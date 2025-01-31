@@ -102,14 +102,23 @@ class MultiCryptoEnv(gym.Env):
         # 2. Adaptive Risk-Adjusted Return Component
         WINDOW = 90  # Align with typical quarterly rebalancing
         
-        # Use Conditional Sharpe Ratio (favors positive skew)
-        returns_window = np.array(self.portfolio_returns[-WINDOW:])
-        positive_returns = returns_window[returns_window > 0]
-        downside_returns = returns_window[returns_window <= 0]
+        # Calculate returns from portfolio history
+        if len(self.portfolio_history) >= 2:
+            values = np.array([ph['value'] for ph in self.portfolio_history[-WINDOW:]])
+            returns_window = np.diff(values) / values[:-1]
+            positive_returns = returns_window[returns_window > 0]
+            downside_returns = returns_window[returns_window <= 0]
+        else:
+            returns_window = np.array([])
+            positive_returns = np.array([])
+            downside_returns = np.array([])
         
-        # Modified denominator with volatility floor
-        denominator = np.std(downside_returns) if len(downside_returns) > 5 else 0.01  # 1% floor
-        risk_adjusted_return = portfolio_return / (denominator + 1e-8)
+        # Modified Sortino-like ratio calculation
+        upside_potential = np.mean(positive_returns) if len(positive_returns) > 0 else 0.01  # 1% floor for upside
+        downside_risk = np.std(downside_returns) if len(downside_returns) > 5 else 0.01  # 1% floor for downside
+        
+        # Combine upside and downside into risk-adjusted return
+        risk_adjusted_return = portfolio_return * (0.7 * upside_potential / (downside_risk + 1e-8) + 0.3)  # Weighted combination
         
         # 3. Penalties with Adaptive Scaling
         # Concentration (Herfindahl Index)
@@ -118,7 +127,7 @@ class MultiCryptoEnv(gym.Env):
         concentration_penalty = 0.2 * herfindahl  # [0-0.2] penalty
         
         # Drawdown (Current Peak-to-Trough)
-        peak = np.max([pv['value'] for pv in self.portfolio_history[-WINDOW:]])
+        peak = np.max([pv['value'] for pv in self.portfolio_history[-WINDOW:]] + [current_value])
         current_drawdown = (peak - current_value) / (peak + 1e-8)
         drawdown_penalty = 0.5 * current_drawdown  # Linear penalty
         
@@ -134,6 +143,10 @@ class MultiCryptoEnv(gym.Env):
         
         # 5. Dynamic Clipping and Scaling
         reward = np.clip(reward, -2.0, 2.0)  # Prevent exploding gradients
+        
+        # Store current portfolio value in history
+        self.portfolio_history.append({'value': current_value})
+        
         return float(reward)
     
     def _portfolio_value(self):

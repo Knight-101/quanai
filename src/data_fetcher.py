@@ -56,9 +56,6 @@ class CryptoDataFetcher:
 
     def _add_features(self, df):
         try:
-            # First set the index to timestamp
-            df = df.set_index('timestamp')
-            
             # Volume indicators
             df['volume_ema'] = ta.volume.volume_weighted_average_price(
                 high=df['high'],
@@ -117,24 +114,37 @@ class CryptoDataFetcher:
             raise ValueError("No data was successfully fetched for any symbol")
         
         # Create common index
-        start_dates = [df.index.min() for df in full_data.values() if not df.empty]
-        end_dates = [df.index.max() for df in full_data.values() if not df.empty]
+        start_dates = [df.index.min() for df in full_data.values()]
+        end_dates = [df.index.max() for df in full_data.values()]
         common_index = pd.date_range(
-            start=max(start_dates),  # Use max of start dates to ensure all assets have data
-            end=min(end_dates),      # Use min of end dates to ensure all assets have data
-            freq=self.timeframe
+            start=max(start_dates),
+            end=min(end_dates),
+            freq=self.timeframe.replace('m', 'min')  # Convert 'm' to 'min' for minutes
         )
         
         # Align all dataframes
         aligned_data = {}
         for asset, df in full_data.items():
-            # Resample to exact timeframe
-            df = df.resample(self.timeframe).agg({
+            # Resample to exact timeframe using 'min' for minutes
+            df = df.resample(self.timeframe.replace('m', 'min')).agg({
                 'open': 'first',
                 'high': 'max',
                 'low': 'min',
                 'close': 'last',
-                'volume': 'sum'
+                'volume': 'sum',
+                'volume_ema': 'last',
+                'obv': 'last',
+                'mfi': 'last',
+                'ema_12': 'last',
+                'ema_26': 'last',
+                'macd': 'last',
+                'macd_signal': 'last',
+                'rsi': 'last',
+                'stoch': 'last',
+                'stoch_signal': 'last',
+                'bb_high': 'last',
+                'bb_low': 'last',
+                'atr': 'last'
             })
             
             # Reindex to common index
@@ -149,8 +159,7 @@ class CryptoDataFetcher:
         
         # Concatenate and clean
         full_df = pd.concat(dfs, axis=1)
-        full_df = full_df.dropna(how='all', axis=1)  # Remove columns with all NaN
-        full_df = full_df.ffill().bfill()
+        full_df = full_df.dropna()  # Remove rows with any NaN values
         
         print(f"Final merged shape: {full_df.shape}")
         return full_df
