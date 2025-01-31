@@ -2,10 +2,6 @@
 data/
 *.csv
 
-# Model files
-models/
-*.pth
-
 # Logs and training data
 logs/
 tensorboard/

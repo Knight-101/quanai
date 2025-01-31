@@ -91,64 +91,71 @@ class MultiCryptoEnv(gym.Env):
         self.trade_count += 1
 
     def _calculate_reward(self):
-        # Current portfolio value
-        current_value = self.balance + sum(
+        # 1. Returns Calculation with Smoothing
+        current_value = self._portfolio_value()
+        prev_value = self.portfolio_history[-2]['value'] if len(self.portfolio_history)>=2 else current_value
+        raw_return = (current_value - prev_value) / (prev_value + 1e-8)
+        
+        # Apply Huber loss to returns for robustness
+        portfolio_return = np.sign(raw_return) * np.sqrt(np.abs(raw_return))  # Compress extreme values
+        
+        # 2. Adaptive Risk-Adjusted Return Component
+        WINDOW = 90  # Align with typical quarterly rebalancing
+        
+        # Use Conditional Sharpe Ratio (favors positive skew)
+        returns_window = np.array(self.portfolio_returns[-WINDOW:])
+        positive_returns = returns_window[returns_window > 0]
+        downside_returns = returns_window[returns_window <= 0]
+        
+        # Modified denominator with volatility floor
+        denominator = np.std(downside_returns) if len(downside_returns) > 5 else 0.01  # 1% floor
+        risk_adjusted_return = portfolio_return / (denominator + 1e-8)
+        
+        # 3. Penalties with Adaptive Scaling
+        # Concentration (Herfindahl Index)
+        allocations = np.array([self.allocations[asset] for asset in self.assets])
+        herfindahl = np.sum(allocations**2)
+        concentration_penalty = 0.2 * herfindahl  # [0-0.2] penalty
+        
+        # Drawdown (Current Peak-to-Trough)
+        peak = np.max([pv['value'] for pv in self.portfolio_history[-WINDOW:]])
+        current_drawdown = (peak - current_value) / (peak + 1e-8)
+        drawdown_penalty = 0.5 * current_drawdown  # Linear penalty
+        
+        # Conditional VaR (Beyond 95% quantile)
+        var = self._calculate_var(alpha=0.95)
+        var_penalty = 0.1 * max(0, var - 0.05)  # Only penalize CVaR >5%
+        
+        # 4. Composite Reward with Normalization
+        reward = (risk_adjusted_return * 0.7  # Primary driver
+                  - concentration_penalty 
+                  - drawdown_penalty 
+                  - var_penalty)
+        
+        # 5. Dynamic Clipping and Scaling
+        reward = np.clip(reward, -2.0, 2.0)  # Prevent exploding gradients
+        return float(reward)
+    
+    def _portfolio_value(self):
+        return self.balance + sum(
             self.allocations[asset] * self._get_current_price(asset)
             for asset in self.assets
-        )
-        
-        # Store portfolio value history
-        self.portfolio_history.append({'value': current_value})
-        
-        # Calculate reward if we have enough history
-        if len(self.portfolio_history) > 1:
-            last_value = self.portfolio_history[-2]['value']
-            # Add small epsilon to prevent division by zero
-            portfolio_return = (current_value - last_value) / (last_value + 1e-8)
-            
-            # Clip extreme values to prevent NaN propagation
-            portfolio_return = np.clip(portfolio_return, -1.0, 1.0)
-            
-            # Store returns for volatility calculation
-            if not hasattr(self, 'portfolio_returns'):
-                self.portfolio_returns = []
-            self.portfolio_returns.append(portfolio_return)
-            
-            # Calculate risk metrics
-            if len(self.portfolio_returns) > 1:
-                volatility = np.std(self.portfolio_returns[-100:]) + 1e-8
-                negative_returns = [r for r in self.portfolio_returns if r < 0]
-                # Add epsilon to denominator and handle empty negative returns
-                sortino_denominator = np.std(negative_returns) if negative_returns else 1.0
-                sortino_denominator = max(sortino_denominator, 1e-8)
-                sortino = portfolio_return / sortino_denominator
-                
-                # Position concentration penalty
-                concentration_penalty = 0.01 * sum(
-                    abs(alloc - 1.0/len(self.assets)) 
-                    for alloc in self.allocations.values()
-                )
-                
-                # Drawdown penalty
-                drawdown_penalty = 0.1 * max(0, -portfolio_return)
-                
-                # VaR penalty
-                var_penalty = 0.2 * abs(self._calculate_var())
-                
-                reward = sortino - concentration_penalty - drawdown_penalty - var_penalty
-                # Ensure reward is finite
-                if not np.isfinite(reward):
-                    reward = 0.0
-                return reward
-                
-            return portfolio_return  # Simple return if not enough data for risk metrics
-            
-        return 0.0  # No reward for first step
+    )
 
-    def _calculate_var(self, alpha=0.95):
-        # Calculate Value-at-Risk
-        returns = np.diff([pv['value'] for pv in self.portfolio_history])
-        return np.percentile(returns, 100*(1-alpha))
+    def _calculate_var(self, alpha=0.95, window=90):
+        """Conditional Value at Risk with lookback window"""
+        if len(self.portfolio_history) < window:
+            return 0.0
+        
+        values = np.array([pv['value'] for pv in self.portfolio_history[-window:]])
+        returns = np.diff(values) / (values[:-1] + 1e-8)
+        if len(returns) == 0:
+            return 0.0
+        
+        # Calculate CVaR
+        var = np.percentile(returns, 100*(1-alpha))
+        cvar = returns[returns <= var].mean()
+        return abs(cvar) if not np.isnan(cvar) else 0.0
 
     def _get_current_price(self, asset):
         return self.df[asset]['close'].iloc[self.current_step]
