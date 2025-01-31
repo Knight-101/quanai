@@ -14,6 +14,9 @@ class RLStrategy(bt.Strategy):
         self.assets = [d._name for d in self.datas]
         self.current_step = 0
         
+        # Setup logging
+        self.trade_log = []
+        
         # Add technical indicators
         for d in self.datas:
             d.rsi = bt.indicators.RSI(d.close, period=14)
@@ -64,17 +67,42 @@ class RLStrategy(bt.Strategy):
         if sum(asset_allocs) > 0:
             asset_allocs = asset_allocs * (1 - cash_alloc) / sum(asset_allocs)
         
+        # Log current portfolio state
+        current_time = self.datas[0].datetime.datetime()
+        log_entry = {
+            'datetime': current_time,
+            'portfolio_value': total,
+            'cash_allocation': cash_alloc,
+            'trades': []
+        }
+        
         # Execute trades
         for i, d in enumerate(self.datas):
             target_value = total * asset_allocs[i]
             current_value = self.getposition(d).size * d.close[0]
             
+            trade_info = {
+                'asset': d._name,
+                'current_value': current_value,
+                'target_value': target_value,
+                'price': d.close[0]
+            }
+            
             if target_value > current_value:
                 self.order_target_value(d, target_value)
+                trade_info['action'] = 'BUY'
             elif target_value < current_value:
                 self.close(d)  # Close position first
+                trade_info['action'] = 'SELL'
                 if target_value > 0:
                     self.order_target_value(d, target_value)  # Then open new position if needed
+                    trade_info['action'] = 'REBALANCE'
+            else:
+                trade_info['action'] = 'HOLD'
+            
+            log_entry['trades'].append(trade_info)
+        
+        self.trade_log.append(log_entry)
 
 def run_backtest():
     cerebro = bt.Cerebro()
@@ -116,7 +144,20 @@ def run_backtest():
     # Run backtest
     print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
     results = cerebro.run()
-    print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
+    strat = results[0]  # Get the strategy instance after running
+    
+    # Print trade log
+    print("\nTrade Log:")
+    for entry in strat.trade_log:
+        print(f"\nDate: {entry['datetime']}")
+        print(f"Portfolio Value: ${entry['portfolio_value']:.2f}")
+        print(f"Cash Allocation: {entry['cash_allocation']:.2%}")
+        print("Trades:")
+        for trade in entry['trades']:
+            print(f"  {trade['asset']}: {trade['action']} - Current: ${trade['current_value']:.2f}, "
+                  f"Target: ${trade['target_value']:.2f}, Price: ${trade['price']:.2f}")
+    
+    print('\nFinal Portfolio Value: %.2f' % cerebro.broker.getvalue())
     
     # Plot if running in a notebook or GUI environment
     try:

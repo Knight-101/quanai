@@ -6,8 +6,16 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+from stable_baselines3.common.utils import get_linear_fn as linear_schedule
 
-from trading_env import MultiCryptoEnv
+from trading_env import MultiCryptoEnv, CurriculumTradingWrapper
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
 class ICMFeatureExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=128):
@@ -15,40 +23,66 @@ class ICMFeatureExtractor(BaseFeaturesExtractor):
         n_input = observation_space.shape[0]
         
         self.encoder = nn.Sequential(
-            nn.Linear(n_input, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
+            nn.Linear(n_input, 256),  # Reduced from 512
             nn.LayerNorm(256),
             nn.ReLU(),
-            nn.Linear(256, features_dim),
-            nn.LayerNorm(features_dim)
+            nn.Dropout(0.1),  # Added dropout
+            nn.Linear(256, 128),  # Reduced from 256
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.1),  # Added dropout
+            nn.Linear(128, features_dim),
+            nn.LayerNorm(features_dim),
+            nn.Tanh()  # Added bounded activation
         )
         
         self.inverse_model = nn.Sequential(
-            nn.Linear(2*features_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(2*features_dim, 128),  # Reduced from 256
             nn.LayerNorm(128),
             nn.ReLU(),
-            nn.Linear(128, n_input)
+            nn.Dropout(0.1),  # Added dropout
+            nn.Linear(128, 64),  # Reduced from 128
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, n_input)
         )
         
         self.forward_model = nn.Sequential(
-            nn.Linear(features_dim + n_input, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(features_dim + n_input, 128),  # Reduced from 256
             nn.LayerNorm(128),
             nn.ReLU(),
-            nn.Linear(128, features_dim)
+            nn.Dropout(0.1),  # Added dropout
+            nn.Linear(128, 64),  # Reduced from 128
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, features_dim)
         )
+        
+        # Initialize weights with smaller values
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.7)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
 
     def forward(self, observations):
+        # Ensure input is on the correct device and has correct dtype
+        observations = observations.to(device=device, dtype=torch.float32)
+        # Clip input values to prevent extreme values
+        observations = torch.clamp(observations, -10.0, 10.0)
         return self.encoder(observations)
 
     def curiosity_loss(self, states, next_states, actions):
+        # Ensure inputs are on the correct device and have correct dtype
+        states = states.to(device=device, dtype=torch.float32)
+        next_states = next_states.to(device=device, dtype=torch.float32)
+        actions = actions.to(device=device, dtype=torch.float32)
+        
+        # Clip input values
+        states = torch.clamp(states, -10.0, 10.0)
+        next_states = torch.clamp(next_states, -10.0, 10.0)
+        actions = torch.clamp(actions, -10.0, 10.0)
+        
         phi = self.encoder(states)
         phi_next = self.encoder(next_states)
         
@@ -60,12 +94,18 @@ class ICMFeatureExtractor(BaseFeaturesExtractor):
         pred_phi_next = self.forward_model(torch.cat([phi, actions], dim=1))
         forward_loss = nn.MSELoss()(pred_phi_next, phi_next)
         
-        return 0.8*forward_loss + 0.2*inverse_loss
+        # Clip losses to prevent extreme values
+        inverse_loss = torch.clamp(inverse_loss, 0.0, 10.0)
+        forward_loss = torch.clamp(forward_loss, 0.0, 10.0)
+        
+        return 0.5*forward_loss + 0.5*inverse_loss  # More balanced loss weights
 
 class CuriosityCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
         self.curiosity_losses = []
+        self.curiosity_scale = 0.005  # Reduced from 0.01
+        self.max_curiosity = 1.0  # Added max curiosity value
 
     def _on_step(self):
         # Get the current buffer size
@@ -74,26 +114,53 @@ class CuriosityCallback(BaseCallback):
             return True
             
         # Collect data for curiosity calculation
-        states = self.locals['rollout_buffer'].observations[:buffer_size-1]  # Current states
-        actions = self.locals['rollout_buffer'].actions[:buffer_size-1]  # Align with states
-        next_states = self.locals['rollout_buffer'].observations[1:buffer_size]  # Next states
+        states = self.locals['rollout_buffer'].observations[:buffer_size-1]
+        actions = self.locals['rollout_buffer'].actions[:buffer_size-1]
+        next_states = self.locals['rollout_buffer'].observations[1:buffer_size]
         
         # Calculate and apply curiosity reward
         with torch.no_grad():
-            phi = self.model.policy.features_extractor(torch.FloatTensor(states))
-            phi_next = self.model.policy.features_extractor(torch.FloatTensor(next_states))
-            curiosity = torch.norm(phi_next - phi, dim=1).cpu().numpy()
-            
-            # Pad the last step with zero curiosity
-            curiosity = np.append(curiosity, 0)
-            curiosity = curiosity.reshape(-1, 1)  # Reshape to match rewards shape
-            
-            # Ensure curiosity matches the buffer size
-            if len(curiosity) > buffer_size:
-                curiosity = curiosity[:buffer_size]
-        
-        # Add curiosity reward to the existing rewards
-        self.locals['rollout_buffer'].rewards += 0.01 * curiosity  # Reduced curiosity weight
+            try:
+                # Convert to float32 and move to device
+                states = torch.FloatTensor(states).to(device)
+                next_states = torch.FloatTensor(next_states).to(device)
+                
+                # Clip inputs
+                states = torch.clamp(states, -10.0, 10.0)
+                next_states = torch.clamp(next_states, -10.0, 10.0)
+                
+                # Get feature representations
+                phi = self.model.policy.features_extractor(states)
+                phi_next = self.model.policy.features_extractor(next_states)
+                
+                # Calculate curiosity (L2 norm of feature differences)
+                curiosity = torch.norm(phi_next - phi, dim=1, p=2)
+                
+                # Clip curiosity values
+                curiosity = torch.clamp(curiosity, 0.0, self.max_curiosity)
+                
+                # Convert to numpy and reshape
+                curiosity = curiosity.cpu().numpy()
+                
+                # Normalize curiosity to [0, 1] range
+                if len(curiosity) > 0:
+                    curiosity = (curiosity - curiosity.min()) / (curiosity.max() - curiosity.min() + 1e-8)
+                
+                # Pad the last step with zero curiosity
+                curiosity = np.append(curiosity, 0)
+                curiosity = curiosity.reshape(-1, 1)
+                
+                # Ensure curiosity matches the buffer size
+                if len(curiosity) > buffer_size:
+                    curiosity = curiosity[:buffer_size]
+                
+                # Add scaled curiosity reward
+                self.locals['rollout_buffer'].rewards += self.curiosity_scale * curiosity
+                
+            except Exception as e:
+                print(f"Warning: Error in curiosity calculation: {e}")
+                # Continue training even if curiosity calculation fails
+                pass
 
         return True
 
@@ -106,22 +173,26 @@ def train_model():
     print(f'DataFrame shape: {df.shape}')
     
     # Create and wrap the environment
-    env = DummyVecEnv([lambda: MultiCryptoEnv(df)])
+    env = DummyVecEnv([lambda: CurriculumTradingWrapper(MultiCryptoEnv(df))])
     env = VecNormalize(
         env,
         norm_obs=True,
         norm_reward=True,
-        clip_obs=10.0,
-        clip_reward=10.0
+        clip_obs=5.0,  # Reduced from 10.0
+        clip_reward=5.0,  # Reduced from 10.0
+        gamma=0.92,
+        epsilon=1e-8  # Added for numerical stability
     )
     
     policy_kwargs = dict(
+        net_arch=[
+            dict(pi=[256, 256], vf=[256, 256])
+        ],
+        activation_fn=nn.Tanh,
+        ortho_init=True,
+        log_std_init=0.5,  # Reduced initial exploration
         features_extractor_class=ICMFeatureExtractor,
-        features_extractor_kwargs=dict(features_dim=128),
-        net_arch=dict(
-            pi=[256, 128],  # Policy network
-            vf=[256, 128]   # Value network
-        )
+        features_extractor_kwargs=dict(features_dim=128)
     )
     
     model = PPO(
@@ -129,25 +200,26 @@ def train_model():
         env,
         policy_kwargs=policy_kwargs,
         verbose=1,
-        learning_rate=1e-5,        # Much lower learning rate
-        n_steps=1024,              # Shorter rollout length
-        batch_size=32,             # Even smaller batch size
-        gamma=0.99,
-        gae_lambda=0.95,
-        ent_coef=0.001,           # Much lower entropy
-        clip_range=0.05,          # Very conservative clipping
-        clip_range_vf=0.05,       # Match policy clipping
-        max_grad_norm=0.2,        # Even lower grad norm
-        n_epochs=3,               # Fewer epochs
-        use_sde=False,            # Disable SDE for now
-        vf_coef=1.0,             # Stronger value function training
-        target_kl=0.025,          # Even more lenient KL target
+        learning_rate=linear_schedule(1e-4, 1e-5,0.8),  # Start aggressive, decay gently
+        n_steps=4096,               # Capture full market cycles (≈3 days at 30m)
+        batch_size=128,             # Balance noise reduction & generalization
+        gamma=0.92,                 # Focus on 12.5-period horizon (1/(1-0.92))
+        gae_lambda=0.85,            # Bias-variance tradeoff for volatile markets
+        ent_coef=0.01,              # Increased exploration for regime shifts
+        clip_range=0.15,             # Standard PPO clipping
+        clip_range_vf=0.15,          # Match policy clipping
+        max_grad_norm=0.5,          # Allow sharper policy updates
+        n_epochs=10,                # Prevent overfitting to recent data
+        vf_coef=0.5,                # Balance policy/value updates
+        target_kl=0.03,             # Stricter policy change control
         tensorboard_log="logs/",
+        seed=42,                    # Reproducibility
+        device="auto"               # Leverage MPS/GPU acceleration
     )
     
     # Train with curiosity
     model.learn(
-        total_timesteps=2_000_000,
+        total_timesteps=1_000_000,
         callback=CuriosityCallback(),
         tb_log_name="multi_crypto_icm"
     )

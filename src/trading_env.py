@@ -100,16 +100,49 @@ class MultiCryptoEnv(gym.Env):
         # Store portfolio value history
         self.portfolio_history.append({'value': current_value})
         
-        # Calculate returns-based reward if we have enough history
+        # Calculate reward if we have enough history
         if len(self.portfolio_history) > 1:
-            returns = np.diff([pv['value'] for pv in self.portfolio_history[-2:]])
-            sharpe = returns[0] / (np.std(returns) + 1e-9)
+            last_value = self.portfolio_history[-2]['value']
+            # Add small epsilon to prevent division by zero
+            portfolio_return = (current_value - last_value) / (last_value + 1e-8)
             
-            # Risk penalty
-            var = self._calculate_var()
+            # Clip extreme values to prevent NaN propagation
+            portfolio_return = np.clip(portfolio_return, -1.0, 1.0)
             
-            return sharpe - 0.3*var
-        
+            # Store returns for volatility calculation
+            if not hasattr(self, 'portfolio_returns'):
+                self.portfolio_returns = []
+            self.portfolio_returns.append(portfolio_return)
+            
+            # Calculate risk metrics
+            if len(self.portfolio_returns) > 1:
+                volatility = np.std(self.portfolio_returns[-100:]) + 1e-8
+                negative_returns = [r for r in self.portfolio_returns if r < 0]
+                # Add epsilon to denominator and handle empty negative returns
+                sortino_denominator = np.std(negative_returns) if negative_returns else 1.0
+                sortino_denominator = max(sortino_denominator, 1e-8)
+                sortino = portfolio_return / sortino_denominator
+                
+                # Position concentration penalty
+                concentration_penalty = 0.01 * sum(
+                    abs(alloc - 1.0/len(self.assets)) 
+                    for alloc in self.allocations.values()
+                )
+                
+                # Drawdown penalty
+                drawdown_penalty = 0.1 * max(0, -portfolio_return)
+                
+                # VaR penalty
+                var_penalty = 0.2 * abs(self._calculate_var())
+                
+                reward = sortino - concentration_penalty - drawdown_penalty - var_penalty
+                # Ensure reward is finite
+                if not np.isfinite(reward):
+                    reward = 0.0
+                return reward
+                
+            return portfolio_return  # Simple return if not enough data for risk metrics
+            
         return 0.0  # No reward for first step
 
     def _calculate_var(self, alpha=0.95):
@@ -126,3 +159,47 @@ class MultiCryptoEnv(gym.Env):
             for asset in self.assets
         )
         print(f"Step {self.current_step} | Value: ${current_value:.2f} | Trades: {self.trade_count}")
+
+class CurriculumTradingWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.initial_volatility = 0.1
+        self.max_volatility = 1.0
+        self.volatility_increment = 0.1
+        self.success_threshold = 0.05  # 5% returns threshold
+        self.episode_returns = []
+        
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        if len(self.episode_returns) > 0:
+            # Adjust difficulty based on performance
+            avg_return = np.mean(self.episode_returns[-5:])  # Last 5 episodes
+            if avg_return > self.success_threshold:
+                self.initial_volatility = min(
+                    self.initial_volatility + self.volatility_increment,
+                    self.max_volatility
+                )
+            self.episode_returns = []
+        return obs
+        
+    def step(self, action):
+        obs, reward, done, truncated, info = self.env.step(action)
+        
+        # Apply volatility scaling to market data only
+        n_market_features = self.env.n_features
+        market_data = obs[:n_market_features]
+        portfolio_state = obs[n_market_features:]
+        
+        # Scale market volatility while preserving relationships
+        scaled_market_data = market_data * (1 + self.initial_volatility)
+        
+        # Combine scaled market data with unchanged portfolio state
+        obs = np.concatenate([scaled_market_data, portfolio_state])
+        
+        if done:
+            final_value = self.env.portfolio_history[-1]['value']
+            initial_value = self.env.initial_balance
+            episode_return = (final_value - initial_value) / initial_value
+            self.episode_returns.append(episode_return)
+            
+        return obs, reward, done, truncated, info
