@@ -4,98 +4,125 @@ import gymnasium as gym
 from gymnasium import spaces
 from typing import Optional
 
-class CryptoTradingEnv(gym.Env):
+class MultiCryptoEnv(gym.Env):
     metadata = {'render_modes': ['human']}
     
-    def __init__(self, df: pd.DataFrame, initial_balance: float = 10000.0):
+    def __init__(self, df, initial_balance=10000.0, risk_free_rate=0.0):
         super().__init__()
-        self.df = df.dropna().reset_index(drop=True)
-        self.features = self.df.columns.difference(['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        self.df = df
+        self.assets = list(df.columns.get_level_values(0).unique())
+        self.features = self._get_feature_list()
         self.n_features = len(self.features)
         
-        # Actions: 0=hold, 1=buy, 2=sell
-        self.action_space = spaces.Discrete(3)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.n_features,))
+        # Action space: [0-1 allocations for each asset + cash]
+        self.action_space = spaces.Box(low=0, high=1, shape=(len(self.assets)+1,))
         
-        # Initialize with reset() instead of setting values directly
+        # Observation space: All features + current allocations
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(self.n_features + len(self.assets)+1,)
+        )
+        
+        # Financial parameters
         self.initial_balance = initial_balance
+        self.risk_free_rate = risk_free_rate
         self.reset()
 
-    def _get_obs(self):
-        return self.df.iloc[self.current_step][self.features].values.astype(np.float32)
-
-    def _calculate_reward(self):
-        portfolio_value = self.balance + self.btc_held * self.current_price
-        daily_return = (portfolio_value - self.last_portfolio_value) / (self.last_portfolio_value + 1e-9)
-        self.returns.append(daily_return)
-        
-        # Sharpe ratio (30-day rolling)
-        excess_returns = np.array(self.returns[-30:]) - 0.0  # Risk-free rate = 0
-        sharpe = np.mean(excess_returns) / (np.std(excess_returns) + 1e-9)
-        
-        # Penalties
-        penalty = 0.0
-        # Transaction cost (0.1%)
-        if self.last_action != 0:
-            penalty += 0.001 * portfolio_value
-        # Drawdown penalty (>5% daily loss)
-        if daily_return < -0.05:
-            penalty += abs(daily_return) * 2
-        
-        reward = sharpe - penalty
-        self.last_portfolio_value = portfolio_value
-        return reward
-
-    def step(self, action):
-        # Prevent out-of-bounds check first
-        if self.current_step >= len(self.df) - 1:
-            terminated = True
-            return self._get_obs(), 0.0, terminated, False, {}
-            
-        self.current_step += 1
-        self.current_price = self.df.iloc[self.current_step]['close']
-        self.last_action = action
-        
-        # Calculate portfolio value before trade
-        prev_portfolio = self.balance + self.btc_held * self.current_price
-        
-        # Apply slippage (increased to 0.2% for market orders)
-        slippage = 0.002
-        executed_price = self.current_price * (1 + slippage) if action == 1 else self.current_price * (1 - slippage)
-        
-        # Execute valid actions with checks
-        if action == 1 and self.balance > 0:  # Buy
-            self.btc_held = self.balance / executed_price
-            self.balance = 0.0
-        elif action == 2 and self.btc_held > 0:  # Sell
-            self.balance = self.btc_held * executed_price
-            self.btc_held = 0.0
-        
-        # Simplified reward calculation
-        new_portfolio = self.balance + self.btc_held * self.current_price
-        fee = 0.001 * new_portfolio  # 0.1% transaction fee
-        reward = (new_portfolio - prev_portfolio - fee) / prev_portfolio if prev_portfolio != 0 else 0
-        
-        terminated = self.current_step >= len(self.df) - 1
-        truncated = False
-        
-        return self._get_obs(), reward, terminated, truncated, {}
+    def _get_feature_list(self):
+        return [f"{asset}/{feat}" for asset in self.assets 
+                for feat in self.df[asset].columns if feat != 'timestamp']
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         self.current_step = 0
         self.balance = self.initial_balance
-        self.btc_held = 0.0
-        self.last_action = 0
-        self.returns = []
-        self.last_portfolio_value = self.initial_balance
+        self.allocations = {asset: 0.0 for asset in self.assets}
+        self.portfolio_history = []
+        self.trade_count = 0
         return self._get_obs(), {}
 
-    def render(self, mode='human'):
-        portfolio = self.balance + self.btc_held * self.current_price
-        print(
-            f"Step: {self.current_step}/{len(self.df)}, "
-            f"Balance: ${self.balance:.2f}, "
-            f"BTC: {self.btc_held:.6f}, "
-            f"Value: ${portfolio:.2f}"
+    def _get_obs(self):
+        # Market features
+        market_data = self.df.iloc[self.current_step].values.astype(np.float32)
+        # Portfolio features (allocations + cash)
+        portfolio_state = [self.balance/self.initial_balance] + [
+            self.allocations[asset] for asset in self.assets
+        ]
+        return np.concatenate([market_data, portfolio_state])
+
+    def step(self, action):
+        # Execute trades with market impact
+        self._rebalance_portfolio(action)
+        
+        # Move to next timestep
+        self.current_step += 1
+        terminated = self.current_step >= len(self.df) - 1
+        
+        # Calculate rewards
+        reward = self._calculate_reward()
+        
+        return self._get_obs(), reward, terminated, False, {}
+
+    def _rebalance_portfolio(self, action):
+        total_value = self.balance + sum(
+            self.allocations[asset] * self._get_current_price(asset)
+            for asset in self.assets
         )
+        
+        # Apply slippage model
+        slippage = 0.0005 * np.sqrt(self.trade_count + 1)  # Increasing slippage
+        
+        # Convert actions to target allocations
+        target_alloc = action / (action.sum() + 1e-9)
+        
+        # Execute rebalancing
+        for i, asset in enumerate(self.assets):
+            target_value = total_value * target_alloc[i+1]
+            current_value = self.allocations[asset] * self._get_current_price(asset)
+            delta = (target_value - current_value) * (1 - slippage)
+            
+            if delta > 0:  # Buy
+                self.balance -= delta
+                self.allocations[asset] += delta / self._get_current_price(asset)
+            else:  # Sell
+                self.allocations[asset] += delta / self._get_current_price(asset)
+                self.balance -= delta * (1 - slippage)
+        
+        self.trade_count += 1
+
+    def _calculate_reward(self):
+        # Current portfolio value
+        current_value = self.balance + sum(
+            self.allocations[asset] * self._get_current_price(asset)
+            for asset in self.assets
+        )
+        
+        # Store portfolio value history
+        self.portfolio_history.append({'value': current_value})
+        
+        # Calculate returns-based reward if we have enough history
+        if len(self.portfolio_history) > 1:
+            returns = np.diff([pv['value'] for pv in self.portfolio_history[-2:]])
+            sharpe = returns[0] / (np.std(returns) + 1e-9)
+            
+            # Risk penalty
+            var = self._calculate_var()
+            
+            return sharpe - 0.3*var
+        
+        return 0.0  # No reward for first step
+
+    def _calculate_var(self, alpha=0.95):
+        # Calculate Value-at-Risk
+        returns = np.diff([pv['value'] for pv in self.portfolio_history])
+        return np.percentile(returns, 100*(1-alpha))
+
+    def _get_current_price(self, asset):
+        return self.df[asset]['close'].iloc[self.current_step]
+
+    def render(self, mode='human'):
+        current_value = self.balance + sum(
+            self.allocations[asset] * self._get_current_price(asset)
+            for asset in self.assets
+        )
+        print(f"Step {self.current_step} | Value: ${current_value:.2f} | Trades: {self.trade_count}")
