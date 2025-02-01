@@ -105,7 +105,10 @@ class MultiCryptoEnv(gym.Env):
         # Calculate returns from portfolio history
         if len(self.portfolio_history) >= 2:
             values = np.array([ph['value'] for ph in self.portfolio_history[-WINDOW:]])
-            returns_window = np.diff(values) / values[:-1]
+            # Add epsilon to prevent division by zero and handle NaN values
+            returns_window = np.diff(values) / (values[:-1] + 1e-8)
+            # Replace any remaining NaN or inf values with 0
+            returns_window = np.nan_to_num(returns_window, nan=0.0, posinf=0.0, neginf=0.0)
             positive_returns = returns_window[returns_window > 0]
             downside_returns = returns_window[returns_window <= 0]
         else:

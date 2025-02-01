@@ -166,17 +166,20 @@ class CuriosityCallback(BaseCallback):
         return True
 
 def objective(trial):
+    # Add at start of function
+    print(f"\nStarting trial {trial.number}")
+    
     # Dynamically sample hyperparameters using Optuna
-    learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)  # Updated from suggest_loguniform
     n_steps = trial.suggest_categorical("n_steps", [2048, 4096, 8192])
     batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
-    gamma = trial.suggest_categorical("gamma", [0.9, 0.92, 0.95])
-    gae_lambda = trial.suggest_categorical("gae_lambda", [0.85, 0.9, 0.95])
-    ent_coef = trial.suggest_loguniform("ent_coef", 0.001, 0.1)
-    clip_range = trial.suggest_categorical("clip_range", [0.1, 0.15, 0.2])
+    gamma = trial.suggest_categorical("gamma", [0.9, 0.92, 0.95, 0.98])
+    gae_lambda = trial.suggest_categorical("gae_lambda", [0.85, 0.9, 0.95, 0.98])
+    ent_coef = trial.suggest_float("ent_coef", 0.001, 0.1, log=True)  # Updated from suggest_loguniform
+    clip_range = trial.suggest_categorical("clip_range", [0.1, 0.12, 0.15, 0.18, 0.2])
     n_epochs = trial.suggest_categorical("n_epochs", [5, 10, 20])
-    max_grad_norm = trial.suggest_categorical("max_grad_norm", [0.3, 0.5, 0.7])
-    vf_coef = trial.suggest_uniform("vf_coef", 0.3, 0.7)
+    max_grad_norm = trial.suggest_categorical("max_grad_norm", [0.3, 0.4, 0.5])
+    vf_coef = trial.suggest_float("vf_coef", 0.3, 0.7)  # Updated from suggest_uniform
 
     # Load data and add error checking
     df = pd.read_parquet('data/multi_crypto.parquet')
@@ -228,26 +231,59 @@ def objective(trial):
         device="auto"
     )
     
-    # Train with curiosity
+    # Add before model.learn()
+    print(f"\nTraining with parameters:")
+    for key, value in trial.params.items():
+        print(f"    {key}: {value}")
+    
+    # Train the model
     model.learn(
-        total_timesteps=1_000_000,
+        total_timesteps=10_000,
         callback=CuriosityCallback(),
         tb_log_name="multi_crypto_icm"
     )
     
-    # # Evaluate the model (replace with your own evaluation metric)
-    # mean_reward, _ = evaluate_policy(model, env, n_eval_episodes=10)
+    # Evaluate the model
+    total_reward = 0.0  # Changed to float
+    n_eval_episodes = 10
+    max_steps = 1000
+
+    # Run evaluation episodes
+    for _ in range(n_eval_episodes):
+        obs = env.reset()
+        episode_reward = 0.0  # Changed to float
+        step_count = 0
+        terminated = truncated = False
+        
+        while not (terminated or truncated) and step_count < max_steps:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, _ = env.step(action)
+            
+            # Extract scalar from array
+            episode_reward += float(reward[0])  # Convert to float and get first element
+            terminated = done
+            step_count += 1
+            
+        total_reward += episode_reward
+
+    mean_reward = total_reward / n_eval_episodes
+    
+    # Add after evaluation
+    print(f"\nTrial {trial.number} finished with mean reward: {mean_reward:.2f}")
     
     # Save both the model and the normalized environment
-    model.save("models/multi_crypto_icm")
-    env.save("models/vec_normalize.pkl")
+    model.save(f"models/multi_crypto_icm_trial_{trial.number}")
+    env.save(f"models/vec_normalize_trial_{trial.number}.pkl")
     
-    # return mean_reward  # Return the mean reward for optimization
+    return mean_reward  # Return the mean reward for optimization
 
 def train_model():
-    # Create an Optuna study and optimize the objective function
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=50)  # Run 50 trials for hyperparameter optimization
+    study = optuna.create_study(
+        direction="maximize", 
+        pruner=optuna.pruners.MedianPruner()
+    )
+    # Run 50 trials, 4 at a time in parallel
+    study.optimize(objective, n_trials=50, n_jobs=4)
 
     # Print the best hyperparameters and the corresponding reward
     print("Best trial:")

@@ -9,7 +9,7 @@ class CryptoDataFetcher:
         self.exchange = ccxt.binance()
         self.symbols = symbols
         self.timeframe = timeframe
-        self.lookback_days = 365 * 10  # 10 years data
+        self.lookback_days = 365 * 7  # 7 years data
 
     def _fetch_single(self, symbol):
         try:
