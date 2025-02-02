@@ -11,6 +11,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 from typing import Dict, Tuple, Optional
 from trading_env import MultiCryptoEnv
+import gc
 
 # Configuration
 CONFIG = {
@@ -49,9 +50,6 @@ class RealTimeTradingAgent:
         self.model, self.vec_normalize = self._load_model()
         self.asset_names = [sym.split('/')[0] for sym in config["symbols"]]
         
-        # Initialize data storage
-        self.historical_data = self._initialize_data_storage()
-        
         # Set up logging
         self.logger = self._configure_logging()
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -82,15 +80,6 @@ class RealTimeTradingAgent:
         
         return model, vec_normalize
 
-    def _initialize_data_storage(self) -> Dict[str, pd.DataFrame]:
-        """Initialize data storage with historical data"""
-        data = {}
-        for sym in self.config["symbols"]:
-            df = pd.read_parquet('data/multi_crypto.parquet')[sym.split('/')[0]]
-            df = df.iloc[-1000:]  # Keep last 1000 periods
-            data[sym.split('/')[0]] = df.copy()
-        return data
-
     def _configure_logging(self) -> logging.Logger:
         """Set up structured logging"""
         logger = logging.getLogger("trading_agent")
@@ -119,73 +108,58 @@ class RealTimeTradingAgent:
         self.trading_enabled = False
 
     def _fetch_realtime_data(self) -> bool:
-        """Fetch latest candle for all symbols"""
+        """Fetch latest candle for all symbols and update parquet file directly"""
         success = True
         data_updated = False
         
-        for sym in self.config["symbols"]:
-            try:
-                # Fetch OHLCV
-                ohlcv = self.exchange.fetch_ohlcv(
-                    sym, 
-                    self.config["timeframe"], 
-                    since=int(time.time() * 1000) - 2*self.exchange.parse_timeframe(self.config["timeframe"])*1000,
-                    limit=1
-                )
-                
-                # Process new data
-                asset = sym.split('/')[0]
-                new_row = pd.DataFrame([ohlcv[-1]], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                new_row['timestamp'] = pd.to_datetime(new_row['timestamp'], unit='ms')
-                new_row.set_index('timestamp', inplace=True)
-                
-                # Check if this is actually new data
-                if new_row.index[0] not in self.historical_data[asset].index:
-                    data_updated = True
-                    # Append to historical data
-                    self.historical_data[asset] = pd.concat([
-                        self.historical_data[asset], 
-                        new_row
-                    ]).drop_duplicates()
+        try:
+            # Read only the last 1000 rows from parquet for each asset
+            full_data = pd.read_parquet('data/multi_crypto.parquet')
+            latest_data = {asset: full_data[asset].iloc[-1000:] for asset in self.asset_names}
+            
+            for sym in self.config["symbols"]:
+                try:
+                    # Fetch OHLCV
+                    ohlcv = self.exchange.fetch_ohlcv(
+                        sym, 
+                        self.config["timeframe"], 
+                        since=int(time.time() * 1000) - 2*self.exchange.parse_timeframe(self.config["timeframe"])*1000,
+                        limit=1
+                    )
                     
-                    # Add features
-                    self.historical_data[asset] = self._add_features(self.historical_data[asset])
+                    # Process new data
+                    asset = sym.split('/')[0]
+                    new_row = pd.DataFrame([ohlcv[-1]], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    new_row['timestamp'] = pd.to_datetime(new_row['timestamp'], unit='ms')
+                    new_row.set_index('timestamp', inplace=True)
                     
-                    # Keep only the rolling window in memory
-                    self.historical_data[asset] = self.historical_data[asset].iloc[-1000:]
-                    
-            except Exception as e:
-                self.logger.error(f"Error fetching data for {sym}: {str(e)}")
-                success = False
-        
-        # If we got new data, update the parquet file
-        if data_updated:
-            try:
-                # Read existing data
-                full_data = pd.read_parquet('data/multi_crypto.parquet')
-                
-                # Update with new data for each asset
-                for asset in self.historical_data:
-                    # Ensure index uniqueness by keeping latest values
-                    combined = pd.concat([
-                        full_data[asset],
-                        self.historical_data[asset]
-                    ]).loc[~pd.concat([
-                        full_data[asset],
-                        self.historical_data[asset]
-                    ]).index.duplicated(keep='last')]
-                    
-                    full_data[asset] = combined.sort_index()
-                
-                # Save back to parquet
+                    # Check if this is actually new data
+                    if new_row.index[0] not in latest_data[asset].index:
+                        data_updated = True
+                        # Add features to new row
+                        new_row_with_features = self._add_features(pd.concat([latest_data[asset], new_row]))
+                        latest_data[asset] = new_row_with_features.iloc[-1000:]  # Keep only last 1000 rows
+                        
+                        # Update full data
+                        full_data[asset] = pd.concat([
+                            full_data[asset].iloc[:-1000],  # Keep historical data
+                            latest_data[asset]  # Update recent data
+                        ])
+                        
+                except Exception as e:
+                    self.logger.error(f"Error fetching data for {sym}: {str(e)}")
+                    success = False
+            
+            # If we got new data, update the parquet file
+            if data_updated:
                 full_data.to_parquet('data/multi_crypto.parquet')
                 self.logger.info("Updated historical data file with new records")
                 
-            except Exception as e:
-                self.logger.error(f"Error updating parquet file: {str(e)}")
-                success = False
+        except Exception as e:
+            self.logger.error(f"Error updating parquet file: {str(e)}")
+            success = False
         
-        return success
+        return success, latest_data if success else None
 
     def _add_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add TA features matching training data"""
@@ -279,22 +253,22 @@ class RealTimeTradingAgent:
             self.logger.error(f"Feature engineering error: {str(e)}")
             return df
 
-    def _get_current_prices(self) -> Dict[str, float]:
+    def _get_current_prices(self, latest_data: Dict[str, pd.DataFrame]) -> Dict[str, float]:
         """Get latest closing prices"""
         return {
-            asset: self.historical_data[asset].iloc[-1]['close']
+            asset: latest_data[asset].iloc[-1]['close']
             for asset in self.asset_names
         }
 
-    def _create_observation(self) -> np.ndarray:
-        """Create model observation vector"""
+    def _create_observation(self, latest_data: Dict[str, pd.DataFrame]) -> np.ndarray:
+        """Create model observation vector using provided data"""
         # Market features
         market_data = []
         for asset in self.asset_names:
-            market_data.extend(self.historical_data[asset].iloc[-1].values)
+            market_data.extend(latest_data[asset].iloc[-1].values)
         
         # Portfolio features
-        prices = self._get_current_prices()
+        prices = self._get_current_prices(latest_data)
         portfolio_value = self.portfolio["balance"] + sum(
             self.portfolio["allocations"][asset] * prices[asset]
             for asset in self.asset_names
@@ -309,9 +283,9 @@ class RealTimeTradingAgent:
         obs = np.concatenate([np.array(market_data), np.array(portfolio_state)])
         return self.vec_normalize.normalize_obs(obs.reshape(1, -1))[0]
 
-    def _execute_trades(self, action: np.ndarray):
+    def _execute_trades(self, action: np.ndarray, latest_data: Dict[str, pd.DataFrame]):
         """Execute trades with slippage and fee modeling"""
-        prices = self._get_current_prices()
+        prices = self._get_current_prices(latest_data)
         total_value = self.portfolio["balance"] + sum(
             self.portfolio["allocations"][asset] * prices[asset]
             for asset in self.asset_names
@@ -367,10 +341,10 @@ class RealTimeTradingAgent:
                 "price": prices[asset]
             })
 
-    def _safety_checks(self) -> bool:
+    def _safety_checks(self, latest_data: Dict[str, pd.DataFrame]) -> bool:
         """Perform risk management checks"""
         current_value = self.portfolio["balance"] + sum(
-            self.portfolio["allocations"][asset] * self._get_current_prices()[asset]
+            self.portfolio["allocations"][asset] * self._get_current_prices(latest_data)[asset]
             for asset in self.asset_names
         )
         
@@ -384,7 +358,7 @@ class RealTimeTradingAgent:
                 
         # Check position limits - now just logs warnings but doesn't stop trading
         for asset in self.asset_names:
-            allocation = self.portfolio["allocations"][asset] * self._get_current_prices()[asset] / current_value
+            allocation = self.portfolio["allocations"][asset] * self._get_current_prices(latest_data)[asset] / current_value
             if allocation > self.config["position_limit"]:
                 self.logger.warning(f"Position limit exceeded for {asset}: {allocation:.2%}, will rebalance next cycle")
                 
@@ -422,7 +396,7 @@ class RealTimeTradingAgent:
         self.logger.info("======================")
 
     def run(self):
-        """Main trading loop with additional model insight logging"""
+        """Main trading loop with memory-efficient data handling"""
         self.logger.info("Starting trading session")
         
         while self.running:
@@ -430,32 +404,30 @@ class RealTimeTradingAgent:
             
             try:
                 # Fetch and process data
-                if not self._fetch_realtime_data():
+                success, latest_data = self._fetch_realtime_data()
+                if not success:
                     self.logger.warning("Data fetch failed, retrying next iteration")
                     time.sleep(self.config["data_refresh"])
                     continue
                 
-                # Create observation
-                obs = self._create_observation()
+                # Create observation using latest data
+                obs = self._create_observation(latest_data)
                 
                 if self.trading_enabled:
                     # Get model action
                     action, _ = self.model.predict(obs, deterministic=True)
                     
-                    # Log internal model insights
-                    # self.log_model_insights(obs, action)
-                    
                     # Execute trades
-                    self._execute_trades(action)
+                    self._execute_trades(action, latest_data)
                     
                     # Perform safety checks
-                    if not self._safety_checks():
+                    if not self._safety_checks(latest_data):
                         self.logger.critical("Safety checks failed, stopping trading")
                         self.trading_enabled = False
-                        
-                # Update portfolio value
+                
+                # Update portfolio value using latest prices
                 current_value = self.portfolio["balance"] + sum(
-                    self.portfolio["allocations"][asset] * self._get_current_prices()[asset]
+                    self.portfolio["allocations"][asset] * latest_data[asset].iloc[-1]['close']
                     for asset in self.asset_names
                 )
                 self.portfolio["value_history"].append(current_value)
@@ -466,6 +438,10 @@ class RealTimeTradingAgent:
                     f"Balance: ${self.portfolio['balance']:,.2f} | "
                     f"Allocations: {self.portfolio['allocations']}"
                 )
+                
+                # Clean up to free memory
+                del latest_data
+                gc.collect()
                 
                 # Sleep until next interval
                 elapsed = time.time() - start_time
