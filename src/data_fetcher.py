@@ -5,11 +5,11 @@ from datetime import datetime, timedelta
 import ta
 
 class CryptoDataFetcher:
-    def __init__(self, symbols=['BTC/USDT', 'ETH/USDT', 'SOL/USDT'], timeframe='30m'):
+    def __init__(self, symbols=['BTC/USDT', 'ETH/USDT', 'SOL/USDT'], timeframe='5m'):
         self.exchange = ccxt.binance()
         self.symbols = symbols
         self.timeframe = timeframe
-        self.lookback_days = 365 * 7  # 7 years data
+        self.lookback_days = 365 * 5  # 5 years data
 
     def _fetch_single(self, symbol):
         try:
@@ -20,7 +20,6 @@ class CryptoDataFetcher:
             while True:
                 try:
                     ohlcv = self.exchange.fetch_ohlcv(symbol, self.timeframe, since=since, limit=1000)
-                    print(f"Fetched {len(ohlcv)} candles for {symbol}")
                     if not ohlcv:
                         break
                     all_ohlcv += ohlcv
