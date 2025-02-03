@@ -2,6 +2,9 @@
 data/
 *.csv
 
+wandb/
+*.log
+
 # Logs and training data
 logs/
 tensorboard/

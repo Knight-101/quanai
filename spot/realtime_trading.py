@@ -83,15 +83,15 @@ class RealTimeTradingAgent:
     def _configure_logging(self) -> logging.Logger:
         """Set up structured logging"""
         logger = logging.getLogger("trading_agent")
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.WARNING)
         
         # File handler
         fh = logging.FileHandler(CONFIG["log_file"])
-        fh.setLevel(logging.INFO)
+        fh.setLevel(logging.WARNING)
         
         # Console handler
         ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
+        ch.setLevel(logging.WARNING)
         
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         fh.setFormatter(formatter)

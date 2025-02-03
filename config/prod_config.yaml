@@ -1,0 +1,338 @@
+# Production Configuration
+
+project_name: "quant_trading_bot"
+mode: "train"  # train or production
+
+# Trading Parameters
+trading:
+  symbols:
+    - "BTCUSDT"  # Binance/Bybit perpetual futures format
+    - "ETHUSDT"
+    - "SOLUSDT"
+  initial_balance: 1000000  # $1M USD
+  max_leverage: 20
+  min_position_size: 1000  # $1K USD
+  max_position_size: 10000000  # $10M USD
+  risk_limits:
+    max_drawdown: 0.3
+    position_concentration: 0.4
+    var_limit: 0.05
+    max_leverage_utilization: 0.8
+  transaction_costs:
+    maker_fee: 0.0002
+    taker_fee: 0.0004
+    slippage: 0.0001
+  funding_rate:
+    multiplier: 0.8
+    max_funding_rate: 0.01
+  transaction_fee: 0.0004
+  funding_fee_multiplier: 1.0
+  risk_free_rate: 0.04
+
+# Risk Management
+risk_management:
+  limits:
+    max_drawdown: 0.2  # 20%
+    var_limit: 0.05  # 5% VaR limit
+    max_leverage: 20.0  # Maximum leverage
+    position_concentration: 0.4  # Maximum position size as fraction of portfolio
+    correlation_limit: 0.7  # Maximum correlation between positions
+    liquidity_ratio: 0.1  # Maximum position size relative to market volume
+    stress_multiplier: 2.0  # Stress test multiplier
+  stress_test_scenarios:
+    - name: normal
+      vol_multiplier: 1.0
+      volume_multiplier: 1.0
+      correlation_multiplier: 1.0
+    - name: stress
+      vol_multiplier: 2.0
+      volume_multiplier: 0.5
+      correlation_multiplier: 1.2
+    - name: crisis
+      vol_multiplier: 3.0
+      volume_multiplier: 0.2
+      correlation_multiplier: 1.5
+  liquidation_thresholds:
+    warning: 0.7  # 70% of max leverage
+    critical: 0.85  # 85% of max leverage
+  circuit_breakers:
+    drawdown_threshold: 0.1  # 10% daily drawdown
+    volatility_threshold: 0.05  # 5% abnormal volatility
+    volume_threshold: 0.5  # 50% volume drop
+  recovery:
+    cool_down_period: 3600  # 1 hour
+    position_reduction: 0.5  # Reduce positions by 50%
+
+# Execution
+execution:
+  default_venue_weights:
+    binance: 1.0
+    bybit: 0.8
+    okx: 0.7
+  min_spread: 0.0001  # 1 bp
+  max_slippage: 0.001  # 10 bps
+  execution_window: 300  # 5 minutes
+  twap_interval: 60  # 1 minute
+
+# Model
+model:
+  transformer:
+    d_model: 50
+    nhead: 5
+    num_layers: 3
+    dropout: 0.1
+  lstm:
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.1
+  mlp:
+    hidden_sizes: [1024, 512, 256]
+    activation: "gelu"
+    layer_norm: true
+    dropout: 0.1
+  checkpoint_dir: "checkpoints"
+  window_size: 100
+  architecture:
+    net_arch:
+      transformer:
+        d_model: 50
+        nhead: 5
+        num_layers: 4
+        dim_feedforward: 512
+      lstm:
+        hidden_size: 256
+        num_layers: 2
+      portfolio:
+        hidden_size: 128
+      actor:
+        hidden_size: 256
+      critic:
+        hidden_size: 256
+    policy_kwargs:
+      activation_fn: "tanh"
+      features_extractor_class: "ICMFeatureExtractor"
+      features_extractor_kwargs:
+        features_dim: 128
+
+# Data
+data:
+  timeframe: "5m"
+  exchanges:
+    - "binance"
+    - "bybit"
+  cache_dir: "data"
+  history_days: 365
+
+# Monitoring
+monitoring:
+  update_interval: 60
+  max_history: 1000
+  port: 8050
+  alert_levels:
+    - name: info
+      color: blue
+    - name: warning
+      color: yellow
+    - name: critical
+      color: red
+  metrics_to_track:
+    - equity
+    - positions
+    - pnl
+    - drawdown
+    - var
+    - leverage
+    - liquidation_risk
+    - execution_quality
+  alert_configs:
+    drawdown_threshold: 0.1
+    var_threshold: 0.15
+    leverage_threshold: 15
+    concentration_threshold: 0.35
+
+# Logging
+logging:
+  level: "WARNING"
+  log_dir: "logs"
+  wandb:
+    project: "quan-perp"
+    entity: "quan-ai"
+    tags: ["production", "perpetual"]
+    mode: "online"
+  wandb_mode: "online"
+  metrics:
+    - "sharpe_ratio"
+    - "sortino_ratio"
+    - "max_drawdown"
+    - "win_rate"
+    - "profit_factor"
+    - "calmar_ratio"
+    - "omega_ratio"
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  max_size: 10485760  # 10MB
+  backup_count: 5
+
+# API Keys (to be overridden by environment variables)
+api_keys:
+  binance:
+    api_key: ${BINANCE_API_KEY}
+    secret_key: ${BINANCE_SECRET_KEY}
+  bybit:
+    api_key: ${BYBIT_API_KEY}
+    secret_key: ${BYBIT_SECRET_KEY}
+  okx:
+    api_key: ${OKX_API_KEY}
+    secret_key: ${OKX_SECRET_KEY}
+    passphrase: ${OKX_PASSPHRASE}
+
+# Training configuration
+training:
+  n_envs: 8  # Keep parallel environments
+  total_timesteps: 1000000
+  learning_rate: 0.0003  # Reduced from 0.0001 to allow more gradual learning
+  n_steps: 4096  # Increased from 2048 to capture more context
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.15  # Reduced from 0.2 for more conservative updates
+  ent_coef: 0.01  # Increased from 0.005 for better exploration
+  vf_coef: 0.5
+  max_grad_norm: 0.3  # Reduced from 0.5 for more stable updates
+  use_sde: true
+  sde_sample_freq: 4
+  target_kl: 0.05  # Increased from 0.03 to allow more policy updates
+  curriculum_stages:
+    - name: "beginner"
+      description: "Basic trading with low risk"
+      difficulty: 0.2
+      timesteps: 1000000
+      env_params:
+        max_leverage: 2
+        position_concentration: 0.1
+        var_limit: 0.02
+        max_drawdown: 0.1
+      required_metrics:
+        returns: 0.05
+        sharpe: 1.0
+        win_rate: 0.52
+        
+    - name: "intermediate"
+      description: "Medium complexity trading"
+      difficulty: 0.5
+      timesteps: 2000000
+      env_params:
+        max_leverage: 5
+        position_concentration: 0.2
+        var_limit: 0.03
+        max_drawdown: 0.15
+      required_metrics:
+        returns: 0.08
+        sharpe: 1.5
+        win_rate: 0.55
+        
+    - name: "advanced"
+      description: "Full complexity trading"
+      difficulty: 1.0
+      timesteps: 3000000
+      env_params:
+        max_leverage: 10
+        position_concentration: 0.3
+        var_limit: 0.05
+        max_drawdown: 0.2
+      required_metrics:
+        returns: 0.12
+        sharpe: 2.0
+        win_rate: 0.58
+  checkpointing:
+    frequency: 100000  # Save every 100k steps
+    keep_best: 5
+  evaluation:
+    freq: 10000
+    episodes: 10
+  early_stopping:
+    patience: 5
+    min_improvement: 0.01
+  eval_episodes: 10
+  callbacks:
+    checkpoint_freq: 100000
+    eval_freq: 10000
+    log_freq: 1000
+
+# Feature engineering
+feature_engineering:
+  volatility_window: 10080  # 1 week of 5m bars
+  n_components: 5  # Number of PCA components
+  technical_indicators:
+    - "RSI"
+    - "MACD"
+    - "BB"
+    - "ATR"
+    - "OBV"
+  market_impact_window: 24
+  correlation_window: 100
+  regime_detection_window: 50
+  features:
+    - name: "price"
+      type: "ohlcv"
+      params:
+        columns: ["open", "high", "low", "close", "volume"]
+    - name: "returns"
+      type: "returns"
+      params:
+        periods: [1, 5, 10, 20]
+    - name: "volatility"
+      type: "volatility"
+      params:
+        windows: [10, 20, 50]
+    - name: "momentum"
+      type: "momentum"
+      params:
+        periods: [5, 10, 20]
+    - name: "volume_profile"
+      type: "volume"
+      params:
+        windows: [5, 10, 20]
+  normalization:
+    method: "zscore"
+    window: 100
+  feature_selection:
+    method: "pca"
+    n_components: 20
+  feature_importance:
+    method: "shap"
+    n_samples: 1000
+
+# Production deployment
+deployment:
+  max_positions: 10
+  position_sizing:
+    method: "kelly"
+    fraction: 0.5
+  risk_management:
+    stop_loss: 0.02
+    take_profit: 0.05
+    trailing_stop: 0.01
+  execution:
+    max_slippage: 0.001
+    order_timeout: 30
+    retry_attempts: 3
+    min_liquidity_ratio: 0.1
+  monitoring:
+    heartbeat_interval: 60
+    health_check_endpoints:
+      - "http://localhost:8000/health"
+    alerts:
+      slack_webhook: "your-webhook-url"
+      email: "alerts@yourdomain.com"
+
+# Emergency settings
+emergency:
+  max_drawdown: 0.25
+  max_daily_loss: 0.1
+  max_var: 0.2
+  volatility_threshold: 0.05
+  volume_threshold: 0.5
+  spread_threshold: 0.01
+  cool_down_period: 3600  # 1 hour
+  position_reduction: 0.5  # Reduce positions by 50% 
