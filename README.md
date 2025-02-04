@@ -83,7 +83,10 @@ The system combines multiple data sources to form a comprehensive market view:
     - Spread costs
   - Risk management integration
   - Position tracking
-  - [More about Perpetual Futures](https://www.binance.com/en/blog/futures/what-are-perpetual-futures-contracts-421499824684901933)
+  - **Learn More**:
+    - [What are Perpetual Futures? (Binance Academy)](https://academy.binance.com/en/articles/what-are-perpetual-futures-contracts)
+    - [Perpetual Futures Trading Guide (YouTube)](https://www.youtube.com/watch?v=_uXHGf_LWyM)
+    - [Understanding Funding Rates (YouTube)](https://www.youtube.com/watch?v=Yl7DZQJ_v2s)
 
 ### 3. Training System (`training/`)
 
@@ -100,7 +103,11 @@ The system combines multiple data sources to form a comprehensive market view:
   - Custom Actor-Critic Policy
   - Multiple action heads for different aspects of trading
   - GAE (Generalized Advantage Estimation)
-  - [PPO Algorithm Details](https://arxiv.org/abs/1707.06347)
+- **Learn More**:
+  - [Reinforcement Learning in Trading (YouTube)](https://www.youtube.com/watch?v=9P-p8li4boE)
+  - [Introduction to PPO (YouTube)](https://www.youtube.com/watch?v=5P7I-xPq8u8)
+  - [Transformers Explained (YouTube)](https://www.youtube.com/watch?v=4Bdc55j80l8)
+  - [Actor-Critic Methods Explained](https://huggingface.co/blog/deep-rl-a2c)
 
 ### 4. Risk Management System (`risk_management/`)
 
@@ -124,11 +131,15 @@ The system combines multiple data sources to form a comprehensive market view:
     - Real-time risk metrics
     - Historical risk analysis
     - Risk limit breach alerts
-- **Key Resources**:
-  - [Value at Risk (VaR) Methodologies](https://www.risk.net/definition/value-at-risk-var)
-  - [Expected Shortfall](https://www.risk.net/definition/expected-shortfall-es)
-  - [Portfolio Risk Management](https://www.cfainstitute.org/en/membership/professional-development/refresher-readings/measuring-managing-market-risk)
-  - [Stress Testing in Trading](https://www.bis.org/publ/bcbs155.pdf)
+- **Learn More**:
+  - Risk Management Fundamentals:
+    - [Introduction to Risk Management (YouTube)](https://www.youtube.com/watch?v=Ql8KUUUOHNc)
+    - [Value at Risk (VaR) Explained Simply (YouTube)](https://www.youtube.com/watch?v=92WaNz9mPeY)
+    - [Position Sizing and Risk Management Guide](https://www.tradingwithrayner.com/position-sizing/)
+  - Advanced Topics:
+    - [Portfolio Risk Management (Investopedia)](https://www.investopedia.com/terms/p/portfolio-management.asp)
+    - [Understanding Expected Shortfall](https://www.investopedia.com/terms/e/expected-shortfall.asp)
+    - [Stress Testing Explained](https://www.investopedia.com/terms/s/stresstesting.asp)
 
 ## Key Technologies and Libraries
 
@@ -248,21 +259,28 @@ model.learn(total_timesteps=100_000)
 
 ### Financial Concepts
 
-- [Perpetual Futures](https://www.binance.com/en/blog/futures/what-are-perpetual-futures-contracts-421499824684901933)
-- [Funding Rates](https://www.bybit.com/en-US/help-center/article/What-is-Funding-Rate)
-- [Market Impact Models](https://arxiv.org/abs/1907.03040)
+- [Complete Guide to Crypto Trading (YouTube)](https://www.youtube.com/watch?v=1prz3utkGAY)
+- [Understanding Market Making (YouTube)](https://www.youtube.com/watch?v=Kl4-VJ2K8Ik)
+- [Crypto Market Structure (YouTube)](https://www.youtube.com/watch?v=QC1h1K6YwBs)
 
-### Machine Learning
+### Machine Learning in Trading
 
-- [Transformers in Trading](https://arxiv.org/abs/2010.08245)
-- [Reinforcement Learning in Finance](https://arxiv.org/abs/1908.09823)
-- [Hierarchical RL](https://arxiv.org/abs/1604.06057)
+- [Introduction to ML in Trading (YouTube)](https://www.youtube.com/watch?v=OhUkMY_DHPg)
+- [Deep Learning in Trading (YouTube)](https://www.youtube.com/watch?v=u6bOLx4xB7E)
+- [Neural Networks for Trading (Article)](https://blog.quantinsti.com/neural-network-trading/)
+- [Transformers in Financial Markets](https://blog.quantinsti.com/transformers-in-finance/)
 
 ### Risk Management
 
-- [Value at Risk (VaR)](https://www.investopedia.com/terms/v/var.asp)
-- [Position Sizing](https://www.investopedia.com/terms/p/positionsizing.asp)
-- [Portfolio Optimization](https://en.wikipedia.org/wiki/Modern_portfolio_theory)
+- [Complete Guide to Risk Management (YouTube)](https://www.youtube.com/watch?v=5M8kXVwgkAg)
+- [Position Sizing Calculator & Strategies](https://www.babypips.com/learn/forex/position-sizing)
+- [Risk Management Strategies (Article)](https://www.babypips.com/learn/forex/how-much-money-can-i-make-from-forex-trading)
+
+### Algorithmic Trading
+
+- [Building a Trading Bot (YouTube Series)](https://www.youtube.com/watch?v=xfzGZB4HhEE)
+- [Algorithmic Trading Strategies](https://www.investopedia.com/articles/active-trading/101014/basics-algorithmic-trading-concepts-and-examples.asp)
+- [Backtesting Best Practices](https://blog.quantinsti.com/backtesting/)
 
 ## Installation
 
@@ -270,7 +288,7 @@ model.learn(total_timesteps=100_000)
 
 ```bash
 git clone https://github.com/yourusername/quantum-trading.git
-cd quan-ai
+cd quantum-trading
 ```
 
 2. Create a virtual environment:
