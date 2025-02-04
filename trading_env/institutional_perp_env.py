@@ -26,6 +26,12 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.df = df
         # Get unique assets from the first level of MultiIndex columns
         self.assets = list(df.columns.get_level_values('asset').unique())
+        
+        # Split features by type
+        self.market_features = [col for col in df.columns if col[1].startswith('market_')]
+        self.sentiment_features = [col for col in df.columns if col[1].startswith('sentiment_')]
+        self.onchain_features = [col for col in df.columns if col[1].startswith('onchain_')]
+        
         self.initial_balance = initial_balance
         self.max_leverage = max_leverage
         self.transaction_fee = transaction_fee
@@ -65,11 +71,13 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.positions = {asset: {'size': 0, 'entry_price': 0, 'funding_accrued': 0} 
                          for asset in self.assets}
         
-        # Calculate observation space size
-        n_features_per_asset = 20  # Fixed number of features per asset
-        n_market_features = n_assets * n_features_per_asset  # Total market features
+        # Calculate observation space size including multimodal features
+        n_market_features = len(self.market_features) * n_assets
+        n_sentiment_features = len(self.sentiment_features) * n_assets
+        n_onchain_features = len(self.onchain_features) * n_assets
         n_portfolio_features = n_assets * 3 + 3  # 3 features per asset + 3 global features
-        total_features = n_market_features + n_portfolio_features
+        
+        total_features = n_market_features + n_sentiment_features + n_onchain_features + n_portfolio_features
         
         # Set observation space
         self.observation_space = spaces.Box(
@@ -380,36 +388,40 @@ class InstitutionalPerpetualEnv(gym.Env):
             return -1.0
         
     def _get_observation(self) -> np.ndarray:
-        """Get current observation"""
+        """Get current observation including multimodal features"""
         try:
             # Get market data window
             market_data = self.df.iloc[self.current_step - self.window_size:self.current_step]
             
             # Initialize observation arrays
             market_features = []
-            n_features_per_asset = 20  # Fixed number of features per asset
+            sentiment_features = []
+            onchain_features = []
             
-            # Fill market features for each asset
+            # Fill features for each asset
             for asset in self.assets:
                 try:
-                    # Get all features for this asset
-                    asset_data = market_data.xs(asset, axis=1, level='asset').iloc[-1]
-                    # Convert to list and handle NaN values
-                    asset_features = [float(x) if pd.notnull(x) else 0.0 for x in asset_data.values]
+                    # Get market features
+                    asset_market = [float(market_data.loc[market_data.index[-1], (asset, feat)]) 
+                                  for feat in self.market_features]
+                    market_features.extend(asset_market)
                     
-                    # Ensure we have exactly n_features_per_asset features
-                    if len(asset_features) < n_features_per_asset:
-                        # Pad with zeros if we have fewer features
-                        asset_features.extend([0.0] * (n_features_per_asset - len(asset_features)))
-                    elif len(asset_features) > n_features_per_asset:
-                        # Truncate if we have more features
-                        asset_features = asset_features[:n_features_per_asset]
-                        
-                    market_features.extend(asset_features)
+                    # Get sentiment features
+                    asset_sentiment = [float(market_data.loc[market_data.index[-1], (asset, feat)]) 
+                                     for feat in self.sentiment_features]
+                    sentiment_features.extend(asset_sentiment)
+                    
+                    # Get onchain features
+                    asset_onchain = [float(market_data.loc[market_data.index[-1], (asset, feat)]) 
+                                   for feat in self.onchain_features]
+                    onchain_features.extend(asset_onchain)
+                    
                 except Exception as e:
                     logger.error(f"Error processing features for {asset}: {str(e)}")
                     # Add zeros if we can't get the features
-                    market_features.extend([0.0] * n_features_per_asset)
+                    market_features.extend([0.0] * len(self.market_features))
+                    sentiment_features.extend([0.0] * len(self.sentiment_features))
+                    onchain_features.extend([0.0] * len(self.onchain_features))
             
             # Add portfolio state features
             portfolio_features = []
@@ -435,7 +447,10 @@ class InstitutionalPerpetualEnv(gym.Env):
             ])
             
             # Combine all features
-            observation = np.array(market_features + portfolio_features, dtype=np.float32)
+            observation = np.array(
+                market_features + sentiment_features + onchain_features + portfolio_features, 
+                dtype=np.float32
+            )
             
             # Ensure observation is finite and within bounds
             observation = np.nan_to_num(observation, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -446,7 +461,8 @@ class InstitutionalPerpetualEnv(gym.Env):
             actual_shape = observation.shape[0]
             if expected_shape != actual_shape:
                 logger.error(f"Observation shape mismatch: expected {expected_shape}, got {actual_shape}")
-                logger.error(f"Market features: {len(market_features)}, Portfolio features: {len(portfolio_features)}")
+                logger.error(f"Market features: {len(market_features)}, Sentiment features: {len(sentiment_features)}, "
+                            f"Onchain features: {len(onchain_features)}, Portfolio features: {len(portfolio_features)}")
                 # Pad or truncate to match expected shape
                 if actual_shape < expected_shape:
                     observation = np.pad(observation, (0, expected_shape - actual_shape))

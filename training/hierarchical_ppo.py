@@ -10,6 +10,7 @@ import logging
 import wandb
 from stable_baselines3.common.callbacks import BaseCallback
 from training.loggers import WandBLogger
+from transformers import AutoModel
 
 logger = logging.getLogger(__name__)
 
@@ -123,13 +124,37 @@ class CustomActorCriticPolicy(nn.Module):
         self.device = device
         
         # Market feature processing
-        market_input_dim = observation_space['market'].shape[-1]  # Get feature dimension
+        market_input_dim = observation_space['market'].shape[-1]
         self.market_transformer = MarketTransformer(
             d_model=net_arch['transformer']['d_model'],
             nhead=net_arch['transformer']['nhead'],
             num_layers=net_arch['transformer']['num_layers'],
             dim_feedforward=net_arch['transformer']['dim_feedforward'],
             input_dim=market_input_dim
+        )
+        
+        # News and social media processing
+        self.text_encoder = AutoModel.from_pretrained('roberta-base')
+        self.text_projection = nn.Linear(768, net_arch['text']['hidden_size'])
+        self.text_attention = nn.MultiheadAttention(
+            net_arch['text']['hidden_size'], 
+            net_arch['text']['num_heads'],
+            batch_first=True
+        )
+        
+        # On-chain data processing
+        self.onchain_lstm = nn.LSTM(
+            input_size=observation_space['onchain'].shape[-1],
+            hidden_size=net_arch['onchain']['hidden_size'],
+            num_layers=net_arch['onchain']['num_layers'],
+            batch_first=True
+        )
+        
+        # Cross-asset attention for market sentiment
+        self.cross_asset_attention = nn.MultiheadAttention(
+            net_arch['transformer']['d_model'],
+            net_arch['cross_asset']['num_heads'],
+            batch_first=True
         )
         
         # Risk metrics processing
@@ -147,14 +172,22 @@ class CustomActorCriticPolicy(nn.Module):
             activation_fn()
         )
         
-        # Feature fusion
+        # Feature fusion with attention
         fusion_input_size = (
-            net_arch['transformer']['d_model'] +
-            net_arch['lstm']['hidden_size'] +
-            net_arch['portfolio']['hidden_size']
+            net_arch['transformer']['d_model'] +  # Market features
+            net_arch['text']['hidden_size'] +     # Text features
+            net_arch['onchain']['hidden_size'] +  # On-chain features
+            net_arch['lstm']['hidden_size'] +     # Risk features
+            net_arch['portfolio']['hidden_size']  # Portfolio features
         )
         
-        # Actor head for each action component
+        self.feature_fusion = nn.MultiheadAttention(
+            fusion_input_size,
+            net_arch['fusion']['num_heads'],
+            batch_first=True
+        )
+        
+        # Actor heads remain the same
         self.actor_heads = nn.ModuleDict({
             'trade_decision': self._create_actor_head(
                 fusion_input_size,
@@ -206,32 +239,57 @@ class CustomActorCriticPolicy(nn.Module):
         )
         
     def forward(self, obs: Dict) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        # Process different observation components
-        market_features = self.market_transformer(obs['market'])  # Shape: (batch_size, num_assets, features)
-        market_features = market_features.mean(dim=1)  # Average over assets to get (batch_size, features)
+        # Process market data
+        market_features = self.market_transformer(obs['market'])
         
+        # Process text data (news & social media)
+        text_features = self.text_encoder(obs['text'])[0]  # Get last hidden state
+        text_features = self.text_projection(text_features)
+        text_features, _ = self.text_attention(text_features, text_features, text_features)
+        text_features = text_features.mean(dim=1)  # Pool text features
+        
+        # Process on-chain data
+        onchain_features, _ = self.onchain_lstm(obs['onchain'])
+        onchain_features = onchain_features[:, -1]  # Take last timestep
+        
+        # Process cross-asset relationships
+        cross_asset_features, _ = self.cross_asset_attention(
+            market_features,
+            market_features,
+            market_features
+        )
+        
+        # Process risk and portfolio features
         risk_features = self.risk_lstm(obs['risk'].unsqueeze(1))
         risk_features = risk_features.squeeze(1)
-        
         portfolio_features = self.portfolio_net(obs['portfolio'])
         
-        # Combine features
+        # Combine all features with attention-based fusion
         combined_features = torch.cat([
-            market_features,
+            market_features.mean(dim=1),
+            text_features,
+            onchain_features,
             risk_features,
             portfolio_features
-        ], dim=1)
+        ], dim=1).unsqueeze(1)
+        
+        fused_features, _ = self.feature_fusion(
+            combined_features,
+            combined_features,
+            combined_features
+        )
+        fused_features = fused_features.squeeze(1)
         
         # Get action distributions
         action_dists = {}
         for name, head in self.actor_heads.items():
-            out = head(combined_features)
+            out = head(fused_features)
             mean, log_std = torch.chunk(out, 2, dim=1)
             log_std = torch.clamp(log_std, -20, 2)
             action_dists[name] = Normal(mean, log_std.exp())
-            
+        
         # Get value estimate
-        value = self.critic(combined_features)
+        value = self.critic(fused_features)
         
         return action_dists, value
         

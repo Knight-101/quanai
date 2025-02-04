@@ -56,3 +56,10 @@ mypy>=1.3.0
 # Optional: GPU Support
 # For CUDA support, install:
 # torch with CUDA: pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# New dependencies
+tweepy>=4.14.0
+python-dateutil>=2.8.2
+etherscan-python>=2.1.0
+glassnode>=1.0.0
+newsapi-python>=0.2.7

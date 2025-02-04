@@ -2,7 +2,7 @@
 import argparse
 import torch
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 from data_system.derivative_data_fetcher import PerpetualDataFetcher
 from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
@@ -24,6 +24,8 @@ from stable_baselines3.ppo import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch.nn as nn
+from data_collection.collect_multimodal import MultiModalDataCollector
+from data_system.multimodal_feature_extractor import MultiModalPerpFeatureExtractor
 
 # Setup logging
 logging.basicConfig(
@@ -316,18 +318,18 @@ class TradingSystem:
             learning_rate=1e-4,
             n_steps=2048,
             batch_size=64,
-            n_epochs=10,
+            n_epochs=5,
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
+            clip_range=0.1,
             clip_range_vf=None,
             normalize_advantage=True,
-            ent_coef=0.01,
+            ent_coef=0.005,
             vf_coef=0.5,
             max_grad_norm=0.5,
             use_sde=True,
             sde_sample_freq=4,
-            target_kl=0.015,
+            target_kl=0.03,
             tensorboard_log=self.config['logging']['log_dir'],
             policy_kwargs=policy_kwargs,
             verbose=1
@@ -451,19 +453,46 @@ class TradingSystem:
             self._get_var() > self.config['emergency']['max_var']
         ])
 
-    async def initialize_training_manager(self):
-        """Initialize training manager after data is fetched and processed"""
-        # Fetch and process data if needed
-        data = await self.fetch_and_process_data()
+    async def initialize_training(self):
+        """Initialize training with multimodal data"""
+        # Calculate date range
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=self.config['data']['history_days'])
         
-        # Now initialize the training manager
+        # Initialize multimodal collector
+        collector = MultiModalDataCollector()
+        
+        # Collect and save multimodal data
+        collector.collect_and_save_data(
+            start_date=start_date,
+            end_date=end_date,
+            output_path=f"{self.config['data']['cache_dir']}/multimodal_data.parquet"
+        )
+        
+        # Load and combine all data sources
+        market_data = await self.fetch_and_process_data()
+        multimodal_data = pd.read_parquet(f"{self.config['data']['cache_dir']}/multimodal_data.parquet")
+        
+        # Align and merge data using the collector's method
+        combined_data = collector.align_and_merge_data(
+            price_data=market_data,
+            tweet_data=pd.DataFrame(),  # Empty DataFrame for tweets since we're not using them
+            news_data=multimodal_data,
+            onchain_data={},  # Empty dict for onchain data since it's handled separately
+            sentiment_data=pd.DataFrame()  # Empty DataFrame for sentiment since it's in multimodal_data
+        )
+        
+        # Create training environment with multimodal support
+        env = self.create_training_env(combined_data)
+        
+        # Initialize training manager with correct parameters
         self.training_manager = TrainingManager(
             data_manager=self.data_manager,
             initial_balance=self.config['trading']['initial_balance'],
             max_leverage=self.config['trading']['max_leverage'],
-            n_envs=self.config['training'].get('n_envs', 8)
+            n_envs=self.config['training']['n_envs'],
+            wandb_config=self.config['logging']['wandb']
         )
-        return data
 
 async def make_env(args):
     """Create the trading environment"""
@@ -525,21 +554,21 @@ def setup_model(env, args):
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=config['training']['learning_rate'],
-        n_steps=config['training']['n_steps'],
-        batch_size=config['training']['batch_size'],
-        n_epochs=config['training']['n_epochs'],
-        gamma=config['training']['gamma'],
-        gae_lambda=config['training']['gae_lambda'],
-        clip_range=config['training']['clip_range'],
+        learning_rate=1e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=5,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.1,
         clip_range_vf=None,
         normalize_advantage=True,
-        ent_coef=config['training']['ent_coef'],
-        vf_coef=config['training']['vf_coef'],
-        max_grad_norm=config['training']['max_grad_norm'],
-        use_sde=config['training']['use_sde'],
-        sde_sample_freq=config['training']['sde_sample_freq'],
-        target_kl=config['training']['target_kl'],
+        ent_coef=0.005,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        use_sde=True,
+        sde_sample_freq=4,
+        target_kl=0.03,
         tensorboard_log=args.log_dir,
         policy_kwargs=policy_kwargs,
         verbose=1,
@@ -578,19 +607,13 @@ async def main():
         wandb_config = setup_wandb_config(config)
         
         # Initialize training
-        training_manager = TrainingManager(
-            data_manager=trading_system.data_manager,
-            initial_balance=config['trading']['initial_balance'],
-            max_leverage=config['trading']['max_leverage'],
-            n_envs=config['training'].get('n_envs', 8),
-            wandb_config=wandb_config
-        )
+        await trading_system.initialize_training()
 
         # Create and initialize the model
         model = setup_model(env, args)
         
         # Train the model
-        training_manager.train(model)
+        trading_system.training_manager.train(model)
         
         # Save model and environment statistics
         model.save(os.path.join(args.model_dir, "final_model"))

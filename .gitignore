@@ -5,6 +5,8 @@ data/
 wandb/
 *.log
 
+test_results/
+
 # Logs and training data
 logs/
 tensorboard/
