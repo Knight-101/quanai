@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 import asyncio
 from data_system.derivative_data_fetcher import PerpetualDataFetcher
 from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
-from training.hierarchical_ppo import HierarchicalPPO
 from risk_management.risk_engine import InstitutionalRiskEngine, RiskLimits
 import pandas as pd
 import numpy as np
@@ -18,14 +17,15 @@ from typing import Dict
 from data_system.feature_engine import DerivativesFeatureEngine
 from training.curriculum import TrainingManager
 from monitoring.dashboard import TradingDashboard
-import warnings
+# import warnings
 from data_system.data_manager import DataManager
 from stable_baselines3.ppo import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch.nn as nn
-from data_collection.collect_multimodal import MultiModalDataCollector
-from data_system.multimodal_feature_extractor import MultiModalPerpFeatureExtractor
+# from data_collection.collect_multimodal import MultiModalDataCollector
+# from data_system.multimodal_feature_extractor import MultiModalPerpFeatureExtractor
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 
 # Setup logging
 logging.basicConfig(
@@ -156,78 +156,83 @@ class TradingSystem:
             alert_configs=config['monitoring']['alert_configs']
         )
         
-        # The training manager will be initialized later after data is fetched and processed
         self.training_manager = None
+        self.env = None
+        self.model = None
+        self.processed_data = None
         
-    async def initialize_data(self):
-        """Initialize data by fetching and processing if not already present"""
-        logger.info("Initializing data...")
+    async def initialize(self, args=None):
+        """Single entry point for all initialization"""
+        logger.info("Starting system initialization...")
         
-        # Check if data exists
-        start_time = datetime.now() - pd.Timedelta(days=self.config['data']['history_days'])
+        # Fetch and process data
+        self.processed_data = await self._fetch_and_process_data()
+        
+        # Initialize environment
+        self.env = self._create_environment(self.processed_data)
+        
+        # Initialize training manager
+        self.training_manager = TrainingManager(
+            data_manager=self.data_manager,
+            initial_balance=self.config['trading']['initial_balance'],
+            max_leverage=self.config['trading']['max_leverage'],
+            n_envs=self.config['training']['n_envs'],
+            wandb_config=self.config['logging']['wandb']
+        )
+        
+        # Initialize model
+        self.model = self._setup_model(args)
+        
+        logger.info("System initialization complete!")
+        
+    async def _fetch_and_process_data(self):
+        """Consolidated method for data fetching and processing"""
+        logger.info("Fetching and processing data...")
+        
+        # Calculate date range
         end_time = datetime.now()
-        
-        # Try to load existing data for any symbol/exchange combination
-        has_data = False
-        for exchange in self.config['data']['exchanges']:
-            for symbol in self.config['trading']['symbols']:
-                data = self.data_manager.load_market_data(
-                    exchange=exchange,
-                    symbol=symbol,
-                    timeframe=self.config['data']['timeframe'],
-                    start_time=start_time,
-                    end_time=end_time,
-                    data_type='perpetual'
-                )
-                if data is not None:
-                    has_data = True
-                    break
-            if has_data:
-                break
-        
-        if not has_data:
-            logger.info("No existing data found. Fetching initial data...")
-            # Fetch new data
-            raw_data = await self.data_fetcher.fetch_derivative_data()
-            
-            # Save market data
-            logger.info("Saving market data...")
-            for exchange, exchange_data in raw_data.items():
-                for symbol, symbol_data in exchange_data.items():
-                    self.data_manager.save_market_data(
-                        data=symbol_data,
-                        exchange=exchange,
-                        symbol=symbol,
-                        timeframe=self.config['data']['timeframe'],
-                        data_type='perpetual'
-                    )
-            
-            # Process and save features
-            logger.info("Engineering and saving features...")
-            processed_data = self.feature_engine.engineer_features(raw_data)
-            self.data_manager.save_feature_data(
-                data=processed_data,
-                feature_set='base_features',
-                metadata={
-                    'feature_config': self.config['feature_engineering'],
-                    'exchanges': self.config['data']['exchanges'],
-                    'symbols': self.config['trading']['symbols'],
-                    'timeframe': self.config['data']['timeframe']
-                }
-            )
-            logger.info("Data initialization complete!")
-        else:
-            logger.info("Using existing data from cache.")
-        
-    async def fetch_and_process_data(self):
-        """Fetch and process market data"""
-        logger.info("Checking for existing data...")
+        lookback_days = self.config['data']['history_days']
+        start_time = end_time - pd.Timedelta(days=lookback_days)
         
         # Try to load existing data first
-        start_time = datetime.now() - pd.Timedelta(days=self.config['data']['history_days'])
-        end_time = datetime.now()
+        existing_data = self._load_cached_data(start_time, end_time)
+        if existing_data is not None and len(existing_data) >= self.config['data']['min_history_points']:
+            logger.info("Using existing data from cache.")
+            formatted_data = self._format_data_for_training(existing_data)
+            logger.info(f"Formatted data shape: {formatted_data.shape}")
+            logger.info(f"Columns: {formatted_data.columns}")
+            return formatted_data
+            
+        # Fetch new data if needed
+        logger.info("No cached data found or insufficient history. Fetching new data...")
         
-        all_data = {}
+        # Initialize data fetcher with correct lookback period
+        self.data_fetcher.lookback = lookback_days
+        
+        # Fetch all data at once (the fetcher handles chunking internally)
+        all_data = await self.data_fetcher.fetch_derivative_data()
+        
+        if not all_data:
+            raise ValueError("No data fetched from exchanges")
+            
+        # Save raw data
+        self._save_market_data(all_data)
+        
+        # Format data for training
+        formatted_data = self._format_data_for_training(all_data)
+        logger.info(f"Formatted data shape: {formatted_data.shape}")
+        logger.info(f"Columns: {formatted_data.columns}")
+        
+        # Save feature data
+        self._save_feature_data(formatted_data)
+        
+        return formatted_data
+        
+    def _load_cached_data(self, start_time, end_time):
+        """Helper method to load cached data"""
+        all_data = {exchange: {} for exchange in self.config['data']['exchanges']}
+        has_all_data = True
+        
         for exchange in self.config['data']['exchanges']:
             for symbol in self.config['trading']['symbols']:
                 data = self.data_manager.load_market_data(
@@ -239,35 +244,31 @@ class TradingSystem:
                     data_type='perpetual'
                 )
                 
-                if data is None:
-                    logger.info(f"No cached data found for {exchange}:{symbol}, fetching from exchange...")
-                    # Fetch new data
-                    raw_data = await self.data_fetcher.fetch_derivative_data()
+                if data is None or len(data) < self.config['data']['min_history_points']:
+                    has_all_data = False
+                    break
                     
-                    # Save the raw data
-                    for exch, exchange_data in raw_data.items():
-                        for sym, symbol_data in exchange_data.items():
-                            self.data_manager.save_market_data(
-                                data=symbol_data,
-                                exchange=exch,
-                                symbol=sym,
-                                timeframe=self.config['data']['timeframe'],
-                                data_type='perpetual'
-                            )
-                    
-                    # Update our data variable
-                    if exchange in raw_data and symbol in raw_data[exchange]:
-                        data = raw_data[exchange][symbol]
+                all_data[exchange][symbol] = data
                 
-                if data is not None:
-                    if exchange not in all_data:
-                        all_data[exchange] = {}
-                    all_data[exchange][symbol] = data
+            if not has_all_data:
+                break
+                
+        return all_data if has_all_data else None
         
-        logger.info("Engineering features...")
-        processed_data = self.feature_engine.engineer_features(all_data)
-        
-        # Save engineered features
+    def _save_market_data(self, raw_data):
+        """Helper method to save market data"""
+        for exchange, exchange_data in raw_data.items():
+            for symbol, symbol_data in exchange_data.items():
+                self.data_manager.save_market_data(
+                    data=symbol_data,
+                    exchange=exchange,
+                    symbol=symbol,
+                    timeframe=self.config['data']['timeframe'],
+                    data_type='perpetual'
+                )
+            
+    def _save_feature_data(self, processed_data):
+        """Helper method to save feature data"""
         self.data_manager.save_feature_data(
             data=processed_data,
             feature_set='base_features',
@@ -279,11 +280,9 @@ class TradingSystem:
             }
         )
         
-        return processed_data
-        
-    def create_training_env(self, data: pd.DataFrame) -> InstitutionalPerpetualEnv:
-        """Create training environment"""
-        return InstitutionalPerpetualEnv(
+    def _create_environment(self, data: pd.DataFrame) -> InstitutionalPerpetualEnv:
+        """Consolidated environment creation"""
+        env = InstitutionalPerpetualEnv(
             df=data,
             initial_balance=self.config['trading']['initial_balance'],
             max_leverage=self.config['trading']['max_leverage'],
@@ -294,27 +293,28 @@ class TradingSystem:
             window_size=self.config['model']['window_size']
         )
         
-    def train_model(self, env: InstitutionalPerpetualEnv) -> PPO:
-        """Train the model"""
-        logger.info("Initializing model training...")
+        # Wrap environment
+        env = DummyVecEnv([lambda: env])
+        env = VecNormalize(env, norm_obs=True, norm_reward=True)
+        return env
         
-        # Wrap environment in VecEnv
-        vec_env = DummyVecEnv([lambda: env])
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
-        
+    def _setup_model(self, args=None) -> PPO:
+        """Consolidated model setup"""
         policy_kwargs = {
             "net_arch": {
-                "pi": [128, 128],  # Actor network
-                "vf": [128, 128]   # Critic network
+                "pi": [128, 128],
+                "vf": [128, 128]
             },
             "activation_fn": torch.nn.ReLU,
             "features_extractor_class": CustomFeatureExtractor,
             "features_extractor_kwargs": {"features_dim": 128}
         }
         
-        model = PPO(
+        device = 'cuda' if (args and args.gpus > 0) else 'cpu'
+        
+        return PPO(
             "MlpPolicy",
-            vec_env,
+            self.env,
             learning_rate=1e-4,
             n_steps=2048,
             batch_size=64,
@@ -332,292 +332,273 @@ class TradingSystem:
             target_kl=0.03,
             tensorboard_log=self.config['logging']['log_dir'],
             policy_kwargs=policy_kwargs,
-            verbose=1
+            verbose=1,
+            device=device
         )
+        
+    def train(self):
+        """Consolidated training method"""
+        if not self.model or not self.env:
+            raise RuntimeError("System not initialized. Call initialize() first.")
+            
+        logger.info("Starting model training...")
         
         # Training loop with curriculum
         for curriculum_stage in self.config['training']['curriculum_stages']:
             logger.info(f"Starting curriculum stage: {curriculum_stage['name']}")
             
             # Update environment parameters for this stage
-            vec_env.envs[0].update_parameters(**curriculum_stage['env_params'])
+            self.env.envs[0].update_parameters(**curriculum_stage['env_params'])
+            
+            # Setup callbacks for this stage
+            callbacks = []
+            if 'callbacks' in self.config['training']:
+                for callback_config in self.config['training']['callbacks']:
+                    if callback_config['type'] == 'checkpoint':
+                        callbacks.append(CheckpointCallback(
+                            save_freq=callback_config['save_freq'],
+                            save_path=self.config['model']['checkpoint_dir'],
+                            name_prefix=f"stage_{curriculum_stage['name']}"
+                        ))
+                    elif callback_config['type'] == 'eval':
+                        callbacks.append(EvalCallback(
+                            eval_env=self.env,
+                            n_eval_episodes=callback_config['n_eval_episodes'],
+                            eval_freq=callback_config['eval_freq'],
+                            log_path=self.config['logging']['log_dir'],
+                            deterministic=True
+                        ))
+                    # Add more callback types as needed
             
             # Train for this stage
-            model.learn(
+            self.model.learn(
                 total_timesteps=curriculum_stage['timesteps'],
-                callback_configs=self.config['training']['callbacks']
+                callback=callbacks if callbacks else None
             )
             
             # Evaluate stage performance
-            self.evaluate_model(model, env, curriculum_stage['name'])
+            self._evaluate_stage(curriculum_stage['name'])
             
             # Save stage checkpoint
-            self.save_model(
-                model,
-                f"stage_{curriculum_stage['name']}_{datetime.now().strftime('%Y%m%d_%H%M')}.pkl"
-            )
+            self._save_checkpoint(f"stage_{curriculum_stage['name']}")
             
-        return model
-        
-    def evaluate_model(self, model: PPO, env: InstitutionalPerpetualEnv, stage: str):
-        """Evaluate model performance"""
+    def _evaluate_stage(self, stage: str):
+        """Helper method for stage evaluation"""
         logger.info(f"Evaluating model performance for stage: {stage}")
         
         eval_episodes = self.config['training']['eval_episodes']
+        metrics = self._run_evaluation_episodes(eval_episodes)
+        
+        # Log metrics
+        wandb.log({
+            f'{stage}/mean_return': metrics['mean_return'],
+            f'{stage}/sharpe_ratio': metrics['sharpe_ratio'],
+            f'{stage}/max_drawdown': metrics['max_drawdown']
+        })
+        
+    def _run_evaluation_episodes(self, n_episodes):
+        """Helper method to run evaluation episodes"""
         returns = []
         sharpe_ratios = []
         max_drawdowns = []
         
-        for episode in range(eval_episodes):
-            obs = env.reset()
-            done = False
-            episode_return = 0
+        for _ in range(n_episodes):
+            episode_metrics = self._run_single_episode()
+            returns.append(episode_metrics['return'])
+            sharpe_ratios.append(episode_metrics['sharpe'])
+            max_drawdowns.append(episode_metrics['max_drawdown'])
             
-            while not done:
-                action = model.predict(obs, deterministic=True)
-                obs, reward, done, _, info = env.step(action)
-                episode_return += reward
-                
-                # Update dashboard
-                self.dashboard.update_metrics(info)
-                
-            returns.append(episode_return)
-            sharpe_ratios.append(info['risk_metrics']['sharpe'])
-            max_drawdowns.append(info['risk_metrics']['max_drawdown'])
-            
-        # Log metrics
-        metrics = {
-            f'{stage}/mean_return': np.mean(returns),
-            f'{stage}/sharpe_ratio': np.mean(sharpe_ratios),
-            f'{stage}/max_drawdown': np.mean(max_drawdowns)
+        return {
+            'mean_return': np.mean(returns),
+            'sharpe_ratio': np.mean(sharpe_ratios),
+            'max_drawdown': np.mean(max_drawdowns)
         }
-        wandb.log(metrics)
         
-    def save_model(self, model: PPO, name: str):
-        """Save trained model"""
-        save_path = os.path.join(self.config['model']['checkpoint_dir'], name)
-        model.save(save_path)
-        logger.info(f"Model saved to {save_path}")
+    def _run_single_episode(self):
+        """Helper method to run a single evaluation episode"""
+        obs = self.env.reset()
+        done = False
+        episode_return = 0
+        info = {}
         
-    def load_model(self, name: str) -> PPO:
-        """Load trained model"""
-        load_path = os.path.join(self.config['model']['checkpoint_dir'], name)
-        model = PPO.load(load_path)
-        logger.info(f"Model loaded from {load_path}")
-        return model
+        while not done:
+            action = self.model.predict(obs, deterministic=True)
+            obs, reward, done, _, info = self.env.step(action)
+            episode_return += reward
+            self.dashboard.update_metrics(info)
         
-    async def run_production(self, model: PPO):
-        """Run the model in production"""
-        logger.info("Starting production trading...")
+        return {
+            'return': episode_return,
+            'sharpe': info['risk_metrics']['sharpe'],
+            'max_drawdown': info['risk_metrics']['max_drawdown']
+        }
         
-        while True:
-            try:
-                # Fetch latest data
-                data = await self.fetch_and_process_data()
-                
-                # Get model prediction
-                obs = self._prepare_observation(data)
-                action = model.predict(obs, deterministic=True)
-                
-                # Pre-trade risk check
-                if not self._check_risk_limits(action, data):
-                    logger.warning("Trade rejected due to risk limits")
-                    continue
-                    
-                # Execute trade
-                self._execute_trade(action)
-                
-                # Update monitoring
-                self._update_monitoring()
-                
-            except Exception as e:
-                logger.error(f"Error in production loop: {str(e)}")
-                if self._should_emergency_stop():
-                    logger.critical("Emergency stop triggered")
-                    break
-                    
-    def _check_risk_limits(self, action: np.ndarray, data: pd.DataFrame) -> bool:
-        """Check if action violates risk limits"""
-        risk_metrics = self.risk_engine.calculate_portfolio_risk(
-            positions=self._get_current_positions(),
-            market_data=data,
-            portfolio_value=self._get_portfolio_value()
-        )
-        return self.risk_engine.check_risk_limits(risk_metrics)[0]
-        
-    def _should_emergency_stop(self) -> bool:
-        """Check if emergency stop is needed"""
-        return any([
-            self._get_drawdown() > self.config['emergency']['max_drawdown'],
-            self._get_daily_loss() > self.config['emergency']['max_daily_loss'],
-            self._get_var() > self.config['emergency']['max_var']
-        ])
+    def _save_checkpoint(self, name: str):
+        """Helper method to save model checkpoint"""
+        save_path = os.path.join(self.config['model']['checkpoint_dir'], f"{name}_{datetime.now().strftime('%Y%m%d_%H%M')}.pkl")
+        self.model.save(save_path)
+        logger.info(f"Model checkpoint saved to {save_path}")
 
-    async def initialize_training(self):
-        """Initialize training with multimodal data"""
-        # Calculate date range
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=self.config['data']['history_days'])
+    def _format_data_for_training(self, raw_data):
+        """Format data into the structure expected by the trading environment"""
+        logger.info("Starting data formatting...")
         
-        # Initialize multimodal collector
-        collector = MultiModalDataCollector()
+        # Initialize an empty list to store DataFrames for each symbol
+        symbol_dfs = []
         
-        # Collect and save multimodal data
-        collector.collect_and_save_data(
-            start_date=start_date,
-            end_date=end_date,
-            output_path=f"{self.config['data']['cache_dir']}/multimodal_data.parquet"
-        )
+        # Process each exchange's data
+        for exchange, exchange_data in raw_data.items():
+            logger.info(f"Processing exchange: {exchange}")
+            for symbol, symbol_data in exchange_data.items():
+                logger.info(f"Processing symbol: {symbol}")
+                
+                # Convert symbol to format expected by risk engine (e.g., BTC/USD:USD -> BTCUSDT)
+                formatted_symbol = symbol.split('/')[0] + "USDT" if not symbol.endswith('USDT') else symbol
+                logger.info(f"Formatted symbol: {formatted_symbol}")
+                
+                # Create a copy to avoid modifying original data
+                df = symbol_data.copy()
+                logger.info(f"Original columns: {df.columns}")
+                
+                # Create formatted DataFrame
+                formatted_data = pd.DataFrame(index=df.index)
+                
+                # Add OHLCV data
+                for col in ['open', 'high', 'low', 'close']:
+                    if col not in df.columns:
+                        raise ValueError(f"Missing required price column {col} for {formatted_symbol}")
+                    formatted_data[col] = df[col].astype(float)
+                
+                # Handle volume data
+                if 'volume' in df.columns:
+                    formatted_data['volume'] = df['volume'].astype(float)
+                else:
+                    # Generate synthetic volume based on price volatility
+                    returns = formatted_data['close'].pct_change()
+                    vol = returns.rolling(window=20).std().fillna(0.01)
+                    formatted_data['volume'] = formatted_data['close'] * vol * 1000
+                
+                # Ensure volume is positive and non-zero
+                formatted_data['volume'] = formatted_data['volume'].clip(lower=1.0)
+                
+                # Handle funding rate
+                if 'funding_rate' in df.columns:
+                    formatted_data['funding_rate'] = df['funding_rate'].astype(float)
+                else:
+                    # Use small random funding rate
+                    formatted_data['funding_rate'] = np.random.normal(0, 0.0001, size=len(formatted_data))
+                
+                # Handle market depth
+                if 'bid_depth' in df.columns and 'ask_depth' in df.columns:
+                    formatted_data['bid_depth'] = df['bid_depth'].astype(float)
+                    formatted_data['ask_depth'] = df['ask_depth'].astype(float)
+                else:
+                    # Generate synthetic depth based on volume
+                    formatted_data['bid_depth'] = formatted_data['volume'] * 0.4
+                    formatted_data['ask_depth'] = formatted_data['volume'] * 0.4
+                
+                # Ensure depth is positive and non-zero
+                formatted_data['bid_depth'] = formatted_data['bid_depth'].clip(lower=1.0)
+                formatted_data['ask_depth'] = formatted_data['ask_depth'].clip(lower=1.0)
+                
+                # Add volatility
+                returns = formatted_data['close'].pct_change()
+                formatted_data['volatility'] = returns.rolling(window=20).std().fillna(0.01)
+                
+                # Forward fill any NaN values first
+                formatted_data = formatted_data.ffill()
+                
+                # Then backward fill any remaining NaN values at the start
+                formatted_data = formatted_data.bfill()
+                
+                # Ensure no NaN values remain
+                if formatted_data.isna().any().any():
+                    logger.error(f"NaN values found in {formatted_symbol} data")
+                    logger.error(f"NaN columns: {formatted_data.columns[formatted_data.isna().any()]}")
+                    raise ValueError(f"NaN values remain in formatted data for {formatted_symbol}")
+                
+                # Create MultiIndex columns
+                formatted_data.columns = pd.MultiIndex.from_product(
+                    [[formatted_symbol], formatted_data.columns],
+                    names=['asset', 'feature']
+                )
+                
+                logger.info(f"Formatted columns for {formatted_symbol}: {formatted_data.columns}")
+                
+                # Verify all required features exist
+                required_features = ['open', 'high', 'low', 'close', 'volume', 'funding_rate', 'bid_depth', 'ask_depth', 'volatility']
+                for feature in required_features:
+                    if (formatted_symbol, feature) not in formatted_data.columns:
+                        raise ValueError(f"Missing required feature {feature} for {formatted_symbol}")
+                
+                symbol_dfs.append(formatted_data)
         
-        # Load and combine all data sources
-        market_data = await self.fetch_and_process_data()
-        multimodal_data = pd.read_parquet(f"{self.config['data']['cache_dir']}/multimodal_data.parquet")
+        # Combine all symbol data
+        if not symbol_dfs:
+            raise ValueError("No valid data to process")
         
-        # Align and merge data using the collector's method
-        combined_data = collector.align_and_merge_data(
-            price_data=market_data,
-            tweet_data=pd.DataFrame(),  # Empty DataFrame for tweets since we're not using them
-            news_data=multimodal_data,
-            onchain_data={},  # Empty dict for onchain data since it's handled separately
-            sentiment_data=pd.DataFrame()  # Empty DataFrame for sentiment since it's in multimodal_data
-        )
+        # Concatenate all symbols' data and handle duplicates
+        combined_data = pd.concat(symbol_dfs, axis=1)
+        logger.info(f"Combined data shape before deduplication: {combined_data.shape}")
         
-        # Create training environment with multimodal support
-        env = self.create_training_env(combined_data)
+        # Remove duplicate columns by taking the mean of duplicates
+        combined_data = combined_data.groupby(level=[0, 1], axis=1).mean()
+        logger.info(f"Combined data shape after deduplication: {combined_data.shape}")
         
-        # Initialize training manager with correct parameters
-        self.training_manager = TrainingManager(
-            data_manager=self.data_manager,
-            initial_balance=self.config['trading']['initial_balance'],
-            max_leverage=self.config['trading']['max_leverage'],
-            n_envs=self.config['training']['n_envs'],
-            wandb_config=self.config['logging']['wandb']
-        )
-
-async def make_env(args):
-    """Create the trading environment"""
-    # Initialize data fetcher and get data
-    data_fetcher = PerpetualDataFetcher(
-        exchanges=config['data']['exchanges'],
-        symbols=args.assets,
-        timeframe=args.timeframe
-    )
-    
-    # Fetch data using await instead of asyncio.run()
-    data = await data_fetcher.fetch_derivative_data()
-    if not data:
-        raise ValueError("No data fetched from exchanges")
-    
-    # Combine data from all exchanges and create MultiIndex columns
-    combined_data = pd.DataFrame()
-    for exchange_data in data.values():
-        for symbol, symbol_data in exchange_data.items():
-            symbol_cols = pd.MultiIndex.from_product(
-                [[symbol], symbol_data.columns],
-                names=['asset', 'feature']
-            )
-            symbol_data.columns = symbol_cols
-            
-            if combined_data.empty:
-                combined_data = symbol_data
-            else:
-                combined_data = pd.concat([combined_data, symbol_data], axis=1)
-    
-    combined_data = combined_data.sort_index(axis=1)
-    
-    # Create environment
-    env = InstitutionalPerpetualEnv(
-        df=combined_data,
-        initial_balance=config['trading']['initial_balance'],
-        max_leverage=args.max_leverage,
-        transaction_fee=config['trading']['transaction_fee'],
-        funding_fee_multiplier=config['trading']['funding_fee_multiplier'],
-        risk_free_rate=config['trading']['risk_free_rate'],
-        max_drawdown=config['risk_management']['limits']['max_drawdown'],
-        window_size=config['model']['window_size']
-    )
-    
-    return env
-
-def setup_model(env, args):
-    """Setup the PPO model"""
-    policy_kwargs = {
-        "net_arch": {
-            "pi": [128, 128],  # Actor network
-            "vf": [128, 128]   # Critic network
-        },
-        "activation_fn": torch.nn.ReLU,
-        "features_extractor_class": CustomFeatureExtractor,
-        "features_extractor_kwargs": {"features_dim": 128}
-    }
-    
-    model = PPO(
-        "MlpPolicy",
-        env,
-        learning_rate=1e-4,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=5,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.1,
-        clip_range_vf=None,
-        normalize_advantage=True,
-        ent_coef=0.005,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        use_sde=True,
-        sde_sample_freq=4,
-        target_kl=0.03,
-        tensorboard_log=args.log_dir,
-        policy_kwargs=policy_kwargs,
-        verbose=1,
-        device='cuda' if args.gpus > 0 else 'cpu'
-    )
-    return model
-
-def setup_wandb_config(config):
-    return {
-        'project': config['logging']['wandb']['project'],
-        'entity': config['logging']['wandb']['entity'],
-        'tags': config['logging']['wandb']['tags'],
-        'mode': config['logging']['wandb']['mode']
-    }
+        # Sort the columns for consistency
+        combined_data = combined_data.sort_index(axis=1)
+        
+        # Final verification
+        assets = combined_data.columns.get_level_values('asset').unique()
+        logger.info(f"Final assets: {assets}")
+        
+        for asset in assets:
+            logger.info(f"Verifying data for {asset}")
+            for feature in required_features:
+                # Check if the feature exists
+                if (asset, feature) not in combined_data.columns:
+                    raise ValueError(f"Missing {feature} for {asset} in final combined data")
+                
+                # Get the feature data
+                feature_data = combined_data.loc[:, (asset, feature)]
+                
+                # Check for NaN or infinite values
+                if not np.isfinite(feature_data).all():
+                    logger.warning(f"Found invalid values in {feature} for {asset}, fixing...")
+                    combined_data.loc[:, (asset, feature)] = feature_data.replace(
+                        [np.inf, -np.inf], np.nan
+                    ).fillna(method='ffill').fillna(method='bfill')
+        
+        logger.info("Data formatting completed successfully")
+        return combined_data
 
 async def main():
     try:
+        # Parse arguments and load config
         args = parse_args()
+        config = load_config('config/prod_config.yaml')
         
-        # Load configuration
-        with open('config/prod_config.yaml', 'r') as f:
-            config = yaml.safe_load(f)
+        # Setup directories and wandb
+        setup_directories(config)
+        initialize_wandb(config)
         
         # Initialize trading system
         trading_system = TradingSystem(config)
         
-        # Initialize data
-        await trading_system.initialize_data()
-        
-        # Initialize environment
-        env = await make_env(args)
-        env = DummyVecEnv([lambda: env])
-        env = VecNormalize(env, norm_obs=True, norm_reward=True)
-        
-        # Setup wandb configuration
-        wandb_config = setup_wandb_config(config)
-        
-        # Initialize training
-        await trading_system.initialize_training()
-
-        # Create and initialize the model
-        model = setup_model(env, args)
+        # Initialize system (this handles data fetching, env creation, and model setup)
+        await trading_system.initialize(args)
         
         # Train the model
-        trading_system.training_manager.train(model)
+        trading_system.train()
         
-        # Save model and environment statistics
-        model.save(os.path.join(args.model_dir, "final_model"))
-        env.save(os.path.join(args.model_dir, "vec_normalize.pkl"))
+        # Save final model and environment
+        final_model_path = os.path.join(args.model_dir, "final_model")
+        final_env_path = os.path.join(args.model_dir, "vec_normalize.pkl")
+        
+        trading_system.model.save(final_model_path)
+        trading_system.env.save(final_env_path)
+        
+        logger.info(f"Training complete. Model saved to {final_model_path}")
         
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
