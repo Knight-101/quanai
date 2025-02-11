@@ -695,23 +695,156 @@ class TradingSystem:
         self.model.save(save_path)
         logger.info(f"Model checkpoint saved to {save_path}")
 
-    def _format_data_for_training(self, data: Dict) -> pd.DataFrame:
-        """Format data for training using feature engineering"""
+    def _format_data_for_training(self, raw_data):
+        """Format data into the structure expected by the trading environment"""
+        logger.info("Starting data formatting...")
+        
+        # Initialize an empty list to store DataFrames for each symbol
+        symbol_dfs = []
+        
+        # Process each exchange's data
+        for exchange, exchange_data in raw_data.items():
+            logger.info(f"Processing exchange: {exchange}")
+            for symbol, symbol_data in exchange_data.items():
+                logger.info(f"Processing symbol: {symbol}")
+                
+                # Convert symbol to format expected by risk engine (e.g., BTC/USD:USD -> BTCUSDT)
+                formatted_symbol = symbol.split('/')[0] + "USDT" if not symbol.endswith('USDT') else symbol
+                logger.info(f"Formatted symbol: {formatted_symbol}")
+                
+                # Create a copy to avoid modifying original data
+                df = symbol_data.copy()
+                logger.info(f"Original columns: {df.columns}")
+                
+                # Create formatted DataFrame
+                formatted_data = pd.DataFrame(index=df.index)
+                
+                # Add OHLCV data
+                for col in ['open', 'high', 'low', 'close']:
+                    if col not in df.columns:
+                        raise ValueError(f"Missing required price column {col} for {formatted_symbol}")
+                    formatted_data[col] = df[col].astype(float)
+                
+                # Handle volume data
+                if 'volume' in df.columns:
+                    formatted_data['volume'] = df['volume'].astype(float)
+                else:
+                    # Generate synthetic volume based on price volatility
+                    returns = formatted_data['close'].pct_change()
+                    vol = returns.rolling(window=20).std().fillna(0.01)
+                    formatted_data['volume'] = formatted_data['close'] * vol * 1000
+                
+                # Ensure volume is positive and non-zero
+                formatted_data['volume'] = formatted_data['volume'].clip(lower=1.0)
+                
+                # Handle funding rate
+                if 'funding_rate' in df.columns:
+                    formatted_data['funding_rate'] = df['funding_rate'].astype(float)
+                else:
+                    # Use small random funding rate
+                    formatted_data['funding_rate'] = np.random.normal(0, 0.0001, size=len(formatted_data))
+                
+                # Handle market depth
+                if 'bid_depth' in df.columns and 'ask_depth' in df.columns:
+                    formatted_data['bid_depth'] = df['bid_depth'].astype(float)
+                    formatted_data['ask_depth'] = df['ask_depth'].astype(float)
+                else:
+                    # Generate synthetic depth based on volume
+                    formatted_data['bid_depth'] = formatted_data['volume'] * 0.4
+                    formatted_data['ask_depth'] = formatted_data['volume'] * 0.4
+                
+                # Ensure depth is positive and non-zero
+                formatted_data['bid_depth'] = formatted_data['bid_depth'].clip(lower=1.0)
+                formatted_data['ask_depth'] = formatted_data['ask_depth'].clip(lower=1.0)
+                
+                # Add volatility
+                returns = formatted_data['close'].pct_change()
+                formatted_data['volatility'] = returns.rolling(window=20).std().fillna(0.01)
+                
+                # Forward fill any NaN values first
+                formatted_data = formatted_data.ffill()
+                
+                # Then backward fill any remaining NaN values at the start
+                formatted_data = formatted_data.bfill()
+                
+                # Ensure no NaN values remain
+                if formatted_data.isna().any().any():
+                    logger.error(f"NaN values found in {formatted_symbol} data")
+                    logger.error(f"NaN columns: {formatted_data.columns[formatted_data.isna().any()]}")
+                    raise ValueError(f"NaN values remain in formatted data for {formatted_symbol}")
+                
+                # Create MultiIndex columns
+                formatted_data.columns = pd.MultiIndex.from_product(
+                    [[formatted_symbol], formatted_data.columns],
+                    names=['asset', 'feature']
+                )
+                
+                logger.info(f"Formatted columns for {formatted_symbol}: {formatted_data.columns}")
+                
+                # Verify all required features exist
+                required_features = ['open', 'high', 'low', 'close', 'volume', 'funding_rate', 'bid_depth', 'ask_depth', 'volatility']
+                for feature in required_features:
+                    if (formatted_symbol, feature) not in formatted_data.columns:
+                        raise ValueError(f"Missing required feature {feature} for {formatted_symbol}")
+                
+                symbol_dfs.append(formatted_data)
+        
+        # Combine all symbol data
+        if not symbol_dfs:
+            raise ValueError("No valid data to process")
+        
+        # Concatenate all symbols' data and handle duplicates
+        combined_data = pd.concat(symbol_dfs, axis=1)
+        logger.info(f"Combined data shape before deduplication: {combined_data.shape}")
+        
+        # Remove duplicate columns by taking the mean of duplicates
+        combined_data = combined_data.groupby(level=[0, 1], axis=1).mean()
+        logger.info(f"Combined data shape after deduplication: {combined_data.shape}")
+        
+        # Sort the columns for consistency
+        combined_data = combined_data.sort_index(axis=1)
+        
+        # Final verification
+        assets = combined_data.columns.get_level_values('asset').unique()
+        logger.info(f"Final assets: {assets}")
+        
+        for asset in assets:
+            logger.info(f"Verifying data for {asset}")
+            for feature in required_features:
+                # Check if the feature exists
+                if (asset, feature) not in combined_data.columns:
+                    raise ValueError(f"Missing {feature} for {asset} in final combined data")
+                
+                # Get the feature data
+                feature_data = combined_data.loc[:, (asset, feature)]
+                
+                # Check for NaN or infinite values
+                if not np.isfinite(feature_data).all():
+                    logger.warning(f"Found invalid values in {feature} for {asset}, fixing...")
+                    combined_data.loc[:, (asset, feature)] = feature_data.replace(
+                        [np.inf, -np.inf], np.nan
+                    ).fillna(method='ffill').fillna(method='bfill')
+        
+        logger.info("Base data formatting completed successfully")
+        
+        # Process through feature engine
         try:
-            # Process data through feature engine
-            processed_data = self.feature_engine.engineer_features(data)
-            
+            processed_data = self.feature_engine.engineer_features({exchange: raw_data[exchange] for exchange in raw_data})
             if processed_data.empty:
                 raise ValueError("Feature engineering produced empty DataFrame")
-            
             logger.info(f"Feature engineering complete. Shape: {processed_data.shape}")
-            logger.info(f"Features generated: {processed_data.columns.get_level_values('feature').unique()}")
+            logger.info(f"Additional features generated: {processed_data.columns.get_level_values('feature').unique()}")
             
-            return processed_data
+            # Combine base features with engineered features
+            final_data = pd.concat([combined_data, processed_data], axis=1)
+            final_data = final_data.loc[:, ~final_data.columns.duplicated()]
+            
+            return final_data
             
         except Exception as e:
-            logger.error(f"Error formatting data for training: {str(e)}")
-            raise
+            logger.error(f"Error in feature engineering: {str(e)}")
+            logger.warning("Falling back to base features only")
+            return combined_data
 
 async def main():
     try:
