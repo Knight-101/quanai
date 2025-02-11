@@ -2,14 +2,27 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from arch import arch_model
-import talib
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import mutual_info_regression
-import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple
 import logging
+from ta.trend import (
+    EMAIndicator, MACD, ADXIndicator
+)
+from ta.momentum import (
+    RSIIndicator, ROCIndicator, WilliamsRIndicator,
+    StochasticOscillator
+)
+from ta.volatility import (
+    BollingerBands, AverageTrueRange
+)
+from ta.volume import (
+    OnBalanceVolumeIndicator, AccDistIndexIndicator,
+    ChaikinMoneyFlowIndicator
+)
+from hmmlearn import hmm
 
 logger = logging.getLogger(__name__)
 
@@ -92,51 +105,76 @@ class DerivativesFeatureEngine:
             return pd.DataFrame()
         
     def _compute_technical_indicators(self, df: pd.DataFrame) -> Dict:
-        """Compute comprehensive technical indicators"""
+        """Compute comprehensive technical indicators using ta library"""
         try:
             features = {}
             
             # Get price and volume data
             close = df['close']
-            features['close'] = close
             high = df['high']
             low = df['low']
             volume = df['volume']
             
+            # Store close price
+            features['close'] = close
+            
             # Trend indicators
-            features['ema_short'] = talib.EMA(close, timeperiod=12)
-            features['ema_medium'] = talib.EMA(close, timeperiod=26)
-            features['ema_long'] = talib.EMA(close, timeperiod=50)
-            features['macd'], features['macd_signal'], _ = talib.MACD(close)
+            ema_short = EMAIndicator(close=close, window=12)
+            ema_medium = EMAIndicator(close=close, window=26)
+            ema_long = EMAIndicator(close=close, window=50)
+            
+            features['ema_short'] = ema_short.ema_indicator()
+            features['ema_medium'] = ema_medium.ema_indicator()
+            features['ema_long'] = ema_long.ema_indicator()
+            
+            # MACD
+            macd = MACD(close=close)
+            features['macd'] = macd.macd()
+            features['macd_signal'] = macd.macd_signal()
             
             # Enhanced momentum indicators
-            features['rsi'] = talib.RSI(close)
-            features['mom'] = talib.MOM(close, timeperiod=10)
-            features['willr'] = talib.WILLR(high, low, close)
-            features['roc'] = talib.ROC(close, timeperiod=10)
-            features['ppo'] = talib.PPO(close)
-            features['mfi'] = talib.MFI(high, low, close, volume, timeperiod=14)
+            rsi = RSIIndicator(close=close)
+            features['rsi'] = rsi.rsi()
+            
+            roc = ROCIndicator(close=close, window=10)
+            features['roc'] = roc.roc()
+            
+            williams = WilliamsRIndicator(high=high, low=low, close=close)
+            features['willr'] = williams.williams_r()
+            
+            stoch = StochasticOscillator(high=high, low=low, close=close)
+            features['stoch_k'] = stoch.stoch()
+            features['stoch_d'] = stoch.stoch_signal()
             
             # Advanced trend indicators
-            features['adx'] = talib.ADX(high, low, close, timeperiod=14)
-            features['di_plus'] = talib.PLUS_DI(high, low, close, timeperiod=14)
-            features['di_minus'] = talib.MINUS_DI(high, low, close, timeperiod=14)
+            adx = ADXIndicator(high=high, low=low, close=close)
+            features['adx'] = adx.adx()
+            features['di_plus'] = adx.adx_pos()
+            features['di_minus'] = adx.adx_neg()
             
             # Volatility indicators
-            features['atr'] = talib.ATR(high, low, close)
-            features['natr'] = talib.NATR(high, low, close)
-            features['bbands_upper'], features['bbands_middle'], features['bbands_lower'] = \
-                talib.BBANDS(close, timeperiod=20)
+            bb = BollingerBands(close=close)
+            features['bbands_upper'] = bb.bollinger_hband()
+            features['bbands_middle'] = bb.bollinger_mavg()
+            features['bbands_lower'] = bb.bollinger_lband()
+            
+            atr = AverageTrueRange(high=high, low=low, close=close)
+            features['atr'] = atr.average_true_range()
             
             # Volume and momentum indicators
-            features['obv'] = talib.OBV(close, volume)
-            features['adosc'] = talib.ADOSC(high, low, close, volume)
-            features['ad'] = talib.AD(high, low, close, volume)
+            obv = OnBalanceVolumeIndicator(close=close, volume=volume)
+            features['obv'] = obv.on_balance_volume()
             
-            # Cycle indicators
-            features['ht_dcperiod'] = talib.HT_DCPERIOD(close)
-            features['ht_dcphase'] = talib.HT_DCPHASE(close)
-            features['ht_trendmode'] = talib.HT_TRENDMODE(close)
+            adi = AccDistIndexIndicator(high=high, low=low, close=close, volume=volume)
+            features['ad'] = adi.acc_dist_index()
+            
+            cmf = ChaikinMoneyFlowIndicator(high=high, low=low, close=close, volume=volume)
+            features['cmf'] = cmf.chaikin_money_flow()
+            
+            # Handle NaN values
+            for key in features:
+                if isinstance(features[key], pd.Series):
+                    features[key] = features[key].fillna(method='ffill').fillna(0)
             
             return features
             
