@@ -299,7 +299,10 @@ class DerivativesFeatureEngine:
             returns_dict = {}
             for asset in full_df.columns.get_level_values('asset').unique():
                 try:
-                    close_prices = full_df.xs(asset, level='asset')['close']
+                    # Get close prices properly handling MultiIndex
+                    close_prices = full_df.loc[:, (asset, 'close')]
+                    if isinstance(close_prices, pd.DataFrame):
+                        close_prices = close_prices.iloc[:, 0]
                     returns_dict[asset] = np.log(close_prices).diff()
                 except Exception as e:
                     logger.warning(f"Could not calculate returns for {asset}: {str(e)}")
@@ -332,7 +335,7 @@ class DerivativesFeatureEngine:
             # Correlation regime
             features['correlation_regime'] = (
                 features['avg_correlation'] - 
-                pd.Series(features['avg_correlation']).rolling(window*2).mean()
+                features['avg_correlation'].rolling(window*2).mean()
             ).fillna(0)
             
             # Beta to market (using average returns as market proxy)
@@ -360,8 +363,19 @@ class DerivativesFeatureEngine:
             # Get returns for all assets
             returns_dict = {}
             for asset in full_df.columns.get_level_values('asset').unique():
-                close_col = [col for col in full_df[asset].columns if 'close' in col.lower()][0]
-                returns_dict[asset] = np.log(full_df[asset][close_col]).diff()
+                try:
+                    # Get close prices properly handling MultiIndex
+                    close_prices = full_df.loc[:, (asset, 'close')]
+                    if isinstance(close_prices, pd.DataFrame):
+                        close_prices = close_prices.iloc[:, 0]
+                    returns_dict[asset] = np.log(close_prices).diff()
+                except Exception as e:
+                    logger.warning(f"Could not calculate returns for {asset}: {str(e)}")
+                    continue
+            
+            if not returns_dict:
+                logger.warning("No valid returns data for cross-sectional features")
+                return {}
             
             returns_df = pd.DataFrame(returns_dict)
             
@@ -390,11 +404,11 @@ class DerivativesFeatureEngine:
                 ranks = rolling_means.rank(axis=1)
                 
                 # Get the rank for the current asset
-                features['xs_momentum'] = ranks[current_asset].iloc[-1]
+                features['xs_momentum'] = ranks[current_asset]
                 
             except Exception as e:
                 logger.warning(f"Error calculating cross-sectional momentum: {str(e)}")
-                features['xs_momentum'] = 0
+                features['xs_momentum'] = pd.Series(0, index=returns_df.index)
             
             return features
             
@@ -461,7 +475,7 @@ class DerivativesFeatureEngine:
         """Handle missing values more intelligently"""
         try:
             # Forward fill first (for time series consistency)
-            df = df.fillna(method='ffill')
+            df = df.ffill()
             
             # For any remaining NaNs, use rolling median
             window_size = min(24, len(df) // 2)  # Use smaller of 24 periods or half the data
