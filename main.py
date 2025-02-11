@@ -569,8 +569,26 @@ class TradingSystem:
                         [np.inf, -np.inf], np.nan
                     ).fillna(method='ffill').fillna(method='bfill')
         
-        logger.info("Data formatting completed successfully")
-        return combined_data
+        logger.info("Base data formatting completed successfully")
+        
+        # Process through feature engine
+        try:
+            processed_data = self.feature_engine.engineer_features({exchange: raw_data[exchange] for exchange in raw_data})
+            if processed_data.empty:
+                raise ValueError("Feature engineering produced empty DataFrame")
+            logger.info(f"Feature engineering complete. Shape: {processed_data.shape}")
+            logger.info(f"Additional features generated: {processed_data.columns.get_level_values('feature').unique()}")
+            
+            # Combine base features with engineered features
+            final_data = pd.concat([combined_data, processed_data], axis=1)
+            final_data = final_data.loc[:, ~final_data.columns.duplicated()]
+            
+            return final_data
+            
+        except Exception as e:
+            logger.error(f"Error in feature engineering: {str(e)}")
+            logger.warning("Falling back to base features only")
+            return combined_data
 
 async def main():
     try:

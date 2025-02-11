@@ -28,9 +28,29 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.assets = list(df.columns.get_level_values('asset').unique())
         
         # Split features by type
-        self.market_features = [col for col in df.columns if col[1].startswith('market_')]
-        self.sentiment_features = [col for col in df.columns if col[1].startswith('sentiment_')]
-        self.onchain_features = [col for col in df.columns if col[1].startswith('onchain_')]
+        all_features = df.columns.get_level_values('feature').unique()
+        
+        # Base features that should exist for all assets
+        self.base_features = ['open', 'high', 'low', 'close', 'volume', 'funding_rate', 'bid_depth', 'ask_depth', 'volatility']
+        
+        # Technical features
+        self.tech_features = [f for f in all_features if f not in self.base_features]
+        
+        # Log feature information
+        logger.info(f"Initialized with assets: {self.assets}")
+        logger.info(f"Base features: {self.base_features}")
+        logger.info(f"Technical features: {self.tech_features}")
+        
+        # Calculate total feature dimension
+        n_base_features = len(self.base_features)
+        n_tech_features = len(self.tech_features)
+        n_portfolio_features = 3  # size, value ratio, funding accrued
+        n_global_features = 3     # balance ratio, pnl ratio, active positions ratio
+        
+        total_features = (n_base_features + n_tech_features) * len(self.assets) + \
+                        n_portfolio_features * len(self.assets) + n_global_features
+        
+        logger.info(f"Total feature dimension: {total_features}")
         
         self.initial_balance = initial_balance
         self.max_leverage = max_leverage
@@ -71,14 +91,6 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.positions = {asset: {'size': 0, 'entry_price': 0, 'funding_accrued': 0} 
                          for asset in self.assets}
         
-        # Calculate observation space size including multimodal features
-        n_market_features = len(self.market_features) * n_assets
-        n_sentiment_features = len(self.sentiment_features) * n_assets
-        n_onchain_features = len(self.onchain_features) * n_assets
-        n_portfolio_features = n_assets * 3 + 3  # 3 features per asset + 3 global features
-        
-        total_features = n_market_features + n_sentiment_features + n_onchain_features + n_portfolio_features
-        
         # Set observation space
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -86,6 +98,23 @@ class InstitutionalPerpetualEnv(gym.Env):
             shape=(total_features,),
             dtype=np.float32
         )
+        
+        # Log the initial state of the DataFrame
+        logger.info(f"Initial DataFrame columns: {self.df.columns}")
+        logger.info(f"Assets: {self.assets}")
+        
+        # Log the features being split
+        logger.info(f"Base features: {self.base_features}")
+        logger.info(f"Technical features: {self.tech_features}")
+        
+        # Check for missing features
+        for asset in self.assets:
+            for feature in self.base_features + self.tech_features:
+                if (asset, feature) not in self.df.columns:
+                    logger.error(f"Missing feature {feature} for asset {asset}")
+        
+        # Log the initialization completion
+        logger.info("InstitutionalPerpetualEnv initialization complete.")
         
         self.reset()
 
@@ -393,76 +422,67 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Get market data window
             market_data = self.df.iloc[self.current_step - self.window_size:self.current_step]
             
-            # Initialize observation arrays
-            market_features = []
-            sentiment_features = []
-            onchain_features = []
+            # Initialize feature lists
+            features = []
             
-            # Fill features for each asset
+            # Process each asset
             for asset in self.assets:
-                try:
-                    # Get market features
-                    asset_market = [float(market_data.loc[market_data.index[-1], (asset, feat)]) 
-                                  for feat in self.market_features]
-                    market_features.extend(asset_market)
-                    
-                    # Get sentiment features
-                    asset_sentiment = [float(market_data.loc[market_data.index[-1], (asset, feat)]) 
-                                     for feat in self.sentiment_features]
-                    sentiment_features.extend(asset_sentiment)
-                    
-                    # Get onchain features
-                    asset_onchain = [float(market_data.loc[market_data.index[-1], (asset, feat)]) 
-                                   for feat in self.onchain_features]
-                    onchain_features.extend(asset_onchain)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing features for {asset}: {str(e)}")
-                    # Add zeros if we can't get the features
-                    market_features.extend([0.0] * len(self.market_features))
-                    sentiment_features.extend([0.0] * len(self.sentiment_features))
-                    onchain_features.extend([0.0] * len(self.onchain_features))
+                # Add base features
+                for feature in self.base_features:
+                    try:
+                        value = market_data.loc[market_data.index[-1], (asset, feature)]
+                        if isinstance(value, pd.Series):
+                            value = value.iloc[0]
+                        features.append(float(value))
+                    except Exception as e:
+                        logger.debug(f"Could not get base feature {feature} for {asset}: {str(e)}")
+                        features.append(0.0)
+                
+                # Add technical features
+                for feature in self.tech_features:
+                    try:
+                        value = market_data.loc[market_data.index[-1], (asset, feature)]
+                        if isinstance(value, pd.Series):
+                            value = value.iloc[0]
+                        features.append(float(value))
+                    except Exception as e:
+                        logger.debug(f"Could not get tech feature {feature} for {asset}: {str(e)}")
+                        features.append(0.0)
             
             # Add portfolio state features
-            portfolio_features = []
             total_value = self.balance
-            
             for asset in self.assets:
                 position = self.positions[asset]
                 mark_price = self._get_mark_price(asset)
                 position_value = position['size'] * mark_price
                 total_value += position_value
                 
-                portfolio_features.extend([
+                features.extend([
                     float(position['size']),
                     float(position_value / total_value if total_value > 0 else 0),
                     float(position['funding_accrued'] / self.initial_balance)
                 ])
             
             # Add global portfolio features
-            portfolio_features.extend([
+            features.extend([
                 float(self.balance / self.initial_balance),
                 float((total_value - self.initial_balance) / self.initial_balance),
                 float(len([p for p in self.positions.values() if p['size'] != 0]) / len(self.assets))
             ])
             
-            # Combine all features
-            observation = np.array(
-                market_features + sentiment_features + onchain_features + portfolio_features, 
-                dtype=np.float32
-            )
+            # Convert to numpy array
+            observation = np.array(features, dtype=np.float32)
             
             # Ensure observation is finite and within bounds
             observation = np.nan_to_num(observation, nan=0.0, posinf=1e3, neginf=-1e3)
             observation = np.clip(observation, -1e3, 1e3)
             
-            # Debug logging
+            # Verify observation shape
             expected_shape = self.observation_space.shape[0]
             actual_shape = observation.shape[0]
             if expected_shape != actual_shape:
                 logger.error(f"Observation shape mismatch: expected {expected_shape}, got {actual_shape}")
-                logger.error(f"Market features: {len(market_features)}, Sentiment features: {len(sentiment_features)}, "
-                            f"Onchain features: {len(onchain_features)}, Portfolio features: {len(portfolio_features)}")
+                logger.error(f"Features length: {len(features)}")
                 # Pad or truncate to match expected shape
                 if actual_shape < expected_shape:
                     observation = np.pad(observation, (0, expected_shape - actual_shape))
@@ -474,8 +494,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         except Exception as e:
             logger.error(f"Error in _get_observation: {str(e)}")
             # Return zero array with correct shape
-            total_features = self.observation_space.shape[0]
-            return np.zeros(total_features, dtype=np.float32)
+            return np.zeros(self.observation_space.shape[0], dtype=np.float32)
         
     def _calculate_reward(self, total_pnl: float) -> float:
         """Calculate reward based on PnL and risk metrics"""

@@ -6,7 +6,7 @@ mode: "train"  # train or production
 # Trading Parameters
 trading:
   symbols:
-    - "BTCUSDT"  # Binance/Bybit perpetual futures format
+    - "BTCUSDT"  # Binance perpetual futures format
     - "ETHUSDT"
     - "SOLUSDT"
   initial_balance: 1000000  # $1M USD
@@ -67,8 +67,6 @@ risk_management:
 execution:
   default_venue_weights:
     binance: 1.0
-    bybit: 0.8
-    okx: 0.7
   min_spread: 0.0001  # 1 bp
   max_slippage: 0.001  # 10 bps
   execution_window: 300  # 5 minutes
@@ -119,7 +117,6 @@ data:
   timeframe: "5m"
   exchanges:
     - "binance"
-    - "bybit"
   cache_dir: "data"
   history_days: 1095
   min_history_points: 1000

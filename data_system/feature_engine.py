@@ -5,19 +5,25 @@ from arch import arch_model
 import talib
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import mutual_info_regression
 import torch
 import torch.nn as nn
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
 
 class DerivativesFeatureEngine:
-    def __init__(self, volatility_window=10080, n_components=5):
+    def __init__(self, 
+                 volatility_window=10080, 
+                 n_components=5,
+                 feature_selection_threshold=0.01):
         self.volatility_window = volatility_window
         self.n_components = n_components
+        self.feature_selection_threshold = feature_selection_threshold
         self.scaler = StandardScaler()
         self._setup_neural_features()
+        self.selected_features = None
         
     def _setup_neural_features(self):
         """Setup neural network for feature extraction"""
@@ -59,6 +65,14 @@ class DerivativesFeatureEngine:
                     flow_features = self._add_flow_features(asset_df)
                     features[asset].update(flow_features)
                     
+                    # Market sentiment features
+                    sentiment_features = self._add_market_sentiment(asset_df)
+                    features[asset].update(sentiment_features)
+                    
+                    # Inter-market correlation features
+                    correlation_features = self._add_intermarket_correlations(df, asset)
+                    features[asset].update(correlation_features)
+                    
                     # Cross-sectional features
                     xs_features = self._add_cross_sectional_features(df, asset)
                     features[asset].update(xs_features)
@@ -95,19 +109,34 @@ class DerivativesFeatureEngine:
             features['ema_long'] = talib.EMA(close, timeperiod=50)
             features['macd'], features['macd_signal'], _ = talib.MACD(close)
             
-            # Momentum indicators
+            # Enhanced momentum indicators
             features['rsi'] = talib.RSI(close)
             features['mom'] = talib.MOM(close, timeperiod=10)
             features['willr'] = talib.WILLR(high, low, close)
+            features['roc'] = talib.ROC(close, timeperiod=10)
+            features['ppo'] = talib.PPO(close)
+            features['mfi'] = talib.MFI(high, low, close, volume, timeperiod=14)
+            
+            # Advanced trend indicators
+            features['adx'] = talib.ADX(high, low, close, timeperiod=14)
+            features['di_plus'] = talib.PLUS_DI(high, low, close, timeperiod=14)
+            features['di_minus'] = talib.MINUS_DI(high, low, close, timeperiod=14)
             
             # Volatility indicators
             features['atr'] = talib.ATR(high, low, close)
+            features['natr'] = talib.NATR(high, low, close)
             features['bbands_upper'], features['bbands_middle'], features['bbands_lower'] = \
                 talib.BBANDS(close, timeperiod=20)
-                
-            # Volume indicators
+            
+            # Volume and momentum indicators
             features['obv'] = talib.OBV(close, volume)
             features['adosc'] = talib.ADOSC(high, low, close, volume)
+            features['ad'] = talib.AD(high, low, close, volume)
+            
+            # Cycle indicators
+            features['ht_dcperiod'] = talib.HT_DCPERIOD(close)
+            features['ht_dcphase'] = talib.HT_DCPHASE(close)
+            features['ht_trendmode'] = talib.HT_TRENDMODE(close)
             
             return features
             
@@ -182,6 +211,108 @@ class DerivativesFeatureEngine:
                                       df['liquidations'].rolling(48).sum()
             
         return features
+        
+    def _add_market_sentiment(self, df: pd.DataFrame) -> Dict:
+        """Calculate market sentiment indicators"""
+        try:
+            features = {}
+            
+            # Price momentum sentiment
+            returns = df['close'].pct_change()
+            features['sentiment_ma'] = returns.rolling(14).mean()
+            features['sentiment_std'] = returns.rolling(14).std()
+            
+            # Volume sentiment
+            volume_ma = df['volume'].rolling(14).mean()
+            features['volume_sentiment'] = (df['volume'] - volume_ma) / volume_ma
+            
+            # Price trend strength
+            features['trend_strength'] = abs(
+                df['close'].rolling(14).mean() - df['close'].rolling(28).mean()
+            ) / df['close'].rolling(28).std()
+            
+            # Volatility regime
+            features['volatility_regime'] = returns.rolling(14).std() / returns.rolling(28).std()
+            
+            # Market efficiency ratio
+            price_change = abs(df['close'] - df['close'].shift(14))
+            path_length = (abs(df['close'].diff())).rolling(14).sum()
+            features['market_efficiency'] = price_change / path_length
+            
+            # Funding rate sentiment (if available)
+            if 'funding_rate' in df.columns:
+                features['funding_sentiment'] = (
+                    df['funding_rate'] - df['funding_rate'].rolling(24).mean()
+                ) / df['funding_rate'].rolling(24).std()
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error in market sentiment: {str(e)}")
+            return {}
+            
+    def _add_intermarket_correlations(self, full_df: pd.DataFrame, current_asset: str) -> Dict:
+        """Calculate inter-market correlation features"""
+        try:
+            features = {}
+            window = 14  # Correlation window
+            
+            # Get returns for all assets
+            returns_dict = {}
+            for asset in full_df.columns.get_level_values('asset').unique():
+                try:
+                    close_prices = full_df.xs(asset, level='asset')['close']
+                    returns_dict[asset] = np.log(close_prices).diff()
+                except Exception as e:
+                    logger.warning(f"Could not calculate returns for {asset}: {str(e)}")
+                    continue
+            
+            if not returns_dict:
+                logger.warning("No valid returns data for correlation calculation")
+                return {}
+                
+            returns_df = pd.DataFrame(returns_dict)
+            current_returns = returns_df[current_asset]
+            
+            # Rolling correlations with other assets
+            for asset in returns_df.columns:
+                if asset != current_asset:
+                    try:
+                        corr = returns_df[asset].rolling(window).corr(current_returns)
+                        features[f'corr_{asset}'] = corr
+                    except Exception as e:
+                        logger.warning(f"Could not calculate correlation between {current_asset} and {asset}: {str(e)}")
+                        features[f'corr_{asset}'] = pd.Series(0, index=returns_df.index)
+            
+            # Average correlation
+            correlations = [features[f'corr_{asset}'] for asset in returns_df.columns if asset != current_asset]
+            if correlations:
+                features['avg_correlation'] = pd.concat(correlations, axis=1).mean(axis=1)
+            else:
+                features['avg_correlation'] = pd.Series(0, index=returns_df.index)
+            
+            # Correlation regime
+            features['correlation_regime'] = (
+                features['avg_correlation'] - 
+                pd.Series(features['avg_correlation']).rolling(window*2).mean()
+            ).fillna(0)
+            
+            # Beta to market (using average returns as market proxy)
+            market_returns = returns_df.mean(axis=1)
+            try:
+                features['market_beta'] = (
+                    returns_df[current_asset].rolling(window).cov(market_returns) /
+                    market_returns.rolling(window).var()
+                ).fillna(0)
+            except Exception as e:
+                logger.warning(f"Could not calculate market beta for {current_asset}: {str(e)}")
+                features['market_beta'] = pd.Series(0, index=returns_df.index)
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error in intermarket correlations for {current_asset}: {str(e)}")
+            return {}
         
     def _add_cross_sectional_features(self, full_df: pd.DataFrame, current_asset: str) -> Dict:
         """Cross-sectional and correlation-based features"""
@@ -262,25 +393,93 @@ class DerivativesFeatureEngine:
             logger.warning(f"HMM fitting failed: {str(e)}")
             return pd.Series(0, index=returns.index)
         
+    def _select_features(self, df: pd.DataFrame, target_col: str = 'close') -> List[str]:
+        """Select most important features using mutual information"""
+        try:
+            # Prepare data
+            X = df.copy()
+            y = X[target_col].pct_change().shift(-1)  # Future returns as target
+            X = X.iloc[:-1]  # Remove last row as we don't have target for it
+            y = y.iloc[:-1]
+            
+            # Calculate mutual information scores
+            mi_scores = mutual_info_regression(X.fillna(0), y)
+            
+            # Create feature importance dictionary
+            feature_importance = dict(zip(X.columns, mi_scores))
+            
+            # Select features above threshold
+            selected = [feat for feat, score in feature_importance.items() 
+                       if score > self.feature_selection_threshold]
+            
+            logger.info(f"Selected {len(selected)} features out of {len(X.columns)}")
+            return selected
+            
+        except Exception as e:
+            logger.error(f"Error in feature selection: {str(e)}")
+            return list(df.columns)
+
+    def _handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Handle missing values more intelligently"""
+        try:
+            # Forward fill first (for time series consistency)
+            df = df.fillna(method='ffill')
+            
+            # For any remaining NaNs, use rolling median
+            window_size = min(24, len(df) // 2)  # Use smaller of 24 periods or half the data
+            df = df.fillna(df.rolling(window=window_size, min_periods=1).median())
+            
+            # If still any NaNs, fill with 0
+            df = df.fillna(0)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error handling missing values: {str(e)}")
+            return df.fillna(0)
+
     def _combine_features(self, features: Dict) -> pd.DataFrame:
         """Combine all features into a single DataFrame with proper normalization"""
         try:
             combined = pd.DataFrame()
+            all_features = set()
             
+            # First pass: collect all feature names
+            for asset, asset_features in features.items():
+                for feat_name, feat_values in asset_features.items():
+                    if isinstance(feat_values, (pd.Series, np.ndarray)):
+                        all_features.add(feat_name)
+            
+            logger.info(f"Total features to process: {len(all_features)}")
+            
+            # Second pass: ensure all assets have all features
             for asset, asset_features in features.items():
                 try:
                     # Convert all features to DataFrame with proper types
                     asset_df = pd.DataFrame()
-                    for feat_name, feat_values in asset_features.items():
-                        # Convert to numeric, replacing non-numeric values with NaN
-                        if isinstance(feat_values, (pd.Series, np.ndarray)):
-                            asset_df[feat_name] = pd.to_numeric(feat_values, errors='coerce')
+                    
+                    # Process each feature
+                    for feat_name in all_features:
+                        if feat_name in asset_features:
+                            value = asset_features[feat_name]
+                            if isinstance(value, (pd.Series, np.ndarray)):
+                                asset_df[feat_name] = pd.to_numeric(value, errors='coerce')
                         else:
-                            # Skip non-numeric features
-                            logger.warning(f"Skipping non-numeric feature {feat_name} for {asset}")
-                            continue
+                            # If feature doesn't exist for this asset, fill with 0
+                            asset_df[feat_name] = 0.0
+                            logger.debug(f"Adding missing feature {feat_name} for {asset}")
                     
                     if len(asset_df) > 0:
+                        # Handle missing values properly
+                        asset_df = self._handle_missing_values(asset_df)
+                        
+                        # Select important features if not already selected
+                        if self.selected_features is None:
+                            self.selected_features = self._select_features(asset_df)
+                        
+                        # Keep only selected features
+                        asset_df = asset_df[self.selected_features]
+                        
                         # Create proper MultiIndex columns
                         asset_df.columns = pd.MultiIndex.from_product(
                             [[asset], asset_df.columns],
@@ -297,8 +496,26 @@ class DerivativesFeatureEngine:
                     logger.error(f"Error combining features for {asset}: {str(e)}")
                     continue
             
-            # Fill any remaining NaN values with 0
-            combined = combined.fillna(0)
+            # Verify all assets have the same features
+            assets = combined.columns.get_level_values('asset').unique()
+            features = combined.columns.get_level_values('feature').unique()
+            
+            for asset in assets:
+                asset_features = combined.xs(asset, axis=1, level='asset').columns
+                missing_features = set(features) - set(asset_features)
+                if missing_features:
+                    logger.warning(f"Asset {asset} is missing features: {missing_features}")
+                    # Add missing features with zeros
+                    for feature in missing_features:
+                        combined[(asset, feature)] = 0.0
+            
+            # Sort columns for consistency
+            combined = combined.sort_index(axis=1)
+            
+            # Final verification
+            logger.info(f"Combined features shape: {combined.shape}")
+            logger.info(f"Features per asset: {len(features)}")
+            logger.info(f"Total assets: {len(assets)}")
             
             return combined
             
