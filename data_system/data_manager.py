@@ -5,6 +5,7 @@ from pathlib import Path
 import logging
 from typing import Optional, Dict, Any
 import numpy as np
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -108,40 +109,32 @@ class DataManager:
     ) -> bool:
         """Save feature data to Parquet file"""
         try:
-            filename = self._get_feature_data_filename(feature_set)
-            filepath = self.feature_data_path / filename
+            filepath = self.feature_data_path / self._get_feature_data_filename(feature_set)
+            
+            # Ensure the directory exists
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Convert MultiIndex columns to string format for parquet compatibility
+            if isinstance(data.columns, pd.MultiIndex):
+                data_to_save = data.copy()
+                data_to_save.columns = [f"{asset}|{feature}" for asset, feature in data.columns]
+            else:
+                data_to_save = data
+            
+            # Convert all numeric columns to float64 for consistency
+            numeric_cols = data_to_save.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                data_to_save[col] = data_to_save[col].astype(np.float64)
+            
+            # Convert any remaining object columns to string
+            object_cols = data_to_save.select_dtypes(include=['object']).columns
+            for col in object_cols:
+                data_to_save[col] = data_to_save[col].astype(str)
             
             # Save metadata separately
-            metadata_file = filepath.with_suffix('.meta.parquet')
-            pd.DataFrame([metadata]).to_parquet(metadata_file)
-            
-            # Create a copy to avoid modifying the original data
-            data_to_save = data.copy()
-            
-            # Convert MultiIndex columns to string format for saving
-            if isinstance(data_to_save.columns, pd.MultiIndex):
-                # Convert None values to 'unknown' and ensure string type
-                new_columns = []
-                for col in data_to_save.columns:
-                    asset, feature = col
-                    asset = str(asset) if asset is not None else 'unknown'
-                    feature = str(feature) if feature is not None else 'unknown'
-                    new_columns.append(f"{asset}|{feature}")
-                data_to_save.columns = new_columns
-            
-            # Ensure all columns are numeric and handle non-numeric data
-            for col in data_to_save.columns:
-                try:
-                    if not np.issubdtype(data_to_save[col].dtype, np.number):
-                        # Try to convert to numeric, replace non-convertible values with NaN
-                        data_to_save[col] = pd.to_numeric(data_to_save[col], errors='coerce')
-                except Exception as e:
-                    logger.warning(f"Could not convert column {col} to numeric: {str(e)}")
-                    # If conversion fails, drop the problematic column
-                    data_to_save = data_to_save.drop(columns=[col])
-            
-            # Fill any NaN values with 0
-            data_to_save = data_to_save.fillna(0)
+            metadata_path = filepath.with_suffix('.meta.json')
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f)
             
             # Save feature data
             data_to_save.to_parquet(filepath)

@@ -133,65 +133,71 @@ class DerivativesFeatureEngine:
             close = close.clip(lower=1e-8)
             high = high.clip(lower=1e-8)
             low = low.clip(lower=1e-8)
-            volume = volume.clip(lower=0)
+            volume = volume.clip(lower=1e-8)  # Changed from 0 to 1e-8 for consistency
+            
+            # Handle NaN values in features
+            def safe_indicator(func):
+                try:
+                    result = func()
+                    if isinstance(result, pd.Series):
+                        return result.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
+                    return result
+                except Exception as e:
+                    logger.warning(f"Error calculating indicator: {str(e)}")
+                    return pd.Series(0, index=close.index)
             
             # Trend indicators
             ema_short = EMAIndicator(close=close, window=12)
             ema_medium = EMAIndicator(close=close, window=26)
             ema_long = EMAIndicator(close=close, window=50)
             
-            features['ema_short'] = ema_short.ema_indicator()
-            features['ema_medium'] = ema_medium.ema_indicator()
-            features['ema_long'] = ema_long.ema_indicator()
+            features['ema_short'] = safe_indicator(ema_short.ema_indicator)
+            features['ema_medium'] = safe_indicator(ema_medium.ema_indicator)
+            features['ema_long'] = safe_indicator(ema_long.ema_indicator)
             
             # MACD
             macd = MACD(close=close)
-            features['macd'] = macd.macd()
-            features['macd_signal'] = macd.macd_signal()
+            features['macd'] = safe_indicator(macd.macd)
+            features['macd_signal'] = safe_indicator(macd.macd_signal)
             
             # Enhanced momentum indicators
             rsi = RSIIndicator(close=close)
-            features['rsi'] = rsi.rsi()
+            features['rsi'] = safe_indicator(rsi.rsi)
             
             roc = ROCIndicator(close=close, window=10)
-            features['roc'] = roc.roc()
+            features['roc'] = safe_indicator(roc.roc)
             
             williams = WilliamsRIndicator(high=high, low=low, close=close)
-            features['willr'] = williams.williams_r()
+            features['willr'] = safe_indicator(williams.williams_r)
             
             stoch = StochasticOscillator(high=high, low=low, close=close)
-            features['stoch_k'] = stoch.stoch()
-            features['stoch_d'] = stoch.stoch_signal()
+            features['stoch_k'] = safe_indicator(stoch.stoch)
+            features['stoch_d'] = safe_indicator(stoch.stoch_signal)
             
             # Advanced trend indicators
             adx = ADXIndicator(high=high, low=low, close=close)
-            features['adx'] = adx.adx()
-            features['di_plus'] = adx.adx_pos()
-            features['di_minus'] = adx.adx_neg()
+            features['adx'] = safe_indicator(adx.adx)
+            features['di_plus'] = safe_indicator(adx.adx_pos)
+            features['di_minus'] = safe_indicator(adx.adx_neg)
             
             # Volatility indicators
             bb = BollingerBands(close=close)
-            features['bbands_upper'] = bb.bollinger_hband()
-            features['bbands_middle'] = bb.bollinger_mavg()
-            features['bbands_lower'] = bb.bollinger_lband()
+            features['bbands_upper'] = safe_indicator(bb.bollinger_hband)
+            features['bbands_middle'] = safe_indicator(bb.bollinger_mavg)
+            features['bbands_lower'] = safe_indicator(bb.bollinger_lband)
             
             atr = AverageTrueRange(high=high, low=low, close=close)
-            features['atr'] = atr.average_true_range()
+            features['atr'] = safe_indicator(atr.average_true_range)
             
             # Volume and momentum indicators
             obv = OnBalanceVolumeIndicator(close=close, volume=volume)
-            features['obv'] = obv.on_balance_volume()
+            features['obv'] = safe_indicator(obv.on_balance_volume)
             
             adi = AccDistIndexIndicator(high=high, low=low, close=close, volume=volume)
-            features['ad'] = adi.acc_dist_index()
+            features['ad'] = safe_indicator(adi.acc_dist_index)
             
             cmf = ChaikinMoneyFlowIndicator(high=high, low=low, close=close, volume=volume)
-            features['cmf'] = cmf.chaikin_money_flow()
-            
-            # Handle NaN values
-            for key in features:
-                if isinstance(features[key], pd.Series):
-                    features[key] = features[key].ffill().bfill().bfill(0)
+            features['cmf'] = safe_indicator(cmf.chaikin_money_flow)
             
             return features
             
@@ -208,16 +214,18 @@ class DerivativesFeatureEngine:
             
             # Ensure close prices are positive and handle missing values
             close_prices = pd.to_numeric(df[close_col], errors='coerce')
-            close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan).ffill().bfill()
+            close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan)
+            close_prices = close_prices.ffill().bfill()
             close_prices = close_prices.clip(lower=1e-8)
             
             # Calculate returns safely
-            returns = np.log(close_prices / close_prices.shift(1)).fillna(0)
-            returns = returns.replace([np.inf, -np.inf], 0)
+            returns = pd.Series(
+                np.log(close_prices / close_prices.shift(1)),
+                index=close_prices.index
+            ).replace([np.inf, -np.inf], np.nan).fillna(0)
             
             # Scale returns for ARCH model
             scaled_returns = returns * 100  # Scale up by 100 for better numerical stability
-            scaled_returns = scaled_returns.replace([np.inf, -np.inf], 0)
             
             # Multi-horizon volatility forecasting
             for horizon in [1, 5, 22]:
@@ -227,12 +235,15 @@ class DerivativesFeatureEngine:
                         res = model.fit(disp='off', show_warning=False)
                         forecast = res.forecast(horizon=horizon)
                         vol = np.sqrt(forecast.variance.iloc[-1]) / 100
-                        features[f'vol_{horizon}d'] = np.clip(vol, 0, 10)  # Clip to reasonable range
+                        features[f'vol_{horizon}d'] = pd.Series(
+                            np.clip(vol, 0, 10),  # Clip to reasonable range
+                            index=returns.index[-horizon:]
+                        )
                     else:
-                        features[f'vol_{horizon}d'] = returns.std()
+                        features[f'vol_{horizon}d'] = returns.rolling(horizon*10).std().fillna(0)
                 except Exception as e:
                     logger.warning(f"Error in GARCH modeling for horizon {horizon}: {str(e)}")
-                    features[f'vol_{horizon}d'] = returns.rolling(horizon*10).std().fillna(0).iloc[-1]
+                    features[f'vol_{horizon}d'] = returns.rolling(horizon*10).std().fillna(0)
             
             return features
             
@@ -394,13 +405,26 @@ class DerivativesFeatureEngine:
                     close_prices = full_df.loc[:, (asset, 'close')]
                     if isinstance(close_prices, pd.DataFrame):
                         close_prices = close_prices.iloc[:, 0]
-                    returns_dict[asset] = np.log(close_prices).diff()
+                    
+                    # Handle zeros and missing values before log
+                    close_prices = pd.to_numeric(close_prices, errors='coerce')
+                    close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan)
+                    close_prices = close_prices.ffill().bfill()
+                    close_prices = close_prices.clip(lower=1e-8)
+                    
+                    # Calculate returns safely
+                    returns = pd.Series(
+                        np.log(close_prices / close_prices.shift(1)),
+                        index=close_prices.index
+                    ).replace([np.inf, -np.inf], np.nan).fillna(0)
+                    
+                    returns_dict[asset] = returns
+                    
                 except Exception as e:
                     logger.warning(f"Could not calculate returns for {asset}: {str(e)}")
                     continue
             
             if not returns_dict:
-                logger.warning("No valid returns data for cross-sectional features")
                 return {}
             
             returns_df = pd.DataFrame(returns_dict)
@@ -410,16 +434,20 @@ class DerivativesFeatureEngine:
             n_components = min(self.n_components, min(n_samples, n_features) - 1)
             
             if n_components > 0:
-                # PCA decomposition
-                pca = PCA(n_components=n_components)
-                pca_features = pca.fit_transform(
-                    self.scaler.fit_transform(returns_df.bfill(0))
-                )
-                
-                # Factor loadings
-                loadings = pca.components_[:, list(returns_dict.keys()).index(current_asset)]
-                for i, loading in enumerate(loadings):
-                    features[f'factor_{i+1}_loading'] = loading
+                try:
+                    # Fill any remaining NaN values with 0 before PCA
+                    returns_df_filled = returns_df.fillna(0)
+                    
+                    # PCA decomposition
+                    pca = PCA(n_components=n_components)
+                    pca_features = pca.fit_transform(self.scaler.fit_transform(returns_df_filled))
+                    
+                    # Factor loadings
+                    loadings = pca.components_[:, list(returns_dict.keys()).index(current_asset)]
+                    for i, loading in enumerate(loadings):
+                        features[f'factor_{i+1}_loading'] = pd.Series(loading, index=returns_df.index)
+                except Exception as e:
+                    logger.warning(f"Error in PCA calculation: {str(e)}")
             
             # Cross-sectional momentum
             try:
@@ -495,33 +523,28 @@ class DerivativesFeatureEngine:
             return df.fillna(0)
 
     def _select_features(self, df: pd.DataFrame, target_col: str = 'close') -> List[str]:
-        """Select most important features using mutual information"""
+        """Process features and optionally remove highly correlated ones"""
         try:
-            # Prepare data
-            X = df.copy()
-            y = X[target_col].pct_change().shift(-1)  # Future returns as target
-            X = X.iloc[:-1]  # Remove last row as we don't have target for it
-            y = y.iloc[:-1]
+            # By default, keep all features
+            features = list(df.columns)
             
-            # Fill NaN values with 0 before MI calculation
-            X_filled = X.fillna(0)
+            # Optionally, we can remove highly correlated features (correlation > 0.95)
+            # to reduce multicollinearity while preserving information
+            if self.feature_selection_threshold > 0:  # Only if threshold is set
+                correlation_matrix = df.corr().abs()
+                upper = correlation_matrix.where(np.triu(np.ones(correlation_matrix.shape), k=1).astype(bool))
+                to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+                
+                if to_drop:
+                    logger.info(f"Removing {len(to_drop)} highly correlated features: {to_drop}")
+                    features = [f for f in features if f not in to_drop]
             
-            # Calculate mutual information scores
-            mi_scores = mutual_info_regression(X_filled, y)
-            
-            # Create feature importance dictionary
-            feature_importance = dict(zip(X.columns, mi_scores))
-            
-            # Select features above threshold
-            selected = [feat for feat, score in feature_importance.items() 
-                       if score > self.feature_selection_threshold]
-            
-            logger.info(f"Selected {len(selected)} features out of {len(X.columns)}")
-            return selected
+            logger.info(f"Using {len(features)} features out of {len(df.columns)} total")
+            return features
             
         except Exception as e:
-            logger.error(f"Error in feature selection: {str(e)}")
-            return list(df.columns)
+            logger.error(f"Error in feature processing: {str(e)}")
+            return list(df.columns)  # Return all features if there's an error
 
     def _combine_features(self, features: Dict) -> pd.DataFrame:
         """Combine all features into a single DataFrame with proper normalization"""
@@ -529,25 +552,40 @@ class DerivativesFeatureEngine:
             combined = pd.DataFrame()
             all_features = set()
             
-            # First pass: collect all feature names
+            # First pass: collect all feature names and find common index
+            common_index = None
             for asset, asset_features in features.items():
                 for feat_name, feat_values in asset_features.items():
                     if isinstance(feat_values, (pd.Series, np.ndarray)):
                         all_features.add(feat_name)
+                        if isinstance(feat_values, pd.Series):
+                            if common_index is None:
+                                common_index = feat_values.index
+                            else:
+                                common_index = common_index.union(feat_values.index)
             
+            if common_index is None:
+                raise ValueError("No valid time series data found")
+                
             logger.info(f"Total features to process: {len(all_features)}")
             
-            # Second pass: ensure all assets have all features
+            # Second pass: ensure all assets have all features with aligned index
             for asset, asset_features in features.items():
                 try:
                     # Convert all features to DataFrame with proper types
-                    asset_df = pd.DataFrame()
+                    asset_df = pd.DataFrame(index=common_index)
                     
                     # Process each feature
                     for feat_name in all_features:
                         if feat_name in asset_features:
                             value = asset_features[feat_name]
                             if isinstance(value, (pd.Series, np.ndarray)):
+                                if isinstance(value, pd.Series):
+                                    # Reindex to common index
+                                    value = value.reindex(common_index)
+                                else:
+                                    # Convert numpy array to series with common index
+                                    value = pd.Series(value, index=common_index[:len(value)])
                                 asset_df[feat_name] = pd.to_numeric(value, errors='coerce')
                         else:
                             # If feature doesn't exist for this asset, fill with 0
@@ -558,12 +596,9 @@ class DerivativesFeatureEngine:
                         # Handle missing values properly
                         asset_df = self._handle_missing_values(asset_df)
                         
-                        # Select important features if not already selected
+                        # Keep all features by default
                         if self.selected_features is None:
                             self.selected_features = self._select_features(asset_df)
-                        
-                        # Keep only selected features
-                        asset_df = asset_df[self.selected_features]
                         
                         # Create proper MultiIndex columns
                         asset_df.columns = pd.MultiIndex.from_product(
@@ -581,26 +616,13 @@ class DerivativesFeatureEngine:
                     logger.error(f"Error combining features for {asset}: {str(e)}")
                     continue
             
-            # Verify all assets have the same features
-            assets = combined.columns.get_level_values('asset').unique()
-            features = combined.columns.get_level_values('feature').unique()
-            
-            for asset in assets:
-                asset_features = combined.xs(asset, axis=1, level='asset').columns
-                missing_features = set(features) - set(asset_features)
-                if missing_features:
-                    logger.warning(f"Asset {asset} is missing features: {missing_features}")
-                    # Add missing features with zeros
-                    for feature in missing_features:
-                        combined[(asset, feature)] = 0.0
-            
             # Sort columns for consistency
             combined = combined.sort_index(axis=1)
             
             # Final verification
             logger.info(f"Combined features shape: {combined.shape}")
-            logger.info(f"Features per asset: {len(features)}")
-            logger.info(f"Total assets: {len(assets)}")
+            logger.info(f"Features per asset: {len(self.selected_features) if self.selected_features else 0}")
+            logger.info(f"Total assets: {len(features)}")
             
             return combined
             

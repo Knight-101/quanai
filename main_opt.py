@@ -20,7 +20,7 @@ from monitoring.dashboard import TradingDashboard
 import warnings
 from data_system.data_manager import DataManager
 from stable_baselines3.ppo import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, SubprocVecEnv
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch.nn as nn
 # from data_collection.collect_multimodal import MultiModalDataCollector
@@ -32,7 +32,7 @@ from optuna.samplers import TPESampler
 
 # Setup logging
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('trading_bot.log'),
@@ -371,15 +371,18 @@ class TradingSystem:
                 show_progress_bar=True
             )
             
-            # Log best parameters
-            logger.info("\nOptimization finished!")
-            logger.info("Best trial:")
-            trial = self.study.best_trial
-            logger.info(f"  Value (Sharpe Ratio): {trial.value:.4f}")
-            logger.info("  Params:")
-            for key, value in trial.params.items():
+            # Enhanced logging
+            logger.info("\n" + "="*80)
+            logger.info("Optimization Results Summary")
+            logger.info("="*80)
+            logger.info(f"Number of completed trials: {len(self.study.trials)}")
+            logger.info(f"Best trial number: {self.study.best_trial.number}")
+            logger.info(f"Best trial value (Sharpe Ratio): {self.study.best_trial.value:.6f}")
+            logger.info("\nBest hyperparameters:")
+            for key, value in self.study.best_trial.params.items():
                 logger.info(f"    {key}: {value}")
-                
+            logger.info("="*80 + "\n")
+            
             # Save study results
             df = self.study.trials_dataframe()
             df.to_csv("optuna_results.csv")
@@ -394,113 +397,128 @@ class TradingSystem:
             
     def objective(self, trial: optuna.Trial, n_steps: int) -> float:
         """Optuna objective function for hyperparameter optimization"""
-        # Print trial start
-        logger.info(f"\nStarting trial {trial.number}")
+        # Add at start of function
+        print(f"\nStarting trial {trial.number}")
         
-        # Define hyperparameter search space
-        params = {
-            "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
-            "n_steps": trial.suggest_int("n_steps", 1024, 4096, step=1024),
-            "batch_size": trial.suggest_int("batch_size", 32, 256, step=32),
-            "n_epochs": trial.suggest_int("n_epochs", 3, 10),
-            "gamma": trial.suggest_float("gamma", 0.9, 0.9999),
-            "gae_lambda": trial.suggest_float("gae_lambda", 0.9, 1.0),
-            "clip_range": trial.suggest_float("clip_range", 0.1, 0.4),
-            "ent_coef": trial.suggest_float("ent_coef", 0.0, 0.01),
-            "vf_coef": trial.suggest_float("vf_coef", 0.1, 0.9),
-            "max_grad_norm": trial.suggest_float("max_grad_norm", 0.3, 0.9),
-            "target_kl": trial.suggest_float("target_kl", 0.01, 0.05)
-        }
-        
-        # Log trial parameters
-        logger.info("\nTraining with parameters:")
-        for key, value in params.items():
-            logger.info(f"    {key}: {value}")
-        
-        # Neural network architecture
-        net_arch = {
-            "pi": [
-                trial.suggest_int("pi_1", 64, 256, step=64),
-                trial.suggest_int("pi_2", 32, 128, step=32)
-            ],
-            "vf": [
-                trial.suggest_int("vf_1", 64, 256, step=64),
-                trial.suggest_int("vf_2", 32, 128, step=32)
-            ]
-        }
-        
-        # Log network architecture
-        logger.info("\nNetwork architecture:")
-        logger.info(f"    Policy network: {net_arch['pi']}")
-        logger.info(f"    Value network: {net_arch['vf']}")
-        
-        # Update policy kwargs
-        policy_kwargs = {
-            "net_arch": net_arch,
-            "activation_fn": torch.nn.ReLU,
-            "features_extractor_class": CustomFeatureExtractor,
-            "features_extractor_kwargs": {"features_dim": 128}
-        }
-        
-        # Create model with trial parameters
-        model = PPO(
-            "MlpPolicy",
-            self.env,
-            learning_rate=params["learning_rate"],
-            n_steps=params["n_steps"],
-            batch_size=params["batch_size"],
-            n_epochs=params["n_epochs"],
-            gamma=params["gamma"],
-            gae_lambda=params["gae_lambda"],
-            clip_range=params["clip_range"],
-            ent_coef=params["ent_coef"],
-            vf_coef=params["vf_coef"],
-            max_grad_norm=params["max_grad_norm"],
-            target_kl=params["target_kl"],
-            tensorboard_log=self.config['logging']['log_dir'],
-            policy_kwargs=policy_kwargs,
-            verbose=0,
-            device=self.device
-        )
+        # Dynamically sample hyperparameters using Optuna
+        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+        n_steps = trial.suggest_categorical("n_steps", [1024, 2048, 4096, 8192, 16384])
+        batch_size = trial.suggest_categorical("batch_size", [64,128,256, 512, 1024])
+        gamma = trial.suggest_categorical("gamma", [0.9, 0.95, 0.99])
+        gae_lambda = trial.suggest_categorical("gae_lambda", [0.9, 0.95, 0.98])
+        ent_coef = trial.suggest_float("ent_coef", 0.001, 0.1, log=True)
+        clip_range = trial.suggest_categorical("clip_range", [0.1, 0.2, 0.3])
+        n_epochs = trial.suggest_categorical("n_epochs", [5, 8, 10])
+        max_grad_norm = trial.suggest_categorical("max_grad_norm", [0.5, 0.8, 1.0])
+        vf_coef = trial.suggest_float("vf_coef", 0.4, 0.8)
+        target_kl = trial.suggest_float("target_kl", 0.01, 0.05)
+
+        # Define environment creation function
+        def make_env():
+            def _init():
+                env = InstitutionalPerpetualEnv(
+                    df=self.processed_data.copy(),
+                    initial_balance=self.config['trading']['initial_balance'],
+                    max_leverage=self.config['trading']['max_leverage'],
+                    transaction_fee=self.config['trading']['transaction_fee'],
+                    funding_fee_multiplier=self.config['trading']['funding_fee_multiplier'],
+                    risk_free_rate=self.config['trading']['risk_free_rate'],
+                    max_drawdown=self.config['risk_management']['limits']['max_drawdown'],
+                    window_size=self.config['model']['window_size']
+                )
+                return env
+            return _init
+
+        # Create multiple environments
+        n_envs = 8  # Number of parallel environments
+        env_fns = [make_env() for _ in range(n_envs)]
         
         try:
-            # Train for specified number of steps
-            logger.info(f"\nTraining model for {n_steps} steps...")
-            model.learn(total_timesteps=n_steps)
+            # Create vectorized environment
+            vec_env = SubprocVecEnv(env_fns)
+            env = VecNormalize(
+                vec_env,
+                norm_obs=True,
+                norm_reward=True,
+                clip_obs=10.0,
+                clip_reward=10.0,
+                gamma=gamma,
+                epsilon=1e-8
+            )
+
+            # Optimize network architecture for GPU
+            policy_kwargs = dict(
+                net_arch=[
+                    dict(
+                        pi=[512, 256],
+                        vf=[512, 256]
+                    )
+                ],
+                activation_fn=nn.ReLU,
+                ortho_init=True,
+                log_std_init=-0.5,
+                optimizer_class=torch.optim.Adam,
+                optimizer_kwargs=dict(
+                    eps=1e-5,
+                    weight_decay=1e-5
+                )
+            )
+
+            # Create model with trial parameters
+            model = PPO(
+                "MlpPolicy",
+                env,
+                learning_rate=learning_rate,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                n_epochs=n_epochs,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                clip_range=clip_range,
+                ent_coef=ent_coef,
+                vf_coef=vf_coef,
+                max_grad_norm=max_grad_norm,
+                target_kl=target_kl,
+                tensorboard_log=self.config['logging']['log_dir'],
+                policy_kwargs=policy_kwargs,
+                verbose=0,
+                device=self.device
+            )
+
+            # Training loop with progress tracking
+            progress_interval = n_steps // 50
             
-            # Evaluate model
-            logger.info("\nEvaluating model performance...")
+            logger.info(f"\n╔═ Training Progress ═{'═' * 63}╗")
+            for step in range(0, n_steps, progress_interval):
+                model.learn(total_timesteps=progress_interval)
+                
+                progress = (step + progress_interval) / n_steps * 100
+                progress_bar = "█" * int(progress / 2) + "░" * (50 - int(progress / 2))
+                
+                if step > 0:
+                    quick_metrics = self._evaluate_model(model, n_eval_episodes=2)
+                    metrics_str = f"Sharpe: {quick_metrics['sharpe_ratio']:.4f} | Return: {quick_metrics['mean_return']:.4f}"
+                    logger.info(f"║ [{progress_bar}] {progress:5.1f}% | {metrics_str:<30} ║")
+                else:
+                    logger.info(f"║ [{progress_bar}] {progress:5.1f}% | Initializing...{' ' * 18} ║")
+
+            # Final evaluation
             eval_metrics = self._evaluate_model(model)
             
-            # Log metrics
-            trial.set_user_attr("sharpe_ratio", eval_metrics["sharpe_ratio"])
-            trial.set_user_attr("max_drawdown", eval_metrics["max_drawdown"])
-            trial.set_user_attr("mean_return", eval_metrics["mean_return"])
-            
-            # Log evaluation results
-            logger.info("\nTrial results:")
-            logger.info(f"    Sharpe Ratio: {eval_metrics['sharpe_ratio']:.4f}")
-            logger.info(f"    Mean Return: {eval_metrics['mean_return']:.4f}")
-            logger.info(f"    Max Drawdown: {eval_metrics['max_drawdown']:.4f}")
-            
-            # Compare with best trial so far
-            if len(self.study.trials) > 1:
-                best_trial = self.study.best_trial
-                logger.info("\nComparison with best trial:")
-                logger.info(f"    Current trial Sharpe: {eval_metrics['sharpe_ratio']:.4f}")
-                logger.info(f"    Best trial Sharpe: {best_trial.value:.4f}")
-                if eval_metrics['sharpe_ratio'] > best_trial.value:
-                    logger.info("    New best trial found!")
-            
-            # Save trial model
-            model.save(f"models/trial_{trial.number}_model")
-            self.env.save(f"models/trial_{trial.number}_env.pkl")
-            logger.info(f"\nTrial {trial.number} model saved")
+            # Clean up
+            env.close()
             
             return eval_metrics["sharpe_ratio"]
-            
+
         except Exception as e:
-            logger.error(f"\nError in trial {trial.number}: {str(e)}")
+            logger.error(f"\n╔═ Error in Trial {trial.number} ═{'═' * 59}╗")
+            logger.error(f"║ {str(e):<78} ║")
+            logger.error(f"╚{'═' * 80}╝\n")
+            
+            # Clean up on error
+            if 'env' in locals():
+                env.close()
+            
             raise optuna.TrialPruned()
             
     def _evaluate_model(self, model, n_eval_episodes=5):
@@ -526,8 +544,12 @@ class TradingSystem:
             # Calculate Sharpe ratio
             returns_array = np.array(returns_list)
             if len(returns_array) > 1:
-                sharpe = np.mean(returns_array) / (np.std(returns_array) + 1e-6) * np.sqrt(252)
+                mean_return = np.mean(returns_array)
+                std_return = np.std(returns_array) + 1e-6  # Add epsilon to avoid division by zero
+                sharpe = mean_return / std_return * np.sqrt(252)
                 sharpe_ratios.append(sharpe)
+            else:
+                sharpe_ratios.append(0)  # Default to 0 if not enough data
             
             # Calculate max drawdown
             cumulative_returns = np.cumsum(returns_list)
@@ -593,107 +615,61 @@ class TradingSystem:
         logger.info("Model updated with best parameters from optimization")
 
     def train(self):
-        """Consolidated training method"""
+        """Optimized training method without curriculum learning"""
         if not self.model or not self.env:
             raise RuntimeError("System not initialized. Call initialize() first.")
-            
+        
         logger.info("Starting model training...")
         
-        # Training loop with curriculum
-        for curriculum_stage in self.config['training']['curriculum_stages']:
-            logger.info(f"Starting curriculum stage: {curriculum_stage['name']}")
-            
-            # Update environment parameters for this stage
-            self.env.envs[0].update_parameters(**curriculum_stage['env_params'])
-            
-            # Setup callbacks for this stage
-            callbacks = []
-            if 'callbacks' in self.config['training']:
-                for callback_config in self.config['training']['callbacks']:
-                    if callback_config['type'] == 'checkpoint':
-                        callbacks.append(CheckpointCallback(
-                            save_freq=callback_config['save_freq'],
-                            save_path=self.config['model']['checkpoint_dir'],
-                            name_prefix=f"stage_{curriculum_stage['name']}"
-                        ))
-                    elif callback_config['type'] == 'eval':
-                        callbacks.append(EvalCallback(
-                            eval_env=self.env,
-                            n_eval_episodes=callback_config['n_eval_episodes'],
-                            eval_freq=callback_config['eval_freq'],
-                            log_path=self.config['logging']['log_dir'],
-                            deterministic=True
-                        ))
-                    # Add more callback types as needed
-            
-            # Train for this stage
+        # Setup callbacks for checkpointing and evaluation
+        callbacks = []
+        
+        # Checkpoint callback - save every 100k steps
+        checkpoint_callback = CheckpointCallback(
+            save_freq=100000,
+            save_path=self.config['model']['checkpoint_dir'],
+            name_prefix="ppo_trading"
+        )
+        callbacks.append(checkpoint_callback)
+        
+        # Evaluation callback - evaluate every 50k steps
+        eval_callback = EvalCallback(
+            eval_env=self.env,
+            n_eval_episodes=5,
+            eval_freq=50000,
+            log_path=self.config['logging']['log_dir'],
+            deterministic=True,
+            render=False
+        )
+        callbacks.append(eval_callback)
+        
+        # Train the model with optimized parameters
+        total_timesteps = self.config['training'].get('total_timesteps', 2_000_000)
+        
+        try:
             self.model.learn(
-                total_timesteps=curriculum_stage['timesteps'],
-                callback=callbacks if callbacks else None
+                total_timesteps=total_timesteps,
+                callback=callbacks,
+                tb_log_name="ppo_trading",
+                progress_bar=True
             )
             
-            # Evaluate stage performance
-            self._evaluate_stage(curriculum_stage['name'])
+            # Save final model
+            final_model_path = os.path.join(self.config['model']['checkpoint_dir'], "final_model")
+            self.model.save(final_model_path)
+            self.env.save(os.path.join(self.config['model']['checkpoint_dir'], "final_env.pkl"))
             
-            # Save stage checkpoint
-            self._save_checkpoint(f"stage_{curriculum_stage['name']}")
+            # Final evaluation
+            eval_metrics = self._evaluate_model(self.model)
+            logger.info("\nTraining completed!")
+            logger.info(f"Final metrics:")
+            logger.info(f"Mean return: {eval_metrics['mean_return']:.4f}")
+            logger.info(f"Sharpe ratio: {eval_metrics['sharpe_ratio']:.4f}")
+            logger.info(f"Max drawdown: {eval_metrics['max_drawdown']:.4f}")
             
-    def _evaluate_stage(self, stage: str):
-        """Helper method for stage evaluation"""
-        logger.info(f"Evaluating model performance for stage: {stage}")
-        
-        eval_episodes = self.config['training']['eval_episodes']
-        metrics = self._run_evaluation_episodes(eval_episodes)
-        
-        # Log metrics
-        wandb.log({
-            f'{stage}/mean_return': metrics['mean_return'],
-            f'{stage}/sharpe_ratio': metrics['sharpe_ratio'],
-            f'{stage}/max_drawdown': metrics['max_drawdown']
-        })
-        
-    def _run_evaluation_episodes(self, n_episodes):
-        """Helper method to run evaluation episodes"""
-        returns = []
-        sharpe_ratios = []
-        max_drawdowns = []
-        
-        for _ in range(n_episodes):
-            episode_metrics = self._run_single_episode()
-            returns.append(episode_metrics['return'])
-            sharpe_ratios.append(episode_metrics['sharpe'])
-            max_drawdowns.append(episode_metrics['max_drawdown'])
-            
-        return {
-            'mean_return': np.mean(returns),
-            'sharpe_ratio': np.mean(sharpe_ratios),
-            'max_drawdown': np.mean(max_drawdowns)
-        }
-        
-    def _run_single_episode(self):
-        """Helper method to run a single evaluation episode"""
-        obs = self.env.reset()
-        done = False
-        episode_return = 0
-        info = {}
-        
-        while not done:
-            action = self.model.predict(obs, deterministic=True)
-            obs, reward, done, _, info = self.env.step(action)
-            episode_return += reward
-            self.dashboard.update_metrics(info)
-        
-        return {
-            'return': episode_return,
-            'sharpe': info['risk_metrics']['sharpe'],
-            'max_drawdown': info['risk_metrics']['max_drawdown']
-        }
-        
-    def _save_checkpoint(self, name: str):
-        """Helper method to save model checkpoint"""
-        save_path = os.path.join(self.config['model']['checkpoint_dir'], f"{name}_{datetime.now().strftime('%Y%m%d_%H%M')}.pkl")
-        self.model.save(save_path)
-        logger.info(f"Model checkpoint saved to {save_path}")
+        except Exception as e:
+            logger.error(f"Error during training: {str(e)}")
+            raise
 
     def _format_data_for_training(self, raw_data):
         """Format data into the structure expected by the trading environment"""
@@ -712,82 +688,91 @@ class TradingSystem:
                 formatted_symbol = symbol.split('/')[0] + "USDT" if not symbol.endswith('USDT') else symbol
                 logger.info(f"Formatted symbol: {formatted_symbol}")
                 
-                # Create a copy to avoid modifying original data
-                df = symbol_data.copy()
-                logger.info(f"Original columns: {df.columns}")
-                
-                # Create formatted DataFrame
-                formatted_data = pd.DataFrame(index=df.index)
-                
-                # Add OHLCV data
-                for col in ['open', 'high', 'low', 'close']:
-                    if col not in df.columns:
-                        raise ValueError(f"Missing required price column {col} for {formatted_symbol}")
-                    formatted_data[col] = df[col].astype(float)
-                
-                # Handle volume data
-                if 'volume' in df.columns:
-                    formatted_data['volume'] = df['volume'].astype(float)
-                else:
-                    # Generate synthetic volume based on price volatility
-                    returns = formatted_data['close'].pct_change()
-                    vol = returns.rolling(window=20).std().fillna(0.01)
-                    formatted_data['volume'] = formatted_data['close'] * vol * 1000
-                
-                # Ensure volume is positive and non-zero
-                formatted_data['volume'] = formatted_data['volume'].clip(lower=1.0)
-                
-                # Handle funding rate
-                if 'funding_rate' in df.columns:
-                    formatted_data['funding_rate'] = df['funding_rate'].astype(float)
-                else:
-                    # Use small random funding rate
-                    formatted_data['funding_rate'] = np.random.normal(0, 0.0001, size=len(formatted_data))
-                
-                # Handle market depth
-                if 'bid_depth' in df.columns and 'ask_depth' in df.columns:
-                    formatted_data['bid_depth'] = df['bid_depth'].astype(float)
-                    formatted_data['ask_depth'] = df['ask_depth'].astype(float)
-                else:
-                    # Generate synthetic depth based on volume
-                    formatted_data['bid_depth'] = formatted_data['volume'] * 0.4
-                    formatted_data['ask_depth'] = formatted_data['volume'] * 0.4
-                
-                # Ensure depth is positive and non-zero
-                formatted_data['bid_depth'] = formatted_data['bid_depth'].clip(lower=1.0)
-                formatted_data['ask_depth'] = formatted_data['ask_depth'].clip(lower=1.0)
-                
-                # Add volatility
-                returns = formatted_data['close'].pct_change()
-                formatted_data['volatility'] = returns.rolling(window=20).std().fillna(0.01)
-                
-                # Forward fill any NaN values first
-                formatted_data = formatted_data.ffill()
-                
-                # Then backward fill any remaining NaN values at the start
-                formatted_data = formatted_data.bfill()
-                
-                # Ensure no NaN values remain
-                if formatted_data.isna().any().any():
-                    logger.error(f"NaN values found in {formatted_symbol} data")
-                    logger.error(f"NaN columns: {formatted_data.columns[formatted_data.isna().any()]}")
-                    raise ValueError(f"NaN values remain in formatted data for {formatted_symbol}")
-                
-                # Create MultiIndex columns
-                formatted_data.columns = pd.MultiIndex.from_product(
-                    [[formatted_symbol], formatted_data.columns],
-                    names=['asset', 'feature']
-                )
-                
-                logger.info(f"Formatted columns for {formatted_symbol}: {formatted_data.columns}")
-                
-                # Verify all required features exist
-                required_features = ['open', 'high', 'low', 'close', 'volume', 'funding_rate', 'bid_depth', 'ask_depth', 'volatility']
-                for feature in required_features:
-                    if (formatted_symbol, feature) not in formatted_data.columns:
-                        raise ValueError(f"Missing required feature {feature} for {formatted_symbol}")
-                
-                symbol_dfs.append(formatted_data)
+                try:
+                    # Create a copy to avoid modifying original data
+                    df = symbol_data.copy()
+                    logger.info(f"Original columns: {df.columns}")
+                    
+                    # Create formatted DataFrame
+                    formatted_data = pd.DataFrame(index=df.index)
+                    
+                    # Add OHLCV data with proper numeric conversion
+                    for col in ['open', 'high', 'low', 'close']:
+                        if col not in df.columns:
+                            raise ValueError(f"Missing required price column {col} for {formatted_symbol}")
+                        formatted_data[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+                    # Handle volume data
+                    if 'volume' in df.columns:
+                        formatted_data['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+                    else:
+                        # Generate synthetic volume based on price volatility
+                        returns = formatted_data['close'].pct_change()
+                        vol = returns.rolling(window=20).std().fillna(0.01)
+                        formatted_data['volume'] = formatted_data['close'] * vol * 1000
+                    
+                    # Ensure volume is positive and non-zero
+                    formatted_data['volume'] = formatted_data['volume'].clip(lower=1.0)
+                    
+                    # Handle funding rate
+                    if 'funding_rate' in df.columns:
+                        formatted_data['funding_rate'] = pd.to_numeric(df['funding_rate'], errors='coerce')
+                    else:
+                        # Use small random funding rate
+                        formatted_data['funding_rate'] = np.random.normal(0, 0.0001, size=len(formatted_data))
+                    
+                    # Handle market depth
+                    if 'bid_depth' in df.columns and 'ask_depth' in df.columns:
+                        formatted_data['bid_depth'] = pd.to_numeric(df['bid_depth'], errors='coerce')
+                        formatted_data['ask_depth'] = pd.to_numeric(df['ask_depth'], errors='coerce')
+                    else:
+                        # Generate synthetic depth based on volume
+                        formatted_data['bid_depth'] = formatted_data['volume'] * 0.4
+                        formatted_data['ask_depth'] = formatted_data['volume'] * 0.4
+                    
+                    # Ensure depth is positive and non-zero
+                    formatted_data['bid_depth'] = formatted_data['bid_depth'].clip(lower=1.0)
+                    formatted_data['ask_depth'] = formatted_data['ask_depth'].clip(lower=1.0)
+                    
+                    # Add volatility
+                    close_returns = formatted_data['close'].pct_change()
+                    formatted_data['volatility'] = close_returns.rolling(window=20).std().fillna(0.01)
+                    
+                    # Handle missing values
+                    # First replace infinities with NaN
+                    formatted_data = formatted_data.replace([np.inf, -np.inf], np.nan)
+                    
+                    # Forward fill any NaN values first
+                    formatted_data = formatted_data.ffill()
+                    
+                    # Then backward fill any remaining NaN values at the start
+                    formatted_data = formatted_data.bfill()
+                    
+                    # Final NaN check
+                    if formatted_data.isna().any().any():
+                        logger.error(f"NaN values found in {formatted_symbol} data")
+                        logger.error(f"NaN columns: {formatted_data.columns[formatted_data.isna().any()]}")
+                        raise ValueError(f"NaN values remain in formatted data for {formatted_symbol}")
+                    
+                    # Create MultiIndex columns
+                    formatted_data.columns = pd.MultiIndex.from_product(
+                        [[formatted_symbol], formatted_data.columns],
+                        names=['asset', 'feature']
+                    )
+                    
+                    logger.info(f"Formatted columns for {formatted_symbol}: {formatted_data.columns}")
+                    
+                    # Verify all required features exist
+                    required_features = ['open', 'high', 'low', 'close', 'volume', 'funding_rate', 'bid_depth', 'ask_depth', 'volatility']
+                    for feature in required_features:
+                        if (formatted_symbol, feature) not in formatted_data.columns:
+                            raise ValueError(f"Missing required feature {feature} for {formatted_symbol}")
+                    
+                    symbol_dfs.append(formatted_data)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {formatted_symbol}: {str(e)}")
+                    continue
         
         # Combine all symbol data
         if not symbol_dfs:
@@ -798,7 +783,7 @@ class TradingSystem:
         logger.info(f"Combined data shape before deduplication: {combined_data.shape}")
         
         # Remove duplicate columns by taking the mean of duplicates
-        combined_data = combined_data.groupby(level=[0, 1], axis=1).mean()
+        combined_data = combined_data.T.groupby(level=[0, 1]).mean().T
         logger.info(f"Combined data shape after deduplication: {combined_data.shape}")
         
         # Sort the columns for consistency
@@ -821,9 +806,9 @@ class TradingSystem:
                 # Check for NaN or infinite values
                 if not np.isfinite(feature_data).all():
                     logger.warning(f"Found invalid values in {feature} for {asset}, fixing...")
-                    combined_data.loc[:, (asset, feature)] = feature_data.replace(
-                        [np.inf, -np.inf], np.nan
-                    ).fillna(method='ffill').fillna(method='bfill')
+                    feature_data = feature_data.replace([np.inf, -np.inf], np.nan)
+                    feature_data = feature_data.ffill().bfill()
+                    combined_data.loc[:, (asset, feature)] = feature_data
         
         logger.info("Base data formatting completed successfully")
         
@@ -839,12 +824,28 @@ class TradingSystem:
             final_data = pd.concat([combined_data, processed_data], axis=1)
             final_data = final_data.loc[:, ~final_data.columns.duplicated()]
             
+            # Ensure all data is numeric
+            for col in final_data.columns:
+                final_data[col] = pd.to_numeric(final_data[col], errors='coerce')
+            
+            # Final NaN check and handling
+            final_data = final_data.replace([np.inf, -np.inf], np.nan)
+            final_data = final_data.ffill().bfill()
+            
             return final_data
             
         except Exception as e:
             logger.error(f"Error in feature engineering: {str(e)}")
             logger.warning("Falling back to base features only")
             return combined_data
+
+    def __del__(self):
+        """Cleanup method for TradingSystem"""
+        if hasattr(self, 'env') and self.env is not None:
+            try:
+                self.env.close()
+            except Exception as e:
+                logger.warning(f"Error during environment cleanup: {e}")
 
 async def main():
     try:
@@ -863,7 +864,7 @@ async def main():
         await trading_system.initialize(args)
         
         # Run hyperparameter optimization
-        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, n_steps=100000)
+        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=4, n_steps=100000)
         
         # Train the model with best parameters
         trading_system.train()
