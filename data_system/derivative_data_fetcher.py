@@ -39,7 +39,7 @@ class PerpetualDataFetcher:
         }
         
     async def fetch_derivative_data(self):
-        """Fetch data from Binance"""
+        """Fetch data from Binance with improved error handling"""
         try:
             # Load markets first
             await self.exchange.load_markets()
@@ -50,6 +50,8 @@ class PerpetualDataFetcher:
                 
         except Exception as e:
             logger.error(f"Error fetching data from Binance: {str(e)}")
+            if 'symbol' in str(e).lower():
+                logger.error("Symbol error - check if the trading pair exists on Binance Futures")
         finally:
             await self.exchange.close()  # Properly close exchange connection
         

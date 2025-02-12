@@ -109,14 +109,31 @@ class DerivativesFeatureEngine:
         try:
             features = {}
             
-            # Get price and volume data
-            close = df['close']
-            high = df['high']
-            low = df['low']
-            volume = df['volume']
+            # Get price and volume data and ensure they are finite
+            close = pd.to_numeric(df['close'], errors='coerce')
+            high = pd.to_numeric(df['high'], errors='coerce')
+            low = pd.to_numeric(df['low'], errors='coerce')
+            volume = pd.to_numeric(df['volume'], errors='coerce')
+            
+            # Replace zeros with NaN before log
+            close = close.replace(0, np.nan)
+            high = high.replace(0, np.nan)
+            low = low.replace(0, np.nan)
             
             # Store close price
             features['close'] = close
+            
+            # Handle missing values before calculations
+            close = close.ffill().bfill()
+            high = high.ffill().bfill()
+            low = low.ffill().bfill()
+            volume = volume.ffill().bfill()
+            
+            # Ensure all values are positive before calculations
+            close = close.clip(lower=1e-8)
+            high = high.clip(lower=1e-8)
+            low = low.clip(lower=1e-8)
+            volume = volume.clip(lower=0)
             
             # Trend indicators
             ema_short = EMAIndicator(close=close, window=12)
@@ -174,7 +191,7 @@ class DerivativesFeatureEngine:
             # Handle NaN values
             for key in features:
                 if isinstance(features[key], pd.Series):
-                    features[key] = features[key].fillna(method='ffill').fillna(0)
+                    features[key] = features[key].ffill().bfill().bfill(0)
             
             return features
             
@@ -188,35 +205,34 @@ class DerivativesFeatureEngine:
         try:
             features = {}
             close_col = [col for col in df.columns if 'close' in col.lower()][0]
-            returns = np.log(df[close_col]).diff().dropna()
+            
+            # Ensure close prices are positive and handle missing values
+            close_prices = pd.to_numeric(df[close_col], errors='coerce')
+            close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan).ffill().bfill()
+            close_prices = close_prices.clip(lower=1e-8)
+            
+            # Calculate returns safely
+            returns = np.log(close_prices / close_prices.shift(1)).fillna(0)
+            returns = returns.replace([np.inf, -np.inf], 0)
             
             # Scale returns for ARCH model
             scaled_returns = returns * 100  # Scale up by 100 for better numerical stability
+            scaled_returns = scaled_returns.replace([np.inf, -np.inf], 0)
             
             # Multi-horizon volatility forecasting
             for horizon in [1, 5, 22]:
                 try:
-                    model = arch_model(scaled_returns, vol='Garch', p=1, q=1, rescale=False)
-                    res = model.fit(disp='off', show_warning=False)
-                    forecast = res.forecast(horizon=horizon)
-                    features[f'vol_{horizon}d'] = np.sqrt(forecast.variance.iloc[-1]) / 100  # Scale back down
+                    if len(scaled_returns.dropna()) > 100:  # Only fit if enough data
+                        model = arch_model(scaled_returns, vol='Garch', p=1, q=1, rescale=False)
+                        res = model.fit(disp='off', show_warning=False)
+                        forecast = res.forecast(horizon=horizon)
+                        vol = np.sqrt(forecast.variance.iloc[-1]) / 100
+                        features[f'vol_{horizon}d'] = np.clip(vol, 0, 10)  # Clip to reasonable range
+                    else:
+                        features[f'vol_{horizon}d'] = returns.std()
                 except Exception as e:
                     logger.warning(f"Error in GARCH modeling for horizon {horizon}: {str(e)}")
-                    features[f'vol_{horizon}d'] = returns.std()
-            
-            # Volatility regime detection using HMM
-            try:
-                vol_regime = self._detect_regime(returns)
-                features['vol_regime'] = vol_regime
-            except Exception as e:
-                logger.warning(f"Error in regime detection: {str(e)}")
-                features['vol_regime'] = 0
-            
-            # Term structure features
-            if all(k in features for k in ['vol_1d', 'vol_5d', 'vol_22d']):
-                features['vol_term_struct'] = features['vol_22d'] / features['vol_1d']
-                features['vol_curvature'] = (features['vol_5d'] - features['vol_1d']) / \
-                                          (features['vol_22d'] - features['vol_5d'])
+                    features[f'vol_{horizon}d'] = returns.rolling(horizon*10).std().fillna(0).iloc[-1]
             
             return features
             
@@ -226,29 +242,48 @@ class DerivativesFeatureEngine:
         
     def _add_flow_features(self, df: pd.DataFrame) -> Dict:
         """Order flow and market microstructure features"""
-        features = {}
-        
-        # Volume profile
-        vwap = (df['close'] * df['volume']).rolling(24).sum() / df['volume'].rolling(24).sum()
-        features['vwap_divergence'] = (df['close'] - vwap) / vwap
-        
-        # Order book pressure
-        if 'bid_depth' in df.columns and 'ask_depth' in df.columns:
-            features['book_pressure'] = (df['bid_depth'] - df['ask_depth']) / \
-                                      (df['bid_depth'] + df['ask_depth'])
+        try:
+            features = {}
             
-        # Funding rate dynamics
-        if 'funding_rate' in df.columns:
-            features['funding_zscore'] = (
-                df['funding_rate'] - df['funding_rate'].rolling(24).mean()
-            ) / df['funding_rate'].rolling(24).std()
+            # Ensure numeric values and handle missing data
+            close = pd.to_numeric(df['close'], errors='coerce').fillna(method='ffill')
+            volume = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
             
-        # Liquidation risk metrics
-        if 'liquidations' in df.columns:
-            features['liq_intensity'] = df['liquidations'].rolling(12).sum() / \
-                                      df['liquidations'].rolling(48).sum()
+            # Volume profile with safety checks
+            volume_sum = volume.rolling(24).sum()
+            volume_sum = volume_sum.replace(0, np.nan)  # Avoid division by zero
+            vwap = (close * volume).rolling(24).sum() / volume_sum
+            vwap = vwap.fillna(close)  # Use close price if VWAP calculation fails
             
-        return features
+            # Calculate divergence safely
+            features['vwap_divergence'] = ((close - vwap) / vwap.clip(lower=1e-8)).fillna(0).clip(-10, 10)
+            
+            # Order book pressure with safety checks
+            if 'bid_depth' in df.columns and 'ask_depth' in df.columns:
+                bid_depth = pd.to_numeric(df['bid_depth'], errors='coerce').fillna(0).clip(lower=1e-8)
+                ask_depth = pd.to_numeric(df['ask_depth'], errors='coerce').fillna(0).clip(lower=1e-8)
+                sum_depth = bid_depth + ask_depth
+                features['book_pressure'] = np.where(
+                    sum_depth > 0,
+                    (bid_depth - ask_depth) / sum_depth,
+                    0
+                )
+            
+            # Funding rate dynamics with safety checks
+            if 'funding_rate' in df.columns:
+                funding = pd.to_numeric(df['funding_rate'], errors='coerce').fillna(0)
+                funding_std = funding.rolling(24).std()
+                features['funding_zscore'] = np.where(
+                    funding_std > 0,
+                    (funding - funding.rolling(24).mean()) / funding_std,
+                    0
+                )
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error in flow features: {str(e)}")
+            return {}
         
     def _add_market_sentiment(self, df: pd.DataFrame) -> Dict:
         """Calculate market sentiment indicators"""
@@ -303,51 +338,42 @@ class DerivativesFeatureEngine:
                     close_prices = full_df.loc[:, (asset, 'close')]
                     if isinstance(close_prices, pd.DataFrame):
                         close_prices = close_prices.iloc[:, 0]
-                    returns_dict[asset] = np.log(close_prices).diff()
+                    
+                    # Handle zeros and missing values before log
+                    close_prices = pd.to_numeric(close_prices, errors='coerce')
+                    close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan)
+                    close_prices = close_prices.ffill().bfill()
+                    close_prices = close_prices.clip(lower=1e-8)
+                    
+                    # Calculate returns safely
+                    returns = np.log(close_prices / close_prices.shift(1)).fillna(0)
+                    returns = returns.replace([np.inf, -np.inf], 0)
+                    returns_dict[asset] = returns
+                    
                 except Exception as e:
                     logger.warning(f"Could not calculate returns for {asset}: {str(e)}")
                     continue
             
             if not returns_dict:
-                logger.warning("No valid returns data for correlation calculation")
                 return {}
                 
-            returns_df = pd.DataFrame(returns_dict)
+            returns_df = pd.DataFrame(returns_dict).fillna(0)
             current_returns = returns_df[current_asset]
             
-            # Rolling correlations with other assets
+            # Calculate correlations safely
             for asset in returns_df.columns:
                 if asset != current_asset:
                     try:
-                        corr = returns_df[asset].rolling(window).corr(current_returns)
-                        features[f'corr_{asset}'] = corr
+                        other_returns = returns_df[asset]
+                        # Only calculate correlation if both series have variation
+                        if current_returns.std() > 0 and other_returns.std() > 0:
+                            corr = returns_df[asset].rolling(window).corr(current_returns)
+                            features[f'corr_{asset}'] = corr.fillna(0).clip(-1, 1)
+                        else:
+                            features[f'corr_{asset}'] = pd.Series(0, index=returns_df.index)
                     except Exception as e:
                         logger.warning(f"Could not calculate correlation between {current_asset} and {asset}: {str(e)}")
                         features[f'corr_{asset}'] = pd.Series(0, index=returns_df.index)
-            
-            # Average correlation
-            correlations = [features[f'corr_{asset}'] for asset in returns_df.columns if asset != current_asset]
-            if correlations:
-                features['avg_correlation'] = pd.concat(correlations, axis=1).mean(axis=1)
-            else:
-                features['avg_correlation'] = pd.Series(0, index=returns_df.index)
-            
-            # Correlation regime
-            features['correlation_regime'] = (
-                features['avg_correlation'] - 
-                features['avg_correlation'].rolling(window*2).mean()
-            ).fillna(0)
-            
-            # Beta to market (using average returns as market proxy)
-            market_returns = returns_df.mean(axis=1)
-            try:
-                features['market_beta'] = (
-                    returns_df[current_asset].rolling(window).cov(market_returns) /
-                    market_returns.rolling(window).var()
-                ).fillna(0)
-            except Exception as e:
-                logger.warning(f"Could not calculate market beta for {current_asset}: {str(e)}")
-                features['market_beta'] = pd.Series(0, index=returns_df.index)
             
             return features
             
@@ -387,7 +413,7 @@ class DerivativesFeatureEngine:
                 # PCA decomposition
                 pca = PCA(n_components=n_components)
                 pca_features = pca.fit_transform(
-                    self.scaler.fit_transform(returns_df.fillna(0))
+                    self.scaler.fit_transform(returns_df.bfill(0))
                 )
                 
                 # Factor loadings
@@ -445,6 +471,29 @@ class DerivativesFeatureEngine:
             logger.warning(f"HMM fitting failed: {str(e)}")
             return pd.Series(0, index=returns.index)
         
+    def _handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Handle missing values more intelligently"""
+        try:
+            # Forward fill first (for time series consistency)
+            df = df.ffill()
+            
+            # For any remaining NaNs, use rolling median
+            window_size = min(24, len(df) // 2)  # Use smaller of 24 periods or half the data
+            rolling_median = df.rolling(window=window_size, min_periods=1).median()
+            df = df.fillna(rolling_median)
+            
+            # If still any NaNs, fill with 0
+            df = df.fillna(0)
+            
+            # Clip extreme values
+            df = df.clip(lower=-1e8, upper=1e8)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error handling missing values: {str(e)}")
+            return df.fillna(0)
+
     def _select_features(self, df: pd.DataFrame, target_col: str = 'close') -> List[str]:
         """Select most important features using mutual information"""
         try:
@@ -454,8 +503,11 @@ class DerivativesFeatureEngine:
             X = X.iloc[:-1]  # Remove last row as we don't have target for it
             y = y.iloc[:-1]
             
+            # Fill NaN values with 0 before MI calculation
+            X_filled = X.fillna(0)
+            
             # Calculate mutual information scores
-            mi_scores = mutual_info_regression(X.fillna(0), y)
+            mi_scores = mutual_info_regression(X_filled, y)
             
             # Create feature importance dictionary
             feature_importance = dict(zip(X.columns, mi_scores))
@@ -470,25 +522,6 @@ class DerivativesFeatureEngine:
         except Exception as e:
             logger.error(f"Error in feature selection: {str(e)}")
             return list(df.columns)
-
-    def _handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle missing values more intelligently"""
-        try:
-            # Forward fill first (for time series consistency)
-            df = df.ffill()
-            
-            # For any remaining NaNs, use rolling median
-            window_size = min(24, len(df) // 2)  # Use smaller of 24 periods or half the data
-            df = df.fillna(df.rolling(window=window_size, min_periods=1).median())
-            
-            # If still any NaNs, fill with 0
-            df = df.fillna(0)
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error handling missing values: {str(e)}")
-            return df.fillna(0)
 
     def _combine_features(self, features: Dict) -> pd.DataFrame:
         """Combine all features into a single DataFrame with proper normalization"""
