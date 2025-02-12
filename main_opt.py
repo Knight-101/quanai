@@ -305,10 +305,10 @@ class TradingSystem:
     def _setup_model(self, args=None) -> PPO:
         """Consolidated model setup"""
         policy_kwargs = {
-            "net_arch": {
-                "pi": [128, 128],
-                "vf": [128, 128]
-            },
+            "net_arch": dict(
+                pi=[128, 128],
+                vf=[128, 128]
+            ),
             "activation_fn": torch.nn.ReLU,
             "features_extractor_class": CustomFeatureExtractor,
             "features_extractor_kwargs": {"features_dim": 128}
@@ -377,7 +377,10 @@ class TradingSystem:
             logger.info("="*80)
             logger.info(f"Number of completed trials: {len(self.study.trials)}")
             logger.info(f"Best trial number: {self.study.best_trial.number}")
-            logger.info(f"Best trial value (Sharpe Ratio): {self.study.best_trial.value:.6f}")
+            logger.info(f"Best trial value (Final Sharpe): {self.study.best_trial.value:.6f}")
+            logger.info(f"Best trial mean return: {self.study.best_trial.user_attrs['mean_return']:.6f}")
+            logger.info(f"Best trial return Sharpe: {self.study.best_trial.user_attrs['return_sharpe']:.6f}")
+            logger.info(f"Best trial reward Sharpe: {self.study.best_trial.user_attrs['reward_sharpe']:.6f}")
             logger.info("\nBest hyperparameters:")
             for key, value in self.study.best_trial.params.items():
                 logger.info(f"    {key}: {value}")
@@ -387,6 +390,17 @@ class TradingSystem:
             df = self.study.trials_dataframe()
             df.to_csv("optuna_results.csv")
             logger.info(f"\nStudy results saved to optuna_results.csv")
+            
+            # Log best trial to wandb
+            wandb.log({
+                "best_trial_number": self.study.best_trial.number,
+                "best_trial_value": self.study.best_trial.value,
+                "best_trial_mean_return": self.study.best_trial.user_attrs['mean_return'],
+                "best_trial_return_sharpe": self.study.best_trial.user_attrs['return_sharpe'],
+                "best_trial_reward_sharpe": self.study.best_trial.user_attrs['reward_sharpe'],
+                "best_trial_max_drawdown": self.study.best_trial.user_attrs['max_drawdown'],
+                **self.study.best_trial.params
+            })
             
             # Update model with best parameters
             self.update_model_with_best_params()
@@ -402,8 +416,8 @@ class TradingSystem:
         
         # Dynamically sample hyperparameters using Optuna
         learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-        n_steps = trial.suggest_categorical("n_steps", [1024, 2048, 4096, 8192, 16384])
-        batch_size = trial.suggest_categorical("batch_size", [64,128,256, 512, 1024])
+        n_steps = trial.suggest_categorical("n_steps", [1024, 2048, 4096, 8192])
+        batch_size = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
         gamma = trial.suggest_categorical("gamma", [0.9, 0.95, 0.99])
         gae_lambda = trial.suggest_categorical("gae_lambda", [0.9, 0.95, 0.98])
         ent_coef = trial.suggest_float("ent_coef", 0.001, 0.1, log=True)
@@ -413,31 +427,23 @@ class TradingSystem:
         vf_coef = trial.suggest_float("vf_coef", 0.4, 0.8)
         target_kl = trial.suggest_float("target_kl", 0.01, 0.05)
 
-        # Define environment creation function
-        def make_env():
-            def _init():
-                env = InstitutionalPerpetualEnv(
-                    df=self.processed_data.copy(),
-                    initial_balance=self.config['trading']['initial_balance'],
-                    max_leverage=self.config['trading']['max_leverage'],
-                    transaction_fee=self.config['trading']['transaction_fee'],
-                    funding_fee_multiplier=self.config['trading']['funding_fee_multiplier'],
-                    risk_free_rate=self.config['trading']['risk_free_rate'],
-                    max_drawdown=self.config['risk_management']['limits']['max_drawdown'],
-                    window_size=self.config['model']['window_size']
-                )
-                return env
-            return _init
-
-        # Create multiple environments
-        n_envs = 8  # Number of parallel environments
-        env_fns = [make_env() for _ in range(n_envs)]
-        
         try:
-            # Create vectorized environment
-            vec_env = SubprocVecEnv(env_fns)
+            # Create a fresh environment for each trial
+            env = InstitutionalPerpetualEnv(
+                df=self.processed_data.copy(),
+                initial_balance=self.config['trading']['initial_balance'],
+                max_leverage=self.config['trading']['max_leverage'],
+                transaction_fee=self.config['trading']['transaction_fee'],
+                funding_fee_multiplier=self.config['trading']['funding_fee_multiplier'],
+                risk_free_rate=self.config['trading']['risk_free_rate'],
+                max_drawdown=self.config['risk_management']['limits']['max_drawdown'],
+                window_size=self.config['model']['window_size']
+            )
+            
+            # Wrap environment
+            env = DummyVecEnv([lambda: env])
             env = VecNormalize(
-                vec_env,
+                env,
                 norm_obs=True,
                 norm_reward=True,
                 clip_obs=10.0,
@@ -448,12 +454,10 @@ class TradingSystem:
 
             # Optimize network architecture for GPU
             policy_kwargs = dict(
-                net_arch=[
-                    dict(
-                        pi=[512, 256],
-                        vf=[512, 256]
-                    )
-                ],
+                net_arch=dict(
+                    pi=[512, 256],
+                    vf=[512, 256]
+                ),
                 activation_fn=nn.ReLU,
                 ortho_init=True,
                 log_std_init=-0.5,
@@ -461,7 +465,9 @@ class TradingSystem:
                 optimizer_kwargs=dict(
                     eps=1e-5,
                     weight_decay=1e-5
-                )
+                ),
+                features_extractor_class=CustomFeatureExtractor,
+                features_extractor_kwargs={"features_dim": 128}
             )
 
             # Create model with trial parameters
@@ -479,89 +485,147 @@ class TradingSystem:
                 vf_coef=vf_coef,
                 max_grad_norm=max_grad_norm,
                 target_kl=target_kl,
-                tensorboard_log=self.config['logging']['log_dir'],
+                tensorboard_log=None,  # Disable tensorboard for trials
                 policy_kwargs=policy_kwargs,
                 verbose=0,
                 device=self.device
             )
 
-            # Training loop with progress tracking
-            progress_interval = n_steps // 50
+            # Training loop
+            model.learn(total_timesteps=n_steps)
             
-            logger.info(f"\n╔═ Training Progress ═{'═' * 63}╗")
-            for step in range(0, n_steps, progress_interval):
-                model.learn(total_timesteps=progress_interval)
-                
-                progress = (step + progress_interval) / n_steps * 100
-                progress_bar = "█" * int(progress / 2) + "░" * (50 - int(progress / 2))
-                
-                if step > 0:
-                    quick_metrics = self._evaluate_model(model, n_eval_episodes=2)
-                    metrics_str = f"Sharpe: {quick_metrics['sharpe_ratio']:.4f} | Return: {quick_metrics['mean_return']:.4f}"
-                    logger.info(f"║ [{progress_bar}] {progress:5.1f}% | {metrics_str:<30} ║")
-                else:
-                    logger.info(f"║ [{progress_bar}] {progress:5.1f}% | Initializing...{' ' * 18} ║")
+            # Evaluation - THIS IS THE KEY PART THAT NEEDS FIXING
+            eval_metrics = self._evaluate_model(model, n_eval_episodes=3)
+            
+            # Log metrics to both Optuna and wandb
+            trial.set_user_attr("mean_return", eval_metrics["mean_return"])
+            trial.set_user_attr("mean_reward", eval_metrics["mean_reward"])
+            trial.set_user_attr("return_sharpe", eval_metrics["return_sharpe"])
+            trial.set_user_attr("reward_sharpe", eval_metrics["reward_sharpe"])
+            trial.set_user_attr("max_drawdown", eval_metrics["max_drawdown"])
+            
+            wandb.log({
+                "trial_number": trial.number,
+                "mean_return": eval_metrics["mean_return"],
+                "mean_reward": eval_metrics["mean_reward"],
+                "return_sharpe": eval_metrics["return_sharpe"],
+                "reward_sharpe": eval_metrics["reward_sharpe"],
+                "max_drawdown": eval_metrics["max_drawdown"],
+                **trial.params  # Log all hyperparameters
+            })
 
-            # Final evaluation
-            eval_metrics = self._evaluate_model(model)
-            
-            # Clean up
-            env.close()
-            
-            return eval_metrics["sharpe_ratio"]
+            # Return the combined metric
+            return float(eval_metrics["final_sharpe"])
 
         except Exception as e:
             logger.error(f"\n╔═ Error in Trial {trial.number} ═{'═' * 59}╗")
             logger.error(f"║ {str(e):<78} ║")
             logger.error(f"╚{'═' * 80}╝\n")
             
-            # Clean up on error
-            if 'env' in locals():
-                env.close()
+            # Log failed trial to wandb
+            wandb.log({
+                "trial_number": trial.number,
+                "status": "failed",
+                "error": str(e),
+                **trial.params
+            })
             
             raise optuna.TrialPruned()
             
     def _evaluate_model(self, model, n_eval_episodes=5):
         """Evaluate model performance"""
         returns = []
-        sharpe_ratios = []
-        max_drawdowns = []
+        rewards = []
+        daily_returns = []
+        portfolio_values = []
         
         for _ in range(n_eval_episodes):
-            obs = self.env.reset()
+            obs = self.env.reset()[0]  # Get first element since reset returns tuple
             done = False
-            episode_return = 0
-            returns_list = []
+            episode_rewards = []
+            episode_returns = []
+            portfolio_value = self.config['trading']['initial_balance']  # Use class attribute
             
             while not done:
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, done, info = self.env.step(action)
-                episode_return += reward
-                returns_list.append(reward)
                 
-            returns.append(episode_return)
+                # Track both reward and portfolio value
+                episode_rewards.append(reward)
+                
+                # Track portfolio value changes
+                if 'portfolio_value' in info:
+                    portfolio_value = info['portfolio_value']
+                    pct_return = (portfolio_value - self.config['trading']['initial_balance']) / self.config['trading']['initial_balance']
+                    episode_returns.append(pct_return)
+                
+                # Track risk metrics if available
+                if 'risk_metrics' in info:
+                    risk_metrics = info['risk_metrics']
+                    # Could use these for more sophisticated evaluation
             
-            # Calculate Sharpe ratio
-            returns_array = np.array(returns_list)
-            if len(returns_array) > 1:
-                mean_return = np.mean(returns_array)
-                std_return = np.std(returns_array) + 1e-6  # Add epsilon to avoid division by zero
-                sharpe = mean_return / std_return * np.sqrt(252)
-                sharpe_ratios.append(sharpe)
+            # Store episode results
+            portfolio_values.append(portfolio_value)
+            returns.append((portfolio_value - self.config['trading']['initial_balance']) / self.config['trading']['initial_balance'])
+            rewards.extend(episode_rewards)
+            daily_returns.extend(episode_returns)
+        
+        # Convert to numpy arrays for calculations
+        returns_array = np.array(returns)
+        rewards_array = np.array(rewards)
+        daily_returns_array = np.array(daily_returns)
+        portfolio_values = np.array(portfolio_values)
+        
+        # Calculate metrics from both rewards and returns
+        mean_return = float(np.mean(returns_array))
+        mean_reward = float(np.mean(rewards_array))
+        
+        # Calculate Sharpe ratio using daily returns (more accurate than rewards)
+        if len(daily_returns_array) > 1:
+            mean_daily_return = np.mean(daily_returns_array)
+            daily_std = np.std(daily_returns_array)
+            if daily_std > 0:
+                sharpe = mean_daily_return / daily_std * np.sqrt(252)  # Annualize
             else:
-                sharpe_ratios.append(0)  # Default to 0 if not enough data
-            
-            # Calculate max drawdown
-            cumulative_returns = np.cumsum(returns_list)
-            running_max = np.maximum.accumulate(cumulative_returns)
-            drawdowns = running_max - cumulative_returns
-            max_drawdown = np.max(drawdowns) if len(drawdowns) > 0 else 0
-            max_drawdowns.append(max_drawdown)
+                sharpe = -100.0  # Penalize zero volatility
+        else:
+            sharpe = -100.0  # Penalize insufficient data
+        
+        # Calculate max drawdown from portfolio values
+        peak = np.maximum.accumulate(portfolio_values)
+        drawdowns = (peak - portfolio_values) / peak
+        max_drawdown = float(np.max(drawdowns)) if len(drawdowns) > 0 else 1.0
+        
+        # Calculate reward-based metrics
+        reward_std = float(np.std(rewards_array)) if len(rewards_array) > 1 else 1.0
+        reward_sharpe = mean_reward / (reward_std + 1e-8)
+        
+        logger.info(f"\nEvaluation metrics:")
+        logger.info(f"Mean return: {mean_return:.4f}")
+        logger.info(f"Mean reward: {mean_reward:.4f}")
+        logger.info(f"Return Sharpe ratio: {sharpe:.4f}")
+        logger.info(f"Reward Sharpe ratio: {reward_sharpe:.4f}")
+        logger.info(f"Max drawdown: {max_drawdown:.4f}")
+        logger.info(f"Final portfolio values: {portfolio_values}")
+        
+        # Return negative values if results are invalid
+        if np.isnan(sharpe) or np.isinf(sharpe):
+            sharpe = -100.0
+        if np.isnan(mean_return) or np.isinf(mean_return):
+            mean_return = -1.0
+        if np.isnan(max_drawdown) or np.isinf(max_drawdown):
+            max_drawdown = 1.0
+        
+        # Combine reward and return metrics for final evaluation
+        final_sharpe = (sharpe + reward_sharpe) / 2  # Average of both Sharpe ratios
         
         return {
-            "mean_return": np.mean(returns),
-            "sharpe_ratio": np.mean(sharpe_ratios),
-            "max_drawdown": np.mean(max_drawdowns)
+            "mean_return": mean_return,
+            "mean_reward": mean_reward,
+            "return_sharpe": sharpe,
+            "reward_sharpe": reward_sharpe,
+            "final_sharpe": final_sharpe,
+            "max_drawdown": max_drawdown
         }
         
     def update_model_with_best_params(self):
@@ -664,7 +728,7 @@ class TradingSystem:
             logger.info("\nTraining completed!")
             logger.info(f"Final metrics:")
             logger.info(f"Mean return: {eval_metrics['mean_return']:.4f}")
-            logger.info(f"Sharpe ratio: {eval_metrics['sharpe_ratio']:.4f}")
+            logger.info(f"Sharpe ratio: {eval_metrics['return_sharpe']:.4f}")
             logger.info(f"Max drawdown: {eval_metrics['max_drawdown']:.4f}")
             
         except Exception as e:
@@ -864,7 +928,7 @@ async def main():
         await trading_system.initialize(args)
         
         # Run hyperparameter optimization
-        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=4, n_steps=100000)
+        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, n_steps=100000)
         
         # Train the model with best parameters
         trading_system.train()

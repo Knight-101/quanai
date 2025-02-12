@@ -573,7 +573,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         logger.info(f"Updated environment parameters: {kwargs}")
 
     def _execute_trade(self, asset: str, trade_decision: float, position_size: float) -> float:
-        """Execute a trade for a single asset"""
+        """Execute a trade for a single asset with enhanced liquidity and slippage modeling"""
         try:
             current_price = self._get_mark_price(asset)
             if current_price <= 0:
@@ -584,37 +584,92 @@ class InstitutionalPerpetualEnv(gym.Env):
                 pos['size'] * self._get_mark_price(a) 
                 for a, pos in self.positions.items()
             )
-            target_size = position_size * portfolio_value / current_price
             
-            # Scale by trade decision (-1 to 1)
-            target_size *= trade_decision
+            # Get volume data for liquidity checks
+            volume = self.df.loc[self.df.index[self.current_step], (asset, 'volume')]
+            if isinstance(volume, (pd.Series, pd.DataFrame)):
+                volume = volume.iloc[0]
+            volume = float(volume)
+            
+            # Calculate ADV (5-day average daily volume)
+            adv = self.df.loc[
+                self.df.index[max(0, self.current_step-5):self.current_step+1],
+                (asset, 'volume')
+            ].mean()
+            if isinstance(adv, (pd.Series, pd.DataFrame)):
+                adv = adv.iloc[0]
+            adv = float(adv)
+            
+            # Limit position size based on ADV
+            max_position_value = adv * current_price * 0.1  # Max 10% of ADV
+            max_position_size = max_position_value / current_price
+            
+            # Scale target size by trade decision (-1 to 1) and ADV limit
+            raw_target_size = position_size * portfolio_value / current_price * trade_decision
+            target_size = np.clip(raw_target_size, -max_position_size, max_position_size)
             
             # Calculate size difference
             size_diff = target_size - self.positions[asset]['size']
             
             if abs(size_diff) > 0:
-                # Calculate transaction cost
-                transaction_cost = abs(size_diff * current_price * self.transaction_fee)
+                # Calculate price impact using square-root law
+                price_impact = 0.1 * np.sqrt(abs(size_diff) / (volume + 1e-8))
+                effective_price = current_price * (1 + price_impact * np.sign(size_diff))
                 
-                # Check if we have enough balance
-                if transaction_cost > self.balance:
-                    return 0.0
+                # Calculate TWAP chunks if size is large
+                twap_chunks = 1
+                if abs(size_diff) > max_position_size * 0.1:  # If order > 10% of max size
+                    twap_chunks = min(5, int(abs(size_diff) / (max_position_size * 0.1)))
+                    size_diff = size_diff / twap_chunks
+                
+                total_cost = 0
+                total_pnl = 0
+                executed_size = 0
+                
+                for _ in range(twap_chunks):
+                    # Calculate transaction cost including spread and impact
+                    transaction_cost = (
+                        abs(size_diff * effective_price * self.transaction_fee) +  # Base fee
+                        abs(size_diff * effective_price * self._get_spread_cost(asset)) +  # Spread cost
+                        abs(size_diff * effective_price * price_impact)  # Impact cost
+                    )
                     
-                # Update position
-                old_size = self.positions[asset]['size']
-                self.positions[asset]['size'] = target_size
-                self.positions[asset]['entry_price'] = current_price
-                
-                # Update balance
-                self.balance -= transaction_cost
-                
-                # Calculate PnL if closing position
-                pnl = 0.0
-                if old_size != 0 and target_size == 0:
-                    pnl = old_size * (current_price - self.positions[asset]['entry_price'])
-                    self.balance += pnl
+                    # Check if we have enough balance
+                    if transaction_cost > self.balance:
+                        break
                     
-                return pnl - transaction_cost
+                    # Update position
+                    old_size = self.positions[asset]['size']
+                    self.positions[asset]['size'] += size_diff
+                    executed_size += size_diff
+                    
+                    # Update entry price using VWAP
+                    if self.positions[asset]['size'] != 0:
+                        self.positions[asset]['entry_price'] = (
+                            (old_size * self.positions[asset]['entry_price'] + 
+                             size_diff * effective_price) / 
+                            self.positions[asset]['size']
+                        )
+                    
+                    # Update balance
+                    self.balance -= transaction_cost
+                    total_cost += transaction_cost
+                    
+                    # Calculate PnL if reducing position
+                    if (old_size > 0 and size_diff < 0) or (old_size < 0 and size_diff > 0):
+                        chunk_pnl = abs(size_diff) * (effective_price - self.positions[asset]['entry_price'])
+                        self.balance += chunk_pnl
+                        total_pnl += chunk_pnl
+                
+                # Log execution details
+                logger.info(f"Trade executed for {asset}:")
+                logger.info(f"  Target size: {target_size:.6f}")
+                logger.info(f"  Executed size: {executed_size:.6f}")
+                logger.info(f"  TWAP chunks: {twap_chunks}")
+                logger.info(f"  Price impact: {price_impact:.6f}")
+                logger.info(f"  Total cost: {total_cost:.2f}")
+                
+                return total_pnl - total_cost
                 
             return 0.0
             
