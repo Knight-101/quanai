@@ -9,10 +9,10 @@ trading:
     - "BTCUSDT"  # Binance perpetual futures format
     - "ETHUSDT"
     - "SOLUSDT"
-  initial_balance: 1000000  # $1M USD
-  max_leverage: 20
+  initial_balance: 10000.0  # $10K USD
+  max_leverage: 20.0
   min_position_size: 1000  # $1K USD
-  max_position_size: 10000000  # $10M USD
+  max_position_size: 200000  # $200K USD
   risk_limits:
     max_drawdown: 0.3
     position_concentration: 0.4
@@ -27,7 +27,7 @@ trading:
     max_funding_rate: 0.01
   transaction_fee: 0.0004
   funding_fee_multiplier: 1.0
-  risk_free_rate: 0.04
+  risk_free_rate: 0.02  # Added annual risk-free rate (2%)
 
 # Risk Management
 risk_management:
@@ -118,7 +118,7 @@ data:
   exchanges:
     - "binance"
   cache_dir: "data"
-  history_days: 1095
+  history_days: 1825
   min_history_points: 1000
 
 # Monitoring

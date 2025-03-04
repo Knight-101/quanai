@@ -28,7 +28,7 @@ class PerpetualDataFetcher:
             
         self.symbols = symbols
         self.timeframe = timeframe
-        self.lookback = 365 * 3  # 3 years
+        self.lookback = 365 * 5  # 5 years
         
         
         # Binance-specific symbol mappings

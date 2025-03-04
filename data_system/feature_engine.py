@@ -630,103 +630,36 @@ class DerivativesFeatureEngine:
             logger.error(f"Error in combine_features: {str(e)}")
             return pd.DataFrame()
 
-    def engineer_features(self, df: Dict) -> pd.DataFrame:
-        """Main feature engineering method that processes nested exchange data structure"""
+    def engineer_features(self, data_dict):
         try:
             processed_data = {}
-            
-            for exchange, symbols in df.items():
-                for symbol, data in symbols.items():
-                    if not isinstance(data, pd.DataFrame):
-                        logger.warning(f"Invalid data type for {exchange}:{symbol}")
-                        continue
-                        
-                    # Ensure all required columns exist
-                    required_columns = ['open', 'high', 'low', 'close', 'volume']
-                    if not all(col in data.columns for col in required_columns):
-                        logger.warning(f"Missing required columns in {exchange}:{symbol}")
-                        continue
-                        
-                    # Process each symbol's data
-                    try:
-                        symbol_data = data.copy()
-                        for col in symbol_data.columns:
-                            symbol_data[col] = pd.to_numeric(symbol_data[col], errors='coerce')
-
-                        key = symbol  # use just the symbol as key
-                        if key in processed_data:
-                            logger.info(f"Duplicate symbol {symbol} found from {exchange}, skipping.")
-                            continue
-                        processed_data[key] = symbol_data
-                    except Exception as e:
-                        logger.error(f"Error processing {exchange}:{symbol}: {str(e)}")
-                        continue
-            
-            if not processed_data:
-                raise ValueError("No valid data found in input")
-            
-            # Combine data for each symbol
-            combined_data = {}
-            for symbol, symbol_data in processed_data.items():
-                try:
-                    # Group by timestamp and aggregate
-                    agg_dict = {
-                        'open': 'first',
-                        'high': 'max',
-                        'low': 'min',
-                        'close': 'last',
-                        'volume': 'sum',
-                        'funding_rate': 'mean',
-                        'bid_depth': 'mean',
-                        'ask_depth': 'mean'
-                    }
-                    
-                    # Remove any columns not in agg_dict
-                    valid_columns = [col for col in symbol_data.columns if col in agg_dict]
-                    symbol_data = symbol_data[valid_columns]
-                    
-                    # Aggregate data
-                    aggregated = symbol_data.groupby(symbol_data.index).agg(
-                        {col: agg_dict[col] for col in valid_columns}
-                    )
-                    
-                    # Create MultiIndex columns
-                    aggregated.columns = pd.MultiIndex.from_product(
-                        [[symbol], aggregated.columns],
-                        names=['asset', 'feature']
-                    )
-                    
-                    combined_data[symbol] = aggregated
-                    
-                except Exception as e:
-                    logger.error(f"Error combining data for {symbol}: {str(e)}")
+            for exchange, df in data_dict.items():
+                if df.empty:
+                    logger.warning(f"Empty DataFrame for {exchange}, skipping")
                     continue
+                    
+                # Ensure MultiIndex columns
+                if not isinstance(df.columns, pd.MultiIndex):
+                    logger.warning(f"Converting {exchange} columns to MultiIndex")
+                    df.columns = pd.MultiIndex.from_product([[exchange], df.columns])
+                
+                # Process features
+                processed = self.transform(df)
+                if not processed.empty:
+                    processed_data[exchange] = processed
+                
+            if not processed_data:
+                raise ValueError("No data processed successfully")
             
-            if not combined_data:
-                raise ValueError("No data after combining")
+            # Combine all exchanges
+            combined = pd.concat(processed_data.values(), axis=1)
             
-            # Combine all symbols into final DataFrame
-            final_df = pd.concat(combined_data.values(), axis=1)
+            # Final validation
+            if combined.empty:
+                raise ValueError("Combined DataFrame is empty")
             
-            # Fill any NaN values
-            final_df = final_df.fillna(0)
-            
-            logger.info(f"Successfully processed data for assets: {list(combined_data.keys())}")
-            
-            # Apply feature transformation
-            transformed_df = self.transform(final_df)
-            
-            # Ensure all data is numeric
-            for col in transformed_df.columns:
-                if not np.issubdtype(transformed_df[col].dtype, np.number):
-                    transformed_df[col] = pd.to_numeric(transformed_df[col], errors='coerce')
-            
-            # Fill any remaining NaN values
-            transformed_df = transformed_df.fillna(0)
-            
-            return transformed_df
+            return combined
             
         except Exception as e:
-            logger.error(f"Error in feature engineering: {str(e)}")
-            logger.error(f"Data structure: {df.keys() if isinstance(df, dict) else 'Not a dict'}")
+            logger.error(f"Error in engineer_features: {str(e)}")
             return pd.DataFrame()

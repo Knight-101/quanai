@@ -114,6 +114,28 @@ class InstitutionalRiskEngine:
                 'current_drawdown': 0.0
             }
         
+    def calculate_risk_metrics(
+        self,
+        positions: Dict[str, Dict],
+        balance: float,
+        prices: Dict[str, float]
+    ) -> Dict:
+        """Alias for calculate_portfolio_risk for backward compatibility"""
+        # Create a simple market data DataFrame from the prices
+        index = pd.date_range(end=pd.Timestamp.now(), periods=self.lookback_window, freq='5min')
+        market_data = pd.DataFrame(index=index)
+        
+        # Add price data for each asset
+        for asset, price in prices.items():
+            # Create MultiIndex columns for each asset
+            market_data[(asset, 'close')] = price
+            market_data[(asset, 'open')] = price
+            market_data[(asset, 'high')] = price
+            market_data[(asset, 'low')] = price
+            market_data[(asset, 'volume')] = 1000000  # Default volume
+            
+        return self.calculate_portfolio_risk(positions, market_data, balance)
+        
     def _calculate_position_metrics(
         self,
         positions: Dict[str, Dict],
