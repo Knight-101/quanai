@@ -34,6 +34,13 @@ class DerivativesFeatureEngine:
         self.volatility_window = volatility_window
         self.n_components = n_components
         self.feature_selection_threshold = feature_selection_threshold
+        self.pca = PCA(n_components=n_components)
+        self.std_scaler = StandardScaler()
+        # Add parameters for market regime detection
+        self.adx_period = 14
+        self.hurst_period = 100
+        self.regime_smoothing = 10
+        
         self.scaler = StandardScaler()
         self._setup_neural_features()
         self.selected_features = None
@@ -105,101 +112,149 @@ class DerivativesFeatureEngine:
             return pd.DataFrame()
         
     def _compute_technical_indicators(self, df: pd.DataFrame) -> Dict:
-        """Compute comprehensive technical indicators using ta library"""
+        """Compute various technical indicators for each asset"""
         try:
-            features = {}
-            
-            # Get price and volume data and ensure they are finite
-            close = pd.to_numeric(df['close'], errors='coerce')
-            high = pd.to_numeric(df['high'], errors='coerce')
-            low = pd.to_numeric(df['low'], errors='coerce')
-            volume = pd.to_numeric(df['volume'], errors='coerce')
-            
-            # Replace zeros with NaN before log
-            close = close.replace(0, np.nan)
-            high = high.replace(0, np.nan)
-            low = low.replace(0, np.nan)
-            
-            # Store close price
-            features['close'] = close
-            
-            # Handle missing values before calculations
-            close = close.ffill().bfill()
-            high = high.ffill().bfill()
-            low = low.ffill().bfill()
-            volume = volume.ffill().bfill()
-            
-            # Ensure all values are positive before calculations
-            close = close.clip(lower=1e-8)
-            high = high.clip(lower=1e-8)
-            low = low.clip(lower=1e-8)
-            volume = volume.clip(lower=1e-8)  # Changed from 0 to 1e-8 for consistency
-            
-            # Handle NaN values in features
-            def safe_indicator(func):
+            result = {}
+            for asset in df.columns.get_level_values('asset').unique():
+                asset_data = {}
+                # Get OHLCV data for the current asset
                 try:
-                    result = func()
-                    if isinstance(result, pd.Series):
-                        return result.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
-                    return result
+                    ohlcv = df[asset]
+                except:
+                    continue
+                
+                if 'close' not in ohlcv.columns:
+                    continue
+                    
+                # Work with asset prices
+                closes = ohlcv['close']
+                
+                if 'open' in ohlcv.columns:
+                    opens = ohlcv['open']
+                if 'high' in ohlcv.columns:
+                    highs = ohlcv['high']
+                if 'low' in ohlcv.columns:
+                    lows = ohlcv['low']
+                if 'volume' in ohlcv.columns:
+                    volumes = ohlcv['volume']
+                
+                # ENHANCED: Market Regime Detection
+                # 1. ADX to identify trending markets
+                if all(x in ohlcv.columns for x in ['high', 'low', 'close']):
+                    try:
+                        adx = ADXIndicator(highs, lows, closes, self.adx_period)
+                        asset_data['adx'] = adx.adx()
+                        asset_data['adx_pos'] = adx.adx_pos()  # Positive directional indicator
+                        asset_data['adx_neg'] = adx.adx_neg()  # Negative directional indicator
+                        
+                        # ADX-based regime classification
+                        # ADX > 25 typically indicates trending market
+                        asset_data['is_trending'] = (asset_data['adx'] > 25).astype(float)
+                        
+                        # Direction strength indicator (combination of +DI and -DI)
+                        asset_data['trend_strength'] = asset_data['adx_pos'] - asset_data['adx_neg']
+                    except Exception as e:
+                        logger.warning(f"Error calculating ADX: {e}")
+                
+                # 2. Hurst Exponent for long-term trend/mean-reversion detection
+                try:
+                    # Calculate Hurst exponent in a rolling window
+                    asset_data['hurst_exponent'] = self._calculate_rolling_hurst(closes, self.hurst_period)
+                    
+                    # Hurst > 0.5 suggests trending, < 0.5 suggests mean-reverting
+                    asset_data['is_mean_reverting'] = (asset_data['hurst_exponent'] < 0.45).astype(float)
+                    asset_data['is_random_walk'] = ((asset_data['hurst_exponent'] >= 0.45) & 
+                                                   (asset_data['hurst_exponent'] <= 0.55)).astype(float)
+                    asset_data['is_persistent'] = (asset_data['hurst_exponent'] > 0.55).astype(float)
                 except Exception as e:
-                    logger.warning(f"Error calculating indicator: {str(e)}")
-                    return pd.Series(0, index=close.index)
+                    logger.warning(f"Error calculating Hurst exponent: {e}")
+                
+                # 3. Volatility regime
+                try:
+                    returns = closes.pct_change().fillna(0)
+                    # Rolling volatility
+                    rolling_vol = returns.rolling(30).std()
+                    # Volatility of volatility - meta-volatility
+                    vol_of_vol = rolling_vol.rolling(30).std()
+                    asset_data['volatility'] = rolling_vol
+                    asset_data['vol_of_vol'] = vol_of_vol
+                    
+                    # High vol-of-vol indicates regime shifts
+                    asset_data['vol_regime_shift'] = (vol_of_vol > vol_of_vol.rolling(100).mean() * 1.5).astype(float)
+                    
+                    # Classify volatility regime
+                    vol_quantiles = rolling_vol.rolling(252).quantile(0.75)
+                    asset_data['high_vol_regime'] = (rolling_vol > vol_quantiles).astype(float)
+                except Exception as e:
+                    logger.warning(f"Error calculating volatility regime: {e}")
+                
+                # 4. Combined market regime score (1 = strong trend, 0 = strong range)
+                try:
+                    if 'is_trending' in asset_data and 'is_persistent' in asset_data:
+                        # Combine ADX trend and Hurst persistence
+                        raw_regime = (asset_data['is_trending'] + asset_data['is_persistent']) / 2
+                        # Smooth the regime indicator
+                        asset_data['market_regime'] = raw_regime.rolling(self.regime_smoothing).mean().fillna(0.5)
+                except Exception as e:
+                    logger.warning(f"Error calculating market regime: {e}")
+                
+                # Continue with existing indicators
+                def safe_indicator(func):
+                    try:
+                        return func()
+                    except:
+                        return pd.Series(index=closes.index, data=np.nan)
+                
+                # Trend indicators
+                ema_short = EMAIndicator(close=closes, window=12)
+                ema_medium = EMAIndicator(close=closes, window=26)
+                ema_long = EMAIndicator(close=closes, window=50)
+                
+                asset_data['ema_short'] = safe_indicator(ema_short.ema_indicator)
+                asset_data['ema_medium'] = safe_indicator(ema_medium.ema_indicator)
+                asset_data['ema_long'] = safe_indicator(ema_long.ema_indicator)
+                
+                # MACD
+                macd = MACD(close=closes)
+                asset_data['macd'] = safe_indicator(macd.macd)
+                asset_data['macd_signal'] = safe_indicator(macd.macd_signal)
+                
+                # Enhanced momentum indicators
+                rsi = RSIIndicator(close=closes)
+                asset_data['rsi'] = safe_indicator(rsi.rsi)
+                
+                roc = ROCIndicator(close=closes, window=10)
+                asset_data['roc'] = safe_indicator(roc.roc)
+                
+                williams = WilliamsRIndicator(high=highs, low=lows, close=closes)
+                asset_data['willr'] = safe_indicator(williams.williams_r)
+                
+                stoch = StochasticOscillator(high=highs, low=lows, close=closes)
+                asset_data['stoch_k'] = safe_indicator(stoch.stoch)
+                asset_data['stoch_d'] = safe_indicator(stoch.stoch_signal)
+                
+                # Advanced trend indicators
+                bb = BollingerBands(close=closes)
+                asset_data['bbands_upper'] = safe_indicator(bb.bollinger_hband)
+                asset_data['bbands_middle'] = safe_indicator(bb.bollinger_mavg)
+                asset_data['bbands_lower'] = safe_indicator(bb.bollinger_lband)
+                
+                atr = AverageTrueRange(high=highs, low=lows, close=closes)
+                asset_data['atr'] = safe_indicator(atr.average_true_range)
+                
+                # Volume and momentum indicators
+                obv = OnBalanceVolumeIndicator(close=closes, volume=volumes)
+                asset_data['obv'] = safe_indicator(obv.on_balance_volume)
+                
+                adi = AccDistIndexIndicator(high=highs, low=lows, close=closes, volume=volumes)
+                asset_data['ad'] = safe_indicator(adi.acc_dist_index)
+                
+                cmf = ChaikinMoneyFlowIndicator(high=highs, low=lows, close=closes, volume=volumes)
+                asset_data['cmf'] = safe_indicator(cmf.chaikin_money_flow)
+                
+                result[asset] = asset_data
             
-            # Trend indicators
-            ema_short = EMAIndicator(close=close, window=12)
-            ema_medium = EMAIndicator(close=close, window=26)
-            ema_long = EMAIndicator(close=close, window=50)
-            
-            features['ema_short'] = safe_indicator(ema_short.ema_indicator)
-            features['ema_medium'] = safe_indicator(ema_medium.ema_indicator)
-            features['ema_long'] = safe_indicator(ema_long.ema_indicator)
-            
-            # MACD
-            macd = MACD(close=close)
-            features['macd'] = safe_indicator(macd.macd)
-            features['macd_signal'] = safe_indicator(macd.macd_signal)
-            
-            # Enhanced momentum indicators
-            rsi = RSIIndicator(close=close)
-            features['rsi'] = safe_indicator(rsi.rsi)
-            
-            roc = ROCIndicator(close=close, window=10)
-            features['roc'] = safe_indicator(roc.roc)
-            
-            williams = WilliamsRIndicator(high=high, low=low, close=close)
-            features['willr'] = safe_indicator(williams.williams_r)
-            
-            stoch = StochasticOscillator(high=high, low=low, close=close)
-            features['stoch_k'] = safe_indicator(stoch.stoch)
-            features['stoch_d'] = safe_indicator(stoch.stoch_signal)
-            
-            # Advanced trend indicators
-            adx = ADXIndicator(high=high, low=low, close=close)
-            features['adx'] = safe_indicator(adx.adx)
-            features['di_plus'] = safe_indicator(adx.adx_pos)
-            features['di_minus'] = safe_indicator(adx.adx_neg)
-            
-            # Volatility indicators
-            bb = BollingerBands(close=close)
-            features['bbands_upper'] = safe_indicator(bb.bollinger_hband)
-            features['bbands_middle'] = safe_indicator(bb.bollinger_mavg)
-            features['bbands_lower'] = safe_indicator(bb.bollinger_lband)
-            
-            atr = AverageTrueRange(high=high, low=low, close=close)
-            features['atr'] = safe_indicator(atr.average_true_range)
-            
-            # Volume and momentum indicators
-            obv = OnBalanceVolumeIndicator(close=close, volume=volume)
-            features['obv'] = safe_indicator(obv.on_balance_volume)
-            
-            adi = AccDistIndexIndicator(high=high, low=low, close=close, volume=volume)
-            features['ad'] = safe_indicator(adi.acc_dist_index)
-            
-            cmf = ChaikinMoneyFlowIndicator(high=high, low=low, close=close, volume=volume)
-            features['cmf'] = safe_indicator(cmf.chaikin_money_flow)
-            
-            return features
+            return result
             
         except Exception as e:
             logger.error(f"Error computing technical indicators: {str(e)}")
@@ -235,10 +290,12 @@ class DerivativesFeatureEngine:
                         res = model.fit(disp='off', show_warning=False)
                         forecast = res.forecast(horizon=horizon)
                         vol = np.sqrt(forecast.variance.iloc[-1]) / 100
+                        
+                        # FIXED: Create a proper Series with the correct index
                         features[f'vol_{horizon}d'] = pd.Series(
-                            np.clip(vol, 0, 10),  # Clip to reasonable range
-                            index=returns.index[-horizon:]
-                        )
+                            np.repeat(vol, len(returns)),  # Repeat the value for all indices
+                            index=returns.index
+                        ).fillna(0)
                     else:
                         features[f'vol_{horizon}d'] = returns.rolling(horizon*10).std().fillna(0)
                 except Exception as e:
@@ -634,8 +691,13 @@ class DerivativesFeatureEngine:
         try:
             processed_data = {}
             for exchange, df in data_dict.items():
-                if df.empty:
+                # Check if df is a DataFrame and if it's empty
+                if isinstance(df, pd.DataFrame) and df.empty:
                     logger.warning(f"Empty DataFrame for {exchange}, skipping")
+                    continue
+                # Check if df is a dict (handle this case properly)
+                elif isinstance(df, dict) and not df:
+                    logger.warning(f"Empty dict for {exchange}, skipping")
                     continue
                     
                 # Ensure MultiIndex columns
@@ -645,7 +707,7 @@ class DerivativesFeatureEngine:
                 
                 # Process features
                 processed = self.transform(df)
-                if not processed.empty:
+                if isinstance(processed, pd.DataFrame) and not processed.empty:
                     processed_data[exchange] = processed
                 
             if not processed_data:
@@ -663,3 +725,58 @@ class DerivativesFeatureEngine:
         except Exception as e:
             logger.error(f"Error in engineer_features: {str(e)}")
             return pd.DataFrame()
+
+    def _calculate_rolling_hurst(self, series, window):
+        """Calculate Hurst exponent in a rolling window to identify trend strength"""
+        series = series.fillna(method='ffill')
+        result = pd.Series(index=series.index, data=np.nan)
+        
+        # Need at least 100 points for a reasonable Hurst calculation
+        min_window = min(100, window)
+        if len(series) < min_window:
+            return result
+            
+        # Calculate for each window
+        for i in range(min_window, len(series)):
+            start_idx = max(0, i - window)
+            time_series = series.iloc[start_idx:i].values
+            result.iloc[i] = self._hurst_exponent(time_series)
+            
+        # Forward fill initial NaN values
+        result = result.fillna(method='ffill')
+        return result
+        
+    def _hurst_exponent(self, time_series, max_lag=20):
+        """Calculate Hurst exponent for a time series"""
+        # Convert to numpy array if needed
+        time_series = np.array(time_series)
+        
+        # Create log returns
+        returns = np.diff(np.log(time_series))
+        
+        # Zero mean returns
+        zero_mean = returns - np.mean(returns)
+        
+        # Calculate variance of difference for each lag
+        tau = np.arange(1, min(max_lag, len(returns) // 4))
+        var = np.zeros(len(tau))
+        
+        for i, lag in enumerate(tau):
+            # Calculate variance of difference
+            var[i] = np.std(zero_mean[lag:] - zero_mean[:-lag])
+            
+        # Avoid log(0) errors
+        var = var[var > 0]
+        tau = tau[:len(var)]
+        
+        if len(var) <= 1:
+            return 0.5  # Default to random walk
+            
+        # Fit power law: var = c * tau^(2*H)
+        log_tau = np.log(tau)
+        log_var = np.log(var)
+        
+        # Linear regression to find Hurst exponent
+        hurst = np.polyfit(log_tau, log_var, 1)[0] / 2.0
+        
+        return min(max(hurst, 0), 1)  # Bound between 0 and 1

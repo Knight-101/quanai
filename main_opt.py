@@ -82,26 +82,156 @@ class CustomFeatureExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         n_input = observation_space.shape[0]
         
-        self.feature_net = nn.Sequential(
-            nn.Linear(n_input, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Linear(128, features_dim),
-            nn.LayerNorm(features_dim)
-        )
+        # ENHANCED: More sophisticated feature extractor with residual connections
+        # and deeper architecture for better pattern recognition
         
-        # Initialize weights
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.constant_(m.bias, 0.0)
+        # Initial layer to project to common dimension
+        self.input_layer = nn.Linear(n_input, 256)
+        self.input_norm = nn.LayerNorm(256)
+        self.input_activation = nn.LeakyReLU()
+        self.input_dropout = nn.Dropout(0.15)  # Slightly increased dropout for better generalization
+        
+        # Residual block 1
+        self.res1_layer1 = nn.Linear(256, 256)
+        self.res1_norm1 = nn.LayerNorm(256)
+        self.res1_activation1 = nn.LeakyReLU()
+        self.res1_layer2 = nn.Linear(256, 256)
+        self.res1_norm2 = nn.LayerNorm(256)
+        self.res1_activation2 = nn.LeakyReLU()
+        self.res1_dropout = nn.Dropout(0.15)
+        
+        # Residual block 2
+        self.res2_layer1 = nn.Linear(256, 256)
+        self.res2_norm1 = nn.LayerNorm(256)
+        self.res2_activation1 = nn.LeakyReLU()
+        self.res2_layer2 = nn.Linear(256, 256)
+        self.res2_norm2 = nn.LayerNorm(256)
+        self.res2_activation2 = nn.LeakyReLU()
+        self.res2_dropout = nn.Dropout(0.15)
+        
+        # Output projection
+        self.output_layer = nn.Linear(256, features_dim)
+        self.output_norm = nn.LayerNorm(features_dim)
+        
+        # Initialize weights with orthogonal initialization
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.constant_(module.bias, 0.0)
 
     def forward(self, observations):
-        return self.feature_net(observations)
+        # Input projection
+        x = self.input_layer(observations)
+        x = self.input_norm(x)
+        x = self.input_activation(x)
+        x = self.input_dropout(x)
+        
+        # Residual block 1
+        residual = x
+        x = self.res1_layer1(x)
+        x = self.res1_norm1(x)
+        x = self.res1_activation1(x)
+        x = self.res1_layer2(x)
+        x = self.res1_norm2(x)
+        x = x + residual  # Add residual connection
+        x = self.res1_activation2(x)
+        x = self.res1_dropout(x)
+        
+        # Residual block 2
+        residual = x
+        x = self.res2_layer1(x)
+        x = self.res2_norm1(x)
+        x = self.res2_activation1(x)
+        x = self.res2_layer2(x)
+        x = self.res2_norm2(x)
+        x = x + residual  # Add residual connection
+        x = self.res2_activation2(x)
+        x = self.res2_dropout(x)
+        
+        # Output projection
+        x = self.output_layer(x)
+        x = self.output_norm(x)
+        
+        return x
+
+class ResNetFeatureExtractor(BaseFeaturesExtractor):
+    """
+    Custom feature extractor using residual connections for better gradient flow.
+    This network architecture is better at capturing complex patterns across time
+    and relationships between different assets and features.
+    """
+    def __init__(self, observation_space, features_dim=128, dropout_rate=0.1, use_layer_norm=True):
+        super().__init__(observation_space, features_dim)
+        
+        # Get input dim from observation space
+        n_input_features = int(np.prod(observation_space.shape))
+        
+        # Save parameters
+        self.dropout_rate = dropout_rate
+        self.use_layer_norm = use_layer_norm
+        
+        # Define network architecture
+        # First layer processes the raw input
+        self.first_layer = nn.Sequential(
+            nn.Linear(n_input_features, 256),
+            nn.LayerNorm(256) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Residual blocks for better gradient flow
+        self.res_block1 = self._make_res_block(256, 256)
+        self.res_block2 = self._make_res_block(256, 256)
+        
+        # Feature reduction and transformation
+        self.feature_transform = nn.Sequential(
+            nn.Linear(256, features_dim),
+            nn.LayerNorm(features_dim) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Track uncertainty for position sizing
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.LayerNorm(64) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1)  # One uncertainty value per forward pass
+        )
+        
+    def _make_res_block(self, in_features, out_features):
+        """Create a residual block with the same input/output dimension"""
+        return nn.Sequential(
+            nn.Linear(in_features, out_features),
+            nn.LayerNorm(out_features) if self.use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(out_features, out_features),
+            nn.LayerNorm(out_features) if self.use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(self.dropout_rate)
+        )
+        
+    def forward(self, observations):
+        # Initial feature processing
+        features = self.first_layer(observations)
+        
+        # Apply residual connections
+        res1 = features + self.res_block1(features)
+        res2 = res1 + self.res_block2(res1)
+        
+        # Generate uncertainty estimates (side path)
+        # This allows the network to explicitly model uncertainty which can be
+        # used for position sizing in the environment
+        uncertainty = torch.sigmoid(self.uncertainty_head(res2))
+        
+        # Final feature transformation
+        transformed_features = self.feature_transform(res2)
+        
+        # Store uncertainty for potential use in position sizing
+        self._last_uncertainty = uncertainty
+        
+        return transformed_features
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Institutional Perpetual Trading AI')
@@ -218,7 +348,7 @@ class TradingSystem:
         
         # Initialize environment
         verbose = args.verbose if args and hasattr(args, 'verbose') else False
-        self.env = self._create_environment(self.processed_data, verbose=verbose)
+        self.env = self._create_environment(self.processed_data)
         
         # Initialize training manager
         self.training_manager = TrainingManager(
@@ -329,26 +459,44 @@ class TradingSystem:
             }
         )
         
-    def _create_environment(self, data: pd.DataFrame, verbose: bool = False) -> InstitutionalPerpetualEnv:
-        """Consolidated environment creation"""
-        # Extract unique assets from the MultiIndex columns
-        assets = list(data.columns.get_level_values('asset').unique())
+    def _create_environment(self, df, train=True):
+        """Create trading environment with market data."""
+        assets = df.columns.get_level_values(0).unique().tolist()
+        logger.info(f"Creating environment with assets: {assets}")
         
+        # Configure features
+        base_features = ['open', 'high', 'low', 'close', 'volume']
+        
+        # ENHANCED: Add more sophisticated technical indicators
+        tech_features = [
+            'returns_1d', 'returns_5d', 'returns_10d',
+            'volatility_5d', 'volatility_10d', 'volatility_20d',
+            'rsi_14', 'macd', 'bb_upper', 'bb_lower', 'bb_middle',
+            'atr_14', 'adx_14', 'cci_14',
+            'market_regime', 'hurst_exponent', 'volatility_regime'  # New market regime features
+        ]
+        
+        # Create risk engine with configuration parameters
+        risk_engine = InstitutionalRiskEngine(
+            risk_limits=RiskLimits(**self.config['risk_management']['limits'])
+        )
+        
+        # Create and return environment
         env = InstitutionalPerpetualEnv(
-            df=data,
+            df=df,
             assets=assets,
             window_size=self.config['model']['window_size'],
             max_leverage=self.config['trading']['max_leverage'],
             commission=self.config['trading']['transaction_fee'],
             funding_fee_multiplier=self.config['trading']['funding_fee_multiplier'],
-            base_features=['close', 'volume', 'funding_rate'],
-            tech_features=['rsi', 'macd', 'bb_upper', 'bb_lower'],
-            risk_engine=self.risk_engine,
-            risk_free_rate=self.config['trading'].get('risk_free_rate', 0.02),
-            verbose=verbose
+            base_features=base_features,
+            tech_features=tech_features,
+            risk_engine=risk_engine,
+            risk_free_rate=self.config['trading']['risk_free_rate'],
+            verbose=train  # Only log verbose in training mode
         )
         
-        # Wrap environment
+        # Wrap with normalization layers
         env = DummyVecEnv([lambda: env])
         env = VecNormalize(env, norm_obs=True, norm_reward=True)
         
@@ -398,18 +546,18 @@ class TradingSystem:
             storage=storage
         )
         
-    def optimize_hyperparameters(self, n_trials=30, n_jobs=5, n_steps=100000):
+    def optimize_hyperparameters(self, n_trials=30, n_jobs=5, total_timesteps=10000):
         """Run hyperparameter optimization"""
         if not self.study:
             self.create_study()
             
         logger.info(f"\nStarting hyperparameter optimization with {n_trials} trials")
         logger.info(f"Number of parallel jobs: {n_jobs}")
-        logger.info(f"Steps per trial: {n_steps}")
+        logger.info(f"Total timesteps per trial: {total_timesteps}")
         
         try:
             self.study.optimize(
-                lambda trial: self.objective(trial, n_steps),
+                lambda trial: self.objective(trial, total_timesteps),
                 n_trials=n_trials,
                 n_jobs=n_jobs,
                 show_progress_bar=True
@@ -447,48 +595,95 @@ class TradingSystem:
             })
             
             # Update model with best parameters
-            self.update_model_with_best_params()
+            self.update_model_with_best_params(self.study.best_trial.params, self.env)
             
         except Exception as e:
             logger.error(f"Error during optimization: {str(e)}")
             raise
             
-    def objective(self, trial: optuna.Trial, n_steps: int) -> float:
+    def objective(self, trial: optuna.Trial, total_timesteps: int) -> float:
         """Objective function for hyperparameter optimization"""
         try:
             # Start trial logging
             logger.info(f"\n╔═ Starting Trial {trial.number} ═{'═' * 59}╗")
-            logger.info(f"║ Steps per trial: {n_steps:<67} ║")
+            logger.info(f"║ Total timesteps per trial: {total_timesteps:<57} ║")
             
             # Sample hyperparameters
             learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)
-            batch_size = trial.suggest_categorical('batch_size', [64, 128, 256, 512])
             n_steps = trial.suggest_categorical('n_steps', [1024, 2048, 4096])
+            batch_size = trial.suggest_categorical('batch_size', [64, 128, 256, 512])
             gamma = trial.suggest_float('gamma', 0.9, 0.9999)
             gae_lambda = trial.suggest_float('gae_lambda', 0.9, 0.99)
             clip_range = trial.suggest_float('clip_range', 0.1, 0.3)
-            ent_coef = trial.suggest_float('ent_coef', 0.0, 0.01)
+            ent_coef = trial.suggest_float('ent_coef', 0.0, 0.05)  # ENHANCED: Expanded upper range
             vf_coef = trial.suggest_float('vf_coef', 0.5, 1.0)
             max_grad_norm = trial.suggest_float('max_grad_norm', 0.3, 0.7)
+            
+            # ENHANCED: Additional trading-specific hyperparameters
+            n_epochs = trial.suggest_int('n_epochs', 5, 15)  # Number of epochs per update
+            use_sde = trial.suggest_categorical('use_sde', [True, False])  # State-dependent exploration
+            sde_sample_freq = trial.suggest_int('sde_sample_freq', 4, 16) if use_sde else -1
+            target_kl = trial.suggest_float('target_kl', 0.01, 0.1)  # KL divergence target
+            
+            # Network architecture hyperparameters
+            pi_1 = trial.suggest_categorical('pi_1', [128, 256, 512])  # Policy network first layer
+            pi_2 = trial.suggest_categorical('pi_2', [64, 128, 256])   # Policy network second layer
+            vf_1 = trial.suggest_categorical('vf_1', [128, 256, 512])  # Value network first layer
+            vf_2 = trial.suggest_categorical('vf_2', [64, 128, 256])   # Value network second layer
+            
+            # Features extractor hyperparameters
+            features_dim = trial.suggest_categorical('features_dim', [64, 128, 256])
+            dropout_rate = trial.suggest_float('dropout_rate', 0.05, 0.3)
+            
+            # ENHANCED: Market regime-aware parameters
+            regime_aware = trial.suggest_categorical('regime_aware', [True, False])
+            position_holding_bonus = trial.suggest_float('position_holding_bonus', 0.01, 0.1) if regime_aware else 0.02
+            uncertainty_scaling = trial.suggest_float('uncertainty_scaling', 0.5, 2.0) if regime_aware else 1.0
             
             # Log sampled hyperparameters
             logger.info(f"║ Hyperparameters:                                                  ║")
             logger.info(f"║   - learning_rate: {learning_rate:<58} ║")
-            logger.info(f"║   - batch_size: {batch_size:<60} ║")
             logger.info(f"║   - n_steps: {n_steps:<63} ║")
+            logger.info(f"║   - batch_size: {batch_size:<60} ║")
             logger.info(f"║   - gamma: {gamma:<65} ║")
             logger.info(f"║   - gae_lambda: {gae_lambda:<60} ║")
             logger.info(f"║   - clip_range: {clip_range:<60} ║")
             logger.info(f"║   - ent_coef: {ent_coef:<62} ║")
             logger.info(f"║   - vf_coef: {vf_coef:<62} ║")
             logger.info(f"║   - max_grad_norm: {max_grad_norm:<56} ║")
+            logger.info(f"║   - n_epochs: {n_epochs:<61} ║")
+            logger.info(f"║   - use_sde: {use_sde:<63} ║")
+            if use_sde:
+                logger.info(f"║   - sde_sample_freq: {sde_sample_freq:<54} ║")
+            logger.info(f"║   - target_kl: {target_kl:<61} ║")
+            logger.info(f"║   - pi_network: [{pi_1}, {pi_2}]                                        ║")
+            logger.info(f"║   - vf_network: [{vf_1}, {vf_2}]                                        ║")
+            logger.info(f"║   - features_dim: {features_dim:<58} ║")
+            logger.info(f"║   - dropout_rate: {dropout_rate:<56} ║")
+            logger.info(f"║   - regime_aware: {regime_aware:<54} ║")
+            logger.info(f"║   - position_holding_bonus: {position_holding_bonus:<48} ║")
+            logger.info(f"║   - uncertainty_scaling: {uncertainty_scaling:<46} ║")
             logger.info(f"╚{'═' * 80}╝\n")
             
             # Create a fresh environment for each trial
-            env = self._create_environment(self.processed_data, verbose=False)
+            env = self._create_environment(self.processed_data)
             
             # Create model with sampled hyperparameters
             try:
+                # Define network architecture
+                net_arch = {
+                    "pi": [pi_1, pi_2],
+                    "vf": [vf_1, vf_2]
+                }
+                
+                # Create custom policy kwargs
+                policy_kwargs = {
+                    "net_arch": net_arch,
+                    "activation_fn": nn.ReLU,
+                    "features_extractor_class": ResNetFeatureExtractor,
+                    "features_extractor_kwargs": {"features_dim": features_dim, "dropout_rate": dropout_rate, "use_layer_norm": True}
+                }
+                
                 model = PPO(
                     policy="MlpPolicy",
                     env=env,
@@ -501,17 +696,21 @@ class TradingSystem:
                     ent_coef=ent_coef,
                     vf_coef=vf_coef,
                     max_grad_norm=max_grad_norm,
+                    n_epochs=n_epochs,
+                    use_sde=use_sde,
+                    sde_sample_freq=sde_sample_freq,
+                    target_kl=target_kl,
                     verbose=0,
                     tensorboard_log=self.config['logging'].get('tensorboard_dir', 'logs/tensorboard'),
-                    policy_kwargs=self.policy_kwargs
+                    policy_kwargs=policy_kwargs
                 )
 
                 # IMPORTANT FIX: Add exploration callback to encourage trading
                 class ExplorationCallback(BaseCallback):
                     def __init__(self, env, verbose=0):
                         super().__init__(verbose)
-                        # IMPORTANT FIX: Increase exploration steps even more
-                        self.exploration_steps = 15000  # Increased from 10000 to 15000
+                        # ENHANCED: Further increase exploration steps
+                        self.exploration_steps = 20000  # Increased from 15000 to 20000
                         # Access the underlying environment to get assets
                         if hasattr(env, 'envs'):
                             # For DummyVecEnv
@@ -524,39 +723,39 @@ class TradingSystem:
                         self.trades_executed = 0
                         self.last_trade_step = 0
                         self.no_trade_warning_counter = 0  # Add counter to avoid excessive warnings
-                        # NEW: Add trade forcing mechanism
-                        self.force_trade_every = 500  # Force trade attempts every N steps
+                        # ENHANCED: Improve trade forcing mechanism
+                        self.force_trade_every = 300  # Force trade attempts more frequently
                         
                     def _on_step(self):
                         self.step_count += 1
                         
-                        # IMPORTANT FIX: Use stronger exploration for longer
+                        # ENHANCED: Use stronger and longer exploration
                         if self.num_timesteps < self.exploration_steps:
                             # Add noise to actions during initial exploration
                             # Use stronger noise early in training
-                            noise_scale = max(0.9, 1.2 - self.num_timesteps / self.exploration_steps)
+                            noise_scale = max(1.0, 1.5 - self.num_timesteps / self.exploration_steps)
                             
-                            # NEW: Add bias toward extreme actions periodically to force trades
-                            if self.step_count % self.force_trade_every < 50:  # For 50 steps every force_trade_every steps
-                                # Create bias toward extreme actions (-1 or 1) to encourage trading
-                                bias = np.random.choice([-0.7, 0.7], size=len(self.assets))
+                            # ENHANCED: Add more frequent and stronger bias toward extreme actions
+                            if self.step_count % self.force_trade_every < 100:  # For 100 steps (longer period)
+                                # Create stronger bias toward extreme actions
+                                bias = np.random.choice([-0.8, 0.8], size=len(self.assets))
                                 self.model.action_noise = CustomActionNoise(
                                     mean=bias,  # Use bias as mean instead of zeros
                                     sigma=noise_scale * np.ones(len(self.assets)),
                                     size=len(self.assets)
                                 )
-                                if self.step_count % self.force_trade_every == 0:
-                                    logger.info(f"Forcing trade exploration at step {self.step_count} with bias {bias}")
+                                # if self.step_count % self.force_trade_every == 0:
+                                #     logger.info(f"Forcing trade exploration at step {self.step_count} with bias {bias}")
                             else:
                                 self.model.action_noise = CustomActionNoise(
                                     mean=np.zeros(len(self.assets)),
                                     sigma=noise_scale * np.ones(len(self.assets)),
                                     size=len(self.assets)
                                 )
-                            
-                            # Every 500 steps, log the exploration progress
-                            # if self.step_count % 500 == 0:
-                            #     logger.info(f"Exploration step {self.num_timesteps}/{self.exploration_steps}, noise scale: {noise_scale:.2f}")
+                              
+                              # Every 500 steps, log the exploration progress
+                              # if self.step_count % 500 == 0:
+                              #     logger.info(f"Exploration step {self.num_timesteps}/{self.exploration_steps}, noise scale: {noise_scale:.2f}")
                                 
                             # CRITICAL FIX: Check if trades are being executed
                             # Fixed trade detection logic
@@ -602,17 +801,17 @@ class TradingSystem:
                                 # logger.info(f"Trade detected at step {self.num_timesteps}, total trades: {self.trades_executed}")
                                 self.no_trade_warning_counter = 0  # Reset warning counter
                             
-                            # IMPORTANT FIX: If no trades for a long time, increase exploration
+                            # ENHANCED: If no trades for a long time, increase exploration even more
                             # Only warn every 100 steps to avoid log spam
                             if self.trades_executed == 0 and self.num_timesteps > 1000:
                                 self.no_trade_warning_counter += 1
                                 if self.no_trade_warning_counter >= 100:
-                                    # Force stronger exploration
-                                    logger.warning(f"No trades executed after {self.num_timesteps} steps, increasing exploration")
+                                    # Force even stronger exploration
+                                    logger.warning(f"No trades executed after {self.num_timesteps} steps, using extreme exploration")
                                     # Use extremely strong noise to force exploration
                                     self.model.action_noise = CustomActionNoise(
-                                        mean=np.zeros(len(self.assets)),
-                                        sigma=2.0 * np.ones(len(self.assets)),  # Very strong noise
+                                        mean=np.random.choice([-0.5, 0.5], size=len(self.assets)),  # Add bias
+                                        sigma=2.5 * np.ones(len(self.assets)),  # Even stronger noise
                                         size=len(self.assets)
                                     )
                                     self.no_trade_warning_counter = 0  # Reset counter
@@ -622,26 +821,26 @@ class TradingSystem:
                                     # If trades stopped, increase exploration again
                                     logger.warning(f"No trades for {self.num_timesteps - self.last_trade_step} steps, increasing exploration")
                                     self.model.action_noise = CustomActionNoise(
-                                        mean=np.zeros(len(self.assets)),
-                                        sigma=1.5 * np.ones(len(self.assets)),  # Strong noise
+                                        mean=np.random.choice([-0.3, 0.3], size=len(self.assets)),  # Add some bias
+                                        sigma=2.0 * np.ones(len(self.assets)),  # Stronger noise
                                         size=len(self.assets)
                                     )
                                     self.no_trade_warning_counter = 0  # Reset counter
                         else:
-                            # Gradually reduce noise after exploration phase
+                            # ENHANCED: Gradually reduce noise after exploration phase but keep it significant
                             if self.num_timesteps < self.exploration_steps * 2:
                                 decay_factor = 1.0 - ((self.num_timesteps - self.exploration_steps) / self.exploration_steps)
-                                noise_scale = 0.5 * decay_factor  # Increased from 0.3 to 0.5
+                                noise_scale = 0.6 * decay_factor  # Increased from 0.5 to 0.6
                                 self.model.action_noise = CustomActionNoise(
                                     mean=np.zeros(len(self.assets)),
                                     sigma=noise_scale * np.ones(len(self.assets)),
                                     size=len(self.assets)
                                 )
                             else:
-                                # IMPORTANT FIX: Keep some minimal noise to encourage exploration
+                                # ENHANCED: Keep more significant minimal noise throughout training
                                 self.model.action_noise = CustomActionNoise(
                                     mean=np.zeros(len(self.assets)),
-                                    sigma=0.1 * np.ones(len(self.assets)),  # Minimal noise
+                                    sigma=0.15 * np.ones(len(self.assets)),  # Increased minimal noise
                                     size=len(self.assets)
                                 )
                         
@@ -651,7 +850,8 @@ class TradingSystem:
                 try:
                     # IMPORTANT FIX: Add exploration callback
                     exploration_callback = ExplorationCallback(env)
-                    model.learn(total_timesteps=n_steps, callback=exploration_callback)
+                    # CRITICAL FIX: Use total_timesteps for the actual training duration
+                    model.learn(total_timesteps=total_timesteps, callback=exploration_callback)
                 except Exception as train_error:
                     logger.error(f"Error during training: {str(train_error)}")
                     raise optuna.TrialPruned()
@@ -1021,55 +1221,98 @@ class TradingSystem:
             "trades_executed": trades_executed
         }
         
-    def update_model_with_best_params(self):
-        """Update the model with the best found parameters"""
-        if not self.study:
-            logger.warning("No study available to update model parameters")
-            return
+    def update_model_with_best_params(self, best_params, env):
+        """Update model with best hyperparameters."""
+        try:
+            # Log best parameters
+            logger.info("Best hyperparameters:")
+            for param, value in best_params.items():
+                logger.info(f"{param}: {value}")
             
-        best_params = self.study.best_params
-        best_trial = self.study.best_trial
-        
-        logger.info("Updating model with best parameters:")
-        for key, value in best_params.items():
-            logger.info(f"  {key}: {value}")
+            # Define network architecture
+            net_arch = [dict(
+                pi=[best_params["pi_1"], best_params["pi_2"]], 
+                vf=[best_params["vf_1"], best_params["vf_2"]]
+            )]
             
-        # Create network architecture from best parameters
-        net_arch = {
-            "pi": [best_params["pi_1"], best_params["pi_2"]],
-            "vf": [best_params["vf_1"], best_params["vf_2"]]
-        }
+            # Define policy kwargs
+            policy_kwargs = {
+                "net_arch": net_arch,
+                "activation_fn": nn.LeakyReLU,
+                "features_extractor_class": ResNetFeatureExtractor,
+                "features_extractor_kwargs": {
+                    "features_dim": best_params.get("features_dim", 128),
+                    "dropout_rate": best_params.get("dropout_rate", 0.15),
+                    "use_layer_norm": True
+                }
+            }
+            
+            # Check if we have SDE parameters
+            use_sde = best_params.get("use_sde", True)
+            sde_sample_freq = best_params.get("sde_sample_freq", 4) if use_sde else -1
+            
+            # Create model with best hyperparameters
+            model = PPO(
+                "MlpPolicy",
+                env,
+                learning_rate=best_params["learning_rate"],
+                n_steps=best_params["ppo_n_steps"],
+                batch_size=best_params["batch_size"],
+                n_epochs=best_params.get("n_epochs", 10),
+                gamma=best_params["gamma"],
+                gae_lambda=best_params["gae_lambda"],
+                clip_range=best_params["clip_range"],
+                clip_range_vf=None,
+                normalize_advantage=True,
+                ent_coef=best_params["ent_coef"],
+                vf_coef=best_params["vf_coef"],
+                max_grad_norm=best_params["max_grad_norm"],
+                use_sde=use_sde,
+                sde_sample_freq=sde_sample_freq,
+                target_kl=best_params.get("target_kl", None),
+                tensorboard_log="./logs/ppo_crypto_tensorboard/",
+                policy_kwargs=policy_kwargs,
+                verbose=1
+            )
+            
+            # Configure environment for best parameters
+            if hasattr(env, "get_attr"):
+                # For vectorized environments
+                if best_params.get("regime_aware", False):
+                    # Enable regime awareness in the environment
+                    env.env_method("set_regime_aware", True)
+                    
+                    # Set position holding incentives
+                    if "position_holding_bonus" in best_params:
+                        env.env_method("set_position_holding_bonus", 
+                                     best_params["position_holding_bonus"])
+                    
+                    # Set uncertainty scaling
+                    if "uncertainty_scaling" in best_params:
+                        env.env_method("set_uncertainty_scaling",
+                                     best_params["uncertainty_scaling"])
+            else:
+                # For non-vectorized environments
+                if best_params.get("regime_aware", False):
+                    # Enable regime awareness in the environment
+                    if hasattr(env, "set_regime_aware"):
+                        env.set_regime_aware(True)
+                    
+                    # Set position holding incentives
+                    if "position_holding_bonus" in best_params and hasattr(env, "set_position_holding_bonus"):
+                        env.set_position_holding_bonus(best_params["position_holding_bonus"])
+                    
+                    # Set uncertainty scaling
+                    if "uncertainty_scaling" in best_params and hasattr(env, "set_uncertainty_scaling"):
+                        env.set_uncertainty_scaling(best_params["uncertainty_scaling"])
+            
+            logger.info("Model updated with best hyperparameters")
+            return model
         
-        # Update policy kwargs
-        policy_kwargs = {
-            "net_arch": net_arch,
-            "activation_fn": torch.nn.ReLU,
-            "features_extractor_class": CustomFeatureExtractor,
-            "features_extractor_kwargs": {"features_dim": 128}
-        }
-        
-        # Create new model with best parameters
-        self.model = PPO(
-            "MlpPolicy",
-            self.env,
-            learning_rate=best_params["learning_rate"],
-            n_steps=best_params["n_steps"],
-            batch_size=best_params["batch_size"],
-            n_epochs=best_params["n_epochs"],
-            gamma=best_params["gamma"],
-            gae_lambda=best_params["gae_lambda"],
-            clip_range=best_params["clip_range"],
-            ent_coef=best_params["ent_coef"],
-            vf_coef=best_params["vf_coef"],
-            max_grad_norm=best_params["max_grad_norm"],
-            target_kl=best_params["target_kl"],
-            tensorboard_log=self.config['logging'].get('tensorboard_dir', 'logs/tensorboard'),
-            policy_kwargs=policy_kwargs,
-            verbose=1,
-            device=self.device
-        )
-        
-        logger.info("Model updated with best parameters from optimization")
+        except Exception as e:
+            logger.error(f"Error updating model with best params: {e}")
+            traceback.print_exc()
+            raise
 
     def train(self):
         """Optimized training method without curriculum learning"""
@@ -1330,7 +1573,7 @@ async def main():
         await trading_system.initialize(args)
         
         # Run hyperparameter optimization
-        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, n_steps=100000)
+        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, total_timesteps=10000)
         
         # Train the model with best parameters
         trading_system.train()

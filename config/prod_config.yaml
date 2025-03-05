@@ -21,7 +21,7 @@ trading:
   transaction_costs:
     maker_fee: 0.0002
     taker_fee: 0.0004
-    slippage: 0.0001
+    slippage: 0.0005
   funding_rate:
     multiplier: 0.8
     max_funding_rate: 0.01
