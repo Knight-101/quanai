@@ -1193,14 +1193,24 @@ class InstitutionalPerpetualEnv(gym.Env):
                     # Determine if volatility is trending up
                     vol_trend = 0.0
                     if len(vol_history) >= 5:
-                        vol_trend = np.mean(list(vol_history)[-3:]) / np.mean(list(vol_history)[:-3]) - 1
+                        recent_mean = np.mean(list(vol_history)[-3:])
+                        older_mean = np.mean(list(vol_history)[:-3])
+                        if np.isnan(recent_mean) or np.isnan(older_mean) or older_mean == 0:
+                            vol_trend = 0.0  # Default to no trend when we have invalid data
+                        else:
+                            vol_trend = recent_mean / older_mean - 1
                     
                     # Calculate uncertainty score (0 = certain, 1 = uncertain)
                     # Base on:
                     # 1. Current volatility relative to average
                     # 2. Trending or ranging market
                     # 3. Volatility trend
-                    volatility_factor = min(current_vol / max(0.0001, self.uncertainty_metrics[asset]['avg_volatility']), 3)
+                    # Adding safeguards for NaN and zero division
+                    denominator = max(0.0001, self.uncertainty_metrics[asset]['avg_volatility'])
+                    if np.isnan(current_vol) or np.isnan(denominator) or denominator == 0:
+                        volatility_factor = 1.0  # Default to neutral when we have invalid data
+                    else:
+                        volatility_factor = min(current_vol / denominator, 3)
                     regime_factor = 0.5 if abs(market_regime - 0.5) < 0.2 else 0.0  # More uncertain in neutral regimes
                     trend_factor = max(0, min(vol_trend * 3, 1))  # More uncertain when volatility increasing
                     
