@@ -546,7 +546,7 @@ class TradingSystem:
             storage=storage
         )
         
-    def optimize_hyperparameters(self, n_trials=30, n_jobs=5, total_timesteps=10000):
+    def optimize_hyperparameters(self, n_trials=30, n_jobs=5, total_timesteps=100000):
         """Run hyperparameter optimization"""
         if not self.study:
             self.create_study()
@@ -1013,7 +1013,7 @@ class TradingSystem:
                     # Check trades_executed flag
                     if info.get('trades_executed', False):
                         trade_detected = True
-                        logger.info(f"Trade executed at step {step_count} (via trades_executed flag)")
+                        # logger.info(f"Trade executed at step {step_count} (via trades_executed flag)")
                     
                     # Check positions directly
                     if 'positions' in info:
@@ -1573,7 +1573,7 @@ async def main():
         await trading_system.initialize(args)
         
         # Run hyperparameter optimization
-        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, total_timesteps=10000)
+        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, total_timesteps=100000)
         
         # Train the model with best parameters
         trading_system.train()
