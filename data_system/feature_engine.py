@@ -916,7 +916,7 @@ class DerivativesFeatureEngine:
 
     def _calculate_rolling_hurst(self, series, window):
         """Calculate Hurst exponent in a rolling window to identify trend strength"""
-        series = series.fillna(method='ffill')
+        series = series.ffill()
         result = pd.Series(index=series.index, data=np.nan)
         
         # Need at least 100 points for a reasonable Hurst calculation
@@ -931,7 +931,7 @@ class DerivativesFeatureEngine:
             result.iloc[i] = self._hurst_exponent(time_series)
             
         # Forward fill initial NaN values
-        result = result.fillna(method='ffill')
+        result = result.ffill()
         return result
         
     def _hurst_exponent(self, time_series, max_lag=20):

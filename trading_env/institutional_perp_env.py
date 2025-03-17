@@ -9,6 +9,7 @@ import logging
 from utils.time_utils import get_utc_now, timestamp_to_datetime
 import traceback
 import copy
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.ERROR)  # Change from WARNING to ERROR for less verbosity
@@ -25,6 +26,8 @@ class InstitutionalPerpetualEnv(gym.Env):
                  tech_features: List[str] = None,
                  risk_engine: Optional[InstitutionalRiskEngine] = None,
                  risk_free_rate: float = 0.02,
+                 initial_balance: float = 10000.0,  # Make initial balance configurable
+                 max_drawdown: float = 0.3,  # Make max drawdown configurable
                  verbose: bool = False):  # Add verbose flag
         
         super().__init__()
@@ -44,14 +47,14 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.df = df
         
         # Basic parameters
-        self.initial_balance = 100000.0
+        self.initial_balance = initial_balance  # Use the passed parameter
         self.balance = self.initial_balance
         self.commission = commission
         self.max_leverage = max_leverage
         self.window_size = window_size
         self.current_step = self.window_size
         self.funding_fee_multiplier = funding_fee_multiplier
-        self.max_drawdown = 0.5
+        self.max_drawdown = max_drawdown  # Use the passed parameter
         self.risk_free_rate = risk_free_rate
         
         # Extract unique assets from MultiIndex
@@ -184,20 +187,22 @@ class InstitutionalPerpetualEnv(gym.Env):
     def step(self, action):
         """Execute trading step with the given action"""
         try:
-            # Store initial portfolio value for reward calculation
+            # CRITICAL FIX: Store initial portfolio value for reward calculation
             initial_portfolio = self._calculate_portfolio_value()
             initial_positions = copy.deepcopy(self.positions)
-            
-            # ENHANCED: Track consecutive no-trade steps
-            had_trade_this_step = False
             
             # Check if we've reached the end of data
             if self.current_step >= len(self.df) - 1:
                 # Return final state with done flag
+                # logger.info(f"Reached end of data at step {self.current_step}")
                 return self._get_observation(), 0, True, False, self._get_info({})
             
             # Advance to next step
             self.current_step += 1
+            
+            # # Log that we're moving to the next step
+            # if self.verbose:
+            #     logger.info(f"Advancing to step {self.current_step} / {len(self.df)-1}")
             
             # ENHANCED: Process action and detect changes for trade frequency tracking
             action_vector = np.array(action).flatten()
@@ -205,12 +210,23 @@ class InstitutionalPerpetualEnv(gym.Env):
             significant_change = np.any(position_changes > 0.1)  # Consider >10% change as significant
             self.last_action_vector = action_vector.copy()
             
+            # CRITICAL FIX: Normalize action vector for multi-asset allocation
+            # This ensures the total allocation across all assets is properly distributed
+            total_allocation = np.sum(np.abs(action_vector))
+            if total_allocation > 1e-8:
+                normalized_allocation = np.abs(action_vector) / total_allocation
+            else:
+                normalized_allocation = np.ones_like(action_vector) / len(action_vector)
+            
             # ENHANCED: Apply uncertainty-based scaling to actions
             uncertainty_scaled_action = self._apply_uncertainty_scaling(action_vector)
             
             # Execute trades based on uncertainty-scaled action
             trades = []
             trades_executed = False
+            
+            # Calculate risk metrics before executing trades
+            risk_metrics = self._calculate_risk_metrics()
             
             # Process each asset's action
             for i, asset in enumerate(self.assets):
@@ -226,87 +242,87 @@ class InstitutionalPerpetualEnv(gym.Env):
                 # Update the last price in position data
                 self.positions[asset]['last_price'] = price
                 
-                # Convert signal to target position size (-max_leverage to +max_leverage)
-                target_size = signal * self.max_leverage * self.balance / price
+                # CRITICAL FIX: Convert signal to target position size with proper allocation
+                # Use normalized allocation to distribute leverage across assets
+                asset_allocation = normalized_allocation[i]
+                target_leverage = abs(signal) * self.max_leverage * asset_allocation
+                direction = np.sign(signal) if np.abs(signal) > 1e-8 else 0
+                portfolio_value = self._calculate_portfolio_value()
+                target_value = direction * target_leverage * portfolio_value
                 
-                # Change from current to target (positive = increase, negative = decrease)
-                size_change = target_size - current_size
+                # Enforce risk limits for position concentration
+                if self.risk_engine:
+                    max_position_value = portfolio_value * self.risk_engine.risk_limits.position_concentration
+                    if abs(target_value) > max_position_value:
+                        target_value = max_position_value * direction
+                        # if self.verbose:
+                        #     logger.info(f"Position size for {asset} limited by concentration risk: {target_value:.2f}")
                 
-                # Skip tiny trades (less than 0.1% of balance)
-                min_trade_size = 0.001 * self.balance / price
-                if abs(size_change) < min_trade_size:
-                    continue
+                # Convert target value to size with sanity checks
+                if price > 0:
+                    target_size = target_value / price
+                    
+                    # CRITICAL FIX: Add asset-specific position limits
+                    max_asset_units = {
+                        'BTCUSDT': 10,      # Max ~$400k per BTC position
+                        'ETHUSDT': 100,     # Max ~$200k per ETH position
+                        'SOLUSDT': 500,      # Max ~$100k per SOL position
+                    }.get(asset, 1000)      # Default limit for other assets
+                    
+                    if abs(target_size) > max_asset_units:
+                        target_size = max_asset_units * direction
+                        # if self.verbose:
+                        #     logger.info(f"Position size for {asset} limited by max units: {target_size:.2f}")
+                else:
+                    target_size = 0
                 
-                # Create trade object with size change
-                trade = {
-                    'asset': asset,
-                    'timestamp': self.current_step,
-                    'price': price,
-                    'target_size': target_size,
-                    'size_change': size_change,
-                    # Add required keys for _simulate_trades
-                    'direction': 1 if size_change > 0 else -1,  # Direction based on size change
-                    'leverage': abs(signal * self.max_leverage),  # Leverage calculation
-                    'execution_params': [1.0],  # Default execution param
-                    'risk_limits': {  # Default risk limits
-                        'max_slippage': 0.001,
-                        'max_impact': 0.002
-                    }
-                }
+                size_diff = target_size - current_size
                 
-                trades.append(trade)
+                # Only create trade if the size difference is significant
+                min_trade_size = 1e-6  # Increase minimum trade size threshold
+                if abs(size_diff) > min_trade_size:
+                    # Add the trade to the list
+                    trades.append({
+                        'asset': asset,
+                        'size_change': size_diff,
+                        'direction': np.sign(size_diff),
+                        'current_price': price
+                    })
+                    # if self.verbose:
+                    #     logger.info(f"Created trade for {asset}: {size_diff:.6f} units at ${price:.2f}")
             
             # Simulate trades to check risk limits
-            risk_metrics = self._simulate_trades(trades)
+            simulation_result = self._simulate_trades(trades)
             
-            # Execute trades if no risk violations
-            if not risk_metrics.get('risk_violation', False):
+            # Execute trades if no risk violations, or execute scaled trades if available
+            if not simulation_result.get('risk_limit_exceeded', False):
                 # Execute the trades
                 self._execute_trades(trades)
-                trades_executed = len(trades) > 0
-                
-                # ENHANCED: If we executed trades, reset consecutive no-trade counter
-                if trades_executed:
-                    had_trade_this_step = True
-                    self.consecutive_no_trade_steps = 0
-                else:
-                    self.consecutive_no_trade_steps += 1
+                trades_executed = True
+                if len(trades) > 0:
+                    logger.debug(f"Executed {len(trades)} trades at step {self.current_step}")
+            elif 'scaled_trades' in simulation_result and simulation_result['scaled_trades']:
+                # Execute scaled trades that comply with risk limits
+                # logger.info(f"Executing scaled trades to comply with risk limits")
+                self._execute_trades(simulation_result['scaled_trades'])
+                trades_executed = True
+            else:
+                logger.debug(f"No trades executed due to risk limits")
+                trades_executed = False
             
             # ENHANCED: Update trade counts for frequency tracking
-            self.trade_counts.append(1 if had_trade_this_step else 0)
+            self.trade_counts.append(1 if trades_executed else 0)
             
-            # Update all positions prices and values
+            # CRITICAL FIX: Apply funding costs and update positions before calculating final portfolio value
             self._update_positions()
             
-            # ENHANCED: Update position durations and track profits
-            for asset in self.assets:
-                position_size = self.positions[asset]['size']
-                
-                if position_size != 0:
-                    # Position exists, increment duration
-                    self.position_duration[asset] += 1
-                    
-                    # Calculate profit/loss for this position
-                    entry_price = self.positions[asset]['entry_price']
-                    current_price = self.positions[asset]['last_price']
-                    if entry_price > 0:  # Avoid division by zero
-                        pnl_pct = (current_price / entry_price - 1) * np.sign(position_size)
-                        self.position_profits[asset].append(pnl_pct)
-                else:
-                    # No position, reset duration and profits
-                    self.position_duration[asset] = 0
-                    self.position_profits[asset] = []
-            
-            # Calculate current portfolio value
+            # CRITICAL FIX: Calculate portfolio value after trades and position updates
             portfolio_value = self._calculate_portfolio_value()
             
-            # Add to portfolio history
-            self.portfolio_history.append({
-                'step': self.current_step,
-                'value': portfolio_value
-            })
+            # Log portfolio value after all updates
+            logger.debug(f"Step {self.current_step} complete. Portfolio value: ${portfolio_value:.2f} (change: ${portfolio_value - initial_portfolio:.2f})")
             
-            # Calculate PnL for this step
+            # CRITICAL FIX: Calculate actual PnL for this step
             total_pnl = portfolio_value - initial_portfolio
             
             # Update risk metrics after executing trades
@@ -315,8 +331,8 @@ class InstitutionalPerpetualEnv(gym.Env):
             # ENHANCED: Calculate holding time bonus/penalty
             holding_reward = self._calculate_holding_time_reward()
             
-            # Calculate reward
-            reward = self._calculate_reward(risk_metrics, total_pnl, holding_reward)
+            # CRITICAL FIX: Calculate reward using the risk-adjusted reward function
+            reward = self._calculate_risk_adjusted_reward(total_pnl, risk_metrics)
             
             # Check if episode is done
             done = self._is_done()
@@ -336,10 +352,14 @@ class InstitutionalPerpetualEnv(gym.Env):
             info['total_trades'] = len(self.trades)
             info['portfolio_change'] = portfolio_value - initial_portfolio
             
-            # Log step results
-            # if self.verbose:
-            #     logger.info(f"Step {self.current_step}: Reward = {reward:.4f}, Done = {done}, "
-            #                f"Trades Executed = {trades_executed}, Portfolio Value = {portfolio_value:.2f}")
+            # Add more position information
+            active_positions = {}
+            for asset, pos in self.positions.items():
+                if abs(pos['size']) > 1e-8:
+                    active_positions[asset] = pos['size']
+            
+            info['positions'] = self.positions
+            info['active_positions'] = active_positions
             
             # CRITICAL FIX: Return 5-tuple format for Gymnasium
             return self._get_observation(), reward, terminated, truncated, info
@@ -360,38 +380,129 @@ class InstitutionalPerpetualEnv(gym.Env):
                 asset = trade['asset']
                 
                 # Handle different trade dictionary structures
-                if 'size' in trade:  
-                    # Close position
-                    simulated_positions[asset]['size'] = 0
-                elif 'size_change' in trade and 'direction' in trade and 'leverage' in trade:  
-                    # New trade with our enhanced structure
+                if 'size_change' in trade:  
                     size_change = trade['size_change']
-                    direction = trade['direction']
-                    leverage = trade['leverage']
-                    
-                    # Calculate target exposure
-                    target_exposure = direction * leverage * self.balance
-                    current_exposure = simulated_positions[asset]['size'] * self._get_mark_price(asset)
-                    
-                    # Get execution parameter (default to 1.0 if not present)
-                    execution_param = 1.0
-                    if 'execution_params' in trade and trade['execution_params']:
-                        execution_param = trade['execution_params'][0]
-                    
-                    # Calculate order size
-                    order_size = (target_exposure - current_exposure) * execution_param
                     
                     # Update simulated position
-                    new_size = simulated_positions[asset]['size'] + (size_change or 0)
-                    simulated_positions[asset]['size'] = new_size
+                    if asset in simulated_positions:
+                        simulated_positions[asset]['size'] += size_change
+                    else:
+                        # Initialize if missing
+                        mark_price = self._get_mark_price(asset)
+                        simulated_positions[asset] = {
+                            'size': size_change,
+                            'entry_price': mark_price,
+                            'last_price': mark_price
+                        }
+            
+            # Calculate simulated risk metrics
+            portfolio_value = self.balance  # Start with cash balance
+            total_exposure = 0
+            asset_values = {}
+            
+            for asset, position in simulated_positions.items():
+                # Skip assets with no position
+                if abs(position['size']) < 1e-8:
+                    continue
+                    
+                # Get current price
+                price = self._get_mark_price(asset)
                 
-            return simulated_positions
+                # Calculate position value and add to total
+                position_value = position['size'] * price
+                portfolio_value += position_value
+                total_exposure += abs(position_value)
+                asset_values[asset] = abs(position_value)
+            
+            # Ensure we don't divide by zero
+            portfolio_value = max(portfolio_value, self.initial_balance * 0.01)
+            
+            # Calculate leverage
+            leverage = total_exposure / portfolio_value
+            
+            # Calculate position concentration
+            max_concentration = 0
+            max_asset = ""
+            for asset, value in asset_values.items():
+                concentration = value / portfolio_value
+                if concentration > max_concentration:
+                    max_concentration = concentration
+                    max_asset = asset
+            
+            # CRITICAL FIX: Check if we exceed risk limits
+            risk_limit_exceeded = False
+            exceeded_limits = []
+            
+            # Check leverage limit
+            if leverage > self.max_leverage:
+                risk_limit_exceeded = True
+                exceeded_limits.append(f"Leverage {leverage:.2f}x > {self.max_leverage:.2f}x")
+            
+            # Check concentration limit
+            concentration_limit = 0.4  # Default, can be overridden by risk engine
+            if self.risk_engine:
+                concentration_limit = self.risk_engine.risk_limits.position_concentration
+                
+            if max_concentration > concentration_limit:
+                risk_limit_exceeded = True
+                exceeded_limits.append(f"Concentration {max_concentration:.2%} > {concentration_limit:.2%} for {max_asset}")
+            
+            # CRITICAL FIX: Scale down trades if they would exceed risk limits
+            scaled_trades = []
+            if risk_limit_exceeded and len(trades) > 0:
+                # logger.warning(f"Risk limits would be exceeded: {', '.join(exceeded_limits)}")
+                
+                # Calculate scaling factor
+                scale_factor = 0.8  # Default scale down by 20%
+                
+                if leverage > self.max_leverage:
+                    # Scale to get within leverage limit
+                    leverage_scale = (self.max_leverage * 0.9) / leverage
+                    scale_factor = min(scale_factor, leverage_scale)
+                
+                if max_concentration > concentration_limit:
+                    # Scale to get within concentration limit
+                    concentration_scale = (concentration_limit * 0.9) / max_concentration
+                    scale_factor = min(scale_factor, concentration_scale)
+                
+                # Apply scaling to all trades
+                for trade in trades:
+                    if 'size_change' in trade:
+                        scaled_trade = trade.copy()
+                        scaled_trade['size_change'] = trade['size_change'] * scale_factor
+                        if abs(scaled_trade['size_change']) > 1e-8:  # Only include non-zero trades
+                            scaled_trades.append(scaled_trade)
+                
+                # logger.info(f"Scaling trades by factor {scale_factor:.4f} to comply with risk limits")
+                return {
+                    'portfolio_value': portfolio_value,
+                    'leverage': leverage,
+                    'max_concentration': max_concentration,
+                    'risk_limit_exceeded': risk_limit_exceeded,
+                    'exceeded_limits': exceeded_limits,
+                    'scaled_trades': scaled_trades
+                }
+            
+            # Return simulated metrics
+            return {
+                'portfolio_value': portfolio_value,
+                'leverage': leverage,
+                'max_concentration': max_concentration,
+                'risk_limit_exceeded': risk_limit_exceeded,
+                'exceeded_limits': exceeded_limits,
+                'scaled_trades': trades  # No scaling needed
+            }
             
         except Exception as e:
-            logger.error(f"Error in _simulate_trades: {str(e)}")
-            traceback.print_exc()
-            # Return empty risk metrics with error flag
-            return {"risk_violation": True, "error": str(e)}
+            logger.error(f"Error in simulating trades: {str(e)}")
+            return {
+                'portfolio_value': self.balance,
+                'leverage': 0,
+                'max_concentration': 0,
+                'risk_limit_exceeded': True,
+                'exceeded_limits': ["Error in simulation"],
+                'scaled_trades': []  # Return empty list on error
+            }
         
     def _execute_trades(self, trades: List[Dict]):
         """Smart order execution with transaction cost model"""
@@ -407,63 +518,124 @@ class InstitutionalPerpetualEnv(gym.Env):
                 # Get execution parameters (default to full execution)
                 execution_params = trade.get('execution_params', [1.0])
                 
+                # CRITICAL FIX: Capture original position for proper PnL calculation
+                original_position = self.positions[asset]['size']
+                original_entry_price = self.positions[asset]['entry_price']
+                
                 # If we have size_change, use that directly
                 if 'size_change' in trade and trade['size_change'] != 0:
                     # Get current price
                     mark_price = self._get_mark_price(asset)
-                    order_size = trade['size_change'] * mark_price
+                    size_change = trade['size_change']
                     
+                    # CRITICAL FIX: Calculate monetary value of the position change
+                    position_change_value = size_change * mark_price
+                
                     # Apply transaction costs
                     # Apply slippage model - implementation shortfall
-                    price_impact = self._estimate_price_impact(asset, order_size)
+                    price_impact = self._estimate_price_impact(asset, position_change_value)
                     execution_price = mark_price * (1 + price_impact * direction)
                     
                     # Apply transaction costs
-                    total_cost = abs(order_size) * (
+                    total_cost = abs(position_change_value) * (
                         self.commission + 
                         price_impact + 
                         self._get_spread_cost(asset)
                     )
+                
+                    # CRITICAL FIX: If closing a position, calculate realized PnL
+                    realized_pnl = 0.0
+                    if original_position != 0 and ((original_position > 0 and size_change < 0) or 
+                                                  (original_position < 0 and size_change > 0)):
+                        # We're reducing or closing position, calculate PnL on closed portion
+                        if abs(size_change) >= abs(original_position):
+                            # Fully closing or flipping
+                            if original_position > 0:  # Long position
+                                realized_pnl = original_position * (execution_price - original_entry_price)
+                            else:  # Short position
+                                realized_pnl = original_position * (original_entry_price - execution_price)
+                        else:
+                            # Partial close
+                            closed_size = min(abs(original_position), abs(size_change))
+                            if original_position > 0:  # Long position
+                                realized_pnl = closed_size * (execution_price - original_entry_price)
+                            else:  # Short position
+                                realized_pnl = closed_size * (original_entry_price - execution_price)
+                            
+                    # Adjust realized PnL by commission costs
+                    realized_pnl -= abs(size_change) * execution_price * self.commission
                     
-                    # Update balance and position
-                    self.balance -= total_cost
-                    self.positions[asset]['size'] += trade['size_change']
-                    self.positions[asset]['entry_price'] = execution_price
+                    # CRITICAL FIX: Update balance with realized PnL and costs
+                    self.balance += realized_pnl - total_cost
+                    
+                    # Update position size
+                    self.positions[asset]['size'] += size_change
+                    
+                    # CRITICAL FIX: Update entry price properly using weighted average
+                    if self.positions[asset]['size'] != 0:
+                        if abs(size_change) > abs(original_position) and np.sign(size_change) != np.sign(original_position):
+                            # Direction flipped, use new price
+                            self.positions[asset]['entry_price'] = execution_price
+                        elif original_position != 0 and np.sign(size_change) == np.sign(original_position):
+                            # Adding to position, calculate weighted average
+                            total_size = abs(self.positions[asset]['size'])
+                            original_value = abs(original_position) * original_entry_price
+                            new_value = abs(size_change) * execution_price
+                            self.positions[asset]['entry_price'] = (original_value + new_value) / total_size
+                        elif original_position == 0:
+                            # New position
+                            self.positions[asset]['entry_price'] = execution_price
+                    
                     self.total_costs += total_cost
+                    
+                    # Add trade to history with realized PnL
+                    self.trades.append({
+                        'timestamp': self.current_step,
+                        'asset': asset,
+                        'size': size_change,
+                        'price': execution_price,
+                        'cost': total_cost,
+                        'realized_pnl': realized_pnl  # CRITICAL FIX: Use 'realized_pnl' for consistency
+                    })
+                    
+                    # if self.verbose:
+                    #     logger.info(f"Trade executed: {asset} {size_change:.4f} @ {execution_price:.2f}, " +
+                    #               f"Cost: {total_cost:.2f}, Realized PnL: {realized_pnl:.2f}")
                 else:
-                    # Target position calculation (original approach)
-                    target_exposure = direction * leverage * self.balance
-                    current_exposure = self.positions[asset]['size'] * self._get_mark_price(asset)
-                    
-                    # Smart execution sizing
-                    order_size = (target_exposure - current_exposure) * execution_params[0]
-                    
-                    if abs(order_size) > 0:
-                        # Implementation shortfall model
-                        price_impact = self._estimate_price_impact(asset, order_size)
-                        execution_price = self._get_mark_price(asset) * (1 + price_impact)
-                        
-                        # Apply transaction costs
-                        total_cost = abs(order_size) * (
-                            self.commission + 
-                            price_impact + 
-                            self._get_spread_cost(asset)
-                        )
-                        
-                        # Update balance and position
-                        self.balance -= total_cost
-                        self.positions[asset]['size'] = target_exposure / execution_price
-                        self.positions[asset]['entry_price'] = execution_price
-                        self.total_costs += total_cost
+                    # Here we would handle the old trade format, but this branch is deprecated
+                    # and shouldn't be called with our new trading logic
+                    logger.warning("Deprecated trade format used without size_change")
         except Exception as e:
             logger.error(f"Error in _execute_trades: {str(e)}")
             traceback.print_exc()
-        
+                    
     def _update_positions(self):
         """Update positions with mark-to-market and funding rates"""
         try:
             total_pnl = 0.0
             portfolio_value_before = self._calculate_portfolio_value()
+            
+            # CRITICAL FIX: Track position metrics
+            for asset in self.assets:
+                position_size = self.positions[asset]['size']
+                
+                if abs(position_size) > 1e-8:
+                    # Position exists, increment duration
+                    self.position_duration[asset] += 1
+                    
+                    # Calculate profit/loss for this position
+                    entry_price = self.positions[asset]['entry_price']
+                    current_price = self.positions[asset]['last_price']
+                    if entry_price > 0:  # Avoid division by zero
+                        pnl_pct = (current_price / entry_price - 1) * np.sign(position_size)
+                        self.position_profits[asset].append(pnl_pct)
+                else:
+                    # No position, reset duration and profits
+                    self.position_duration[asset] = 0
+                    self.position_profits[asset] = []
+            
+            # CRITICAL FIX: Calculate total portfolio value before funding
+            total_portfolio_value = self._calculate_portfolio_value()
             
             for asset in self.assets:
                 try:
@@ -489,46 +661,66 @@ class InstitutionalPerpetualEnv(gym.Env):
                         # Track funding for metrics
                         self.funding_accrued[asset] += funding_cost
                         
-                        # Apply funding to balance
-                        if abs(funding_cost) > 0:
-                            if funding_cost > self.balance and funding_cost > 0:
-                                # Force close position if can't afford funding
-                                # logger.warning(f"Forced liquidation of {asset} due to insufficient balance for funding cost: {funding_cost:.2f} > {self.balance:.2f}")
-                                self._close_position(asset)
-                            else:
-                                # Update balance with funding cost
-                                self.balance -= funding_cost
-                                if self.verbose:
-                                    logger.debug(f"Applied funding for {asset}: {funding_cost:.4f} (rate: {funding_rate:.6f})")
+                        # CRITICAL FIX: Only apply funding if there are sufficient funds
+                        # and limit maximum funding impact
+                        if funding_cost > 0:  # Paying funding
+                            # Limit funding cost to at most 5% of position value
+                            max_funding = abs(position['size'] * mark_price * 0.05)
+                            funding_cost = min(funding_cost, max_funding)
+                            
+                            # Check if we can afford funding
+                            if funding_cost > self.balance:
+                                # Reduce funding cost to available balance
+                                funding_cost = max(0, self.balance * 0.9)  # Keep some buffer
+                                
+                                # Reduce position size if running out of funds
+                                new_size = position['size'] * 0.5  # Cut position in half
+                                
+                                # if self.verbose:
+                                #     logger.warning(f"Reducing {asset} position due to funding costs: {position['size']:.4f} -> {new_size:.4f}")
+                                
+                                # Close half the position due to insufficient funds
+                                size_to_close = position['size'] - new_size
+                                close_price = mark_price * (1 - 0.001 * np.sign(position['size']))  # 0.1% slippage
+                                
+                                # Calculate PnL from closing
+                                close_pnl = size_to_close * (close_price - position['entry_price'])
+                                
+                                # Update position
+                                position['size'] = new_size
+                                
+                                # Add realized PnL to balance
+                                self.balance += close_pnl
+                                
+                                # if self.verbose:
+                                #     logger.info(f"Partial close of {asset}: {size_to_close:.4f} @ {close_price:.2f}, PnL: {close_pnl:.2f}")
                         
-                        # Update last price
+                        # CRITICAL FIX: Apply funding to balance (even if reduced)
+                        # We already handled negative case, and we track the total for metrics
+                        self.balance -= funding_cost
+                        self.total_costs += funding_cost
+                        
+                        # Improve logging of funding impacts
+                        if abs(funding_cost) > 0.01:  # Only log meaningful amounts (> 1 cent)
+                            logger.debug(f"Applied funding for {asset}: ${funding_cost:.4f} (rate: {funding_rate*100:.6f}%)")
+                        
+                        # Position last price already updated above
                         position['last_price'] = mark_price
-                        
                 except Exception as e:
                     logger.error(f"Error updating position for {asset}: {str(e)}")
                     continue
             
-            # Calculate portfolio value after updates
-            portfolio_value_after = self._calculate_portfolio_value()
-            
-            # Update peak value for drawdown calculations
-            if portfolio_value_after > self.peak_value:
-                self.peak_value = portfolio_value_after
-            
-            # Calculate current drawdown
-            current_drawdown = 0.0
-            if self.peak_value > 0:
-                current_drawdown = 1.0 - (portfolio_value_after / self.peak_value)
-                
-                # Add to drawdown history
-                if current_drawdown > 0:
-                    self.drawdown_history.append(current_drawdown)
-            
-            # Check for liquidation
-            if portfolio_value_after <= 0 or self.balance <= 0:
-                # logger.warning("Account liquidated due to insufficient funds")
-                self.liquidated = True
-                self._close_all_positions()
+            # CRITICAL FIX: Add to portfolio history after all updates
+            self.portfolio_history.append({
+                'step': self.current_step,
+                'timestamp': get_utc_now() if 'get_utc_now' in globals() else datetime.now(),
+                'balance': self.balance,
+                'value': self._calculate_portfolio_value(),
+                'return': 0.0,  # Will be calculated in _update_history
+                'leverage': 0.0, # Will be calculated in _update_history
+                'drawdown': 0.0, # Will be calculated in _update_history
+                'exposure': sum(abs(p['size'] * self._get_mark_price(a)) for a, p in self.positions.items())
+            })
             
             return total_pnl
             
@@ -543,33 +735,57 @@ class InstitutionalPerpetualEnv(gym.Env):
             total_value = self.balance
             
             # Add value of all positions
+            total_position_value = 0.0
+            total_unrealized_pnl = 0.0
+            
             for asset, position in self.positions.items():
                 try:
                     mark_price = self._get_mark_price(asset)
-                    position_value = position['size'] * mark_price
-                    unrealized_pnl = position['size'] * (mark_price - position['entry_price'])
                     
-                    # Add position value including unrealized PnL
-                    total_value += position_value
+                    # CRITICAL FIX: Calculate position value correctly for perpetual futures
+                    position_size = position['size']
+                    entry_price = position['entry_price']
                     
-                    # Log significant positions
-                    if abs(position['size']) > 1e-8 and self.verbose:
-                        logger.debug(f"Position value for {asset}: size={position['size']:.4f}, "
-                                   f"price={mark_price:.2f}, value={position_value:.2f}, "
-                                   f"unrealized_pnl={unrealized_pnl:.2f}")
+                    # Skip extremely small positions
+                    if abs(position_size) <= 1e-8:
+                        continue
+                        
+                    # For perpetual futures, the total value is:
+                    # Cash balance + Unrealized PnL
+                    # The unrealized PnL is: position_size * (mark_price - entry_price)
+                    unrealized_pnl = position_size * (mark_price - entry_price)
+                    
+                    # The position value is position_size * mark_price (absolute value)
+                    position_value = abs(position_size * mark_price)
+                    
+                    # Add to totals
+                    total_position_value += position_value  # This is for tracking only
+                    total_unrealized_pnl += unrealized_pnl
+                    
+                    # Log details for significant positions
+                    if abs(position_size) > 0.001:
+                        logger.debug(f"Position value for {asset}: size={position_size:.6f} units, "
+                                   f"entry=${entry_price:.2f}, mark=${mark_price:.2f}, "
+                                   f"position_value=${position_value:.2f}, unrealized_pnl=${unrealized_pnl:.2f}")
                         
                 except Exception as e:
                     logger.error(f"Error calculating position value for {asset}: {str(e)}")
+                    traceback.print_exc()
                     continue
             
-            # Log total portfolio value
-            if self.verbose:
-                logger.debug(f"Total portfolio value: {total_value:.2f} (balance: {self.balance:.2f})")
+            # Final portfolio value is cash balance plus unrealized PnL
+            final_value = self.balance + total_unrealized_pnl
             
-            return total_value
+            # Log detailed breakdown
+            logger.debug(f"Portfolio value: ${final_value:.2f} = Cash (${self.balance:.2f}) + Unrealized PnL (${total_unrealized_pnl:.2f})")
+            logger.debug(f"Total position exposure: ${total_position_value:.2f}")
+            
+            return final_value
             
         except Exception as e:
-            logger.error(f"Error calculating portfolio value: {str(e)}")
+            logger.error(f"Error in _calculate_portfolio_value: {str(e)}")
+            traceback.print_exc()
+            # In case of error, return cash balance as fallback
             return self.balance
 
     def _get_funding_rate(self, asset: str) -> float:
@@ -753,127 +969,99 @@ class InstitutionalPerpetualEnv(gym.Env):
             }
         
     def _calculate_risk_adjusted_reward(self, total_pnl: float, risk_metrics: Dict) -> float:
-        """Enhanced reward function incorporating risk metrics"""
+        """Calculate reward based on PnL and risk-adjusted metrics"""
         try:
-            # Calculate portfolio value and return
-            portfolio_value = self._calculate_portfolio_value()
+            # CRITICAL FIX: Improved portfolio return calculation
+            portfolio_value = risk_metrics.get('portfolio_value', self.balance)
+            previous_value = portfolio_value - total_pnl  # Value before this step
             
-            # Safety check for portfolio value
-            if portfolio_value <= 0:
-                # logger.warning("Portfolio value is zero or negative in reward calculation")
-                return -1.0
-                
-            # Calculate portfolio return (capped to prevent extreme values)
-            portfolio_return = (portfolio_value - self.initial_balance) / self.initial_balance
-            portfolio_return = np.clip(portfolio_return, -1.0, 1.0)  # Cap return to reasonable range
+            # Ensure previous value is positive to avoid division issues
+            previous_value = max(previous_value, self.initial_balance * 0.01)
             
-            # Get risk metrics with safety checks
-            volatility = max(risk_metrics.get('volatility', 0.0001), 0.0001)  # Avoid division by zero
-            var = abs(risk_metrics.get('var', 0.0))
-            es = abs(risk_metrics.get('expected_shortfall', 0.0))
-            max_drawdown = max(risk_metrics.get('max_drawdown', 0.0), 0.0001)
-            current_drawdown = risk_metrics.get('current_drawdown', 0.0)
-            leverage = risk_metrics.get('leverage_utilization', 0.0)
-            concentration = risk_metrics.get('max_concentration', 0.0)
+            # Calculate return as percentage of previous portfolio value
+            portfolio_return = total_pnl / previous_value
             
-            # Calculate excess return over risk-free rate (daily)
-            daily_risk_free = self.risk_free_rate / 252  # Convert annual to daily
-            excess_return = portfolio_return - daily_risk_free
-            
-            # Calculate risk-adjusted ratios with strict bounds
-            # Sharpe ratio - limit to reasonable range (-3 to 3 is typical)
-            sharpe = excess_return / volatility if volatility > 0 else 0
-            sharpe = np.clip(sharpe, -3.0, 3.0)
-            
-            # Calculate Sortino ratio (using downside deviation)
-            if not hasattr(self, 'returns_history') or len(self.returns_history) < 2:
-                sortino = 0.0
-            else:
-                # Calculate downside deviation (only negative returns)
-                negative_returns = [r for r in self.returns_history if r < 0]
-                if negative_returns:
-                    downside_deviation = np.std(negative_returns)
-                    downside_deviation = max(downside_deviation, 0.0001)  # Safety check
-                    sortino = excess_return / downside_deviation
+            # CRITICAL FIX: Add sanity checks for unrealistic returns
+            if abs(portfolio_return) > 0.1:  # >10% return in a single step is suspicious
+                if abs(portfolio_return) > 0.5:  # >50% return is extremely unrealistic
+                    # logger.warning(f"Highly unrealistic return detected: {portfolio_return:.2%}, applying severe penalty")
+                    # Apply very severe penalty for extremely unrealistic returns
+                    if portfolio_return > 0:
+                        portfolio_return = 0.05  # Cap positive return at 5%
+                    else:
+                        portfolio_return = -0.05  # Cap negative return at -5%
                 else:
-                    sortino = 0.0  # No negative returns yet
+                    # logger.warning(f"Unrealistic return detected: {portfolio_return:.2%}, applying penalty")
+                    # Apply moderate penalty for unrealistic returns
+                    if portfolio_return > 0:
+                        portfolio_return = 0.1  # Cap positive return at 10%
+                    else:
+                        portfolio_return = -0.1  # Cap negative return at -10%
             
-            # Clip Sortino to reasonable range
-            sortino = np.clip(sortino, -3.0, 3.0)
+            # CRITICAL FIX: Scale returns more reasonably for learning signal
+            base_reward = portfolio_return * 5.0  # Scale returns but less aggressively
             
-            # Calculate Calmar ratio (return / max drawdown)
-            if max_drawdown > 0.0001:
-                calmar = portfolio_return / max_drawdown
-                calmar = np.clip(calmar, -3.0, 3.0)  # Clip to reasonable range
-            else:
-                calmar = 0.0  # No significant drawdown yet
+            # Risk-adjusted components
+            sharpe = risk_metrics.get('sharpe_ratio', 0)
+            sortino = risk_metrics.get('sortino_ratio', 0)
+            calmar = risk_metrics.get('calmar_ratio', 0)
             
-            # Calculate diversification score
-            active_positions = sum(1 for p in self.positions.values() if abs(p['size']) > 0)
-            max_possible_positions = max(len(self.assets), 1)  # Avoid division by zero
-            diversification_score = min(active_positions / max_possible_positions, 1.0)
+            # CRITICAL FIX: Add sanity checks for risk metrics
+            sharpe = np.clip(sharpe, -5, 5)
+            sortino = np.clip(sortino, -5, 5)
+            calmar = np.clip(calmar, -5, 5)
             
-            # Calculate risk penalties
-            # Leverage penalty (higher leverage = higher penalty)
-            leverage_ratio = min(leverage / max(self.max_leverage, 0.0001), 1.0)
-            leverage_penalty = 1.0 - leverage_ratio
+            # Combine risk-adjusted metrics with less weight
+            risk_reward = (sharpe + sortino + calmar) / 3.0 * 0.5  # Reduced weight for risk metrics
             
-            # Drawdown penalty (higher drawdown = higher penalty)
-            drawdown_ratio = min(current_drawdown / max(self.max_drawdown, 0.0001), 1.0)
-            drawdown_penalty = 1.0 - drawdown_ratio
+            # CRITICAL FIX: Penalize excessive risk more aggressively
+            leverage_penalty = 0.0
+            concentration_penalty = 0.0
             
-            # VaR penalty (higher VaR = higher penalty)
-            var_ratio = min(var / max(0.05 * portfolio_value, 0.0001), 1.0)
-            var_penalty = 1.0 - var_ratio
+            # Penalize high leverage relative to limits
+            max_leverage = self.max_leverage
+            current_leverage = risk_metrics.get('leverage_utilization', 0)
+            if current_leverage > max_leverage * 0.5:  # Start penalizing at 50% of max
+                leverage_ratio = current_leverage / max_leverage
+                leverage_penalty = (leverage_ratio - 0.5) * 2.0  # More aggressive penalty
             
-            # Concentration penalty (higher concentration = higher penalty)
-            concentration_ratio = min(concentration / 0.5, 1.0)
-            concentration_penalty = 1.0 - concentration_ratio
+            # Penalize high concentration
+            max_concentration = self.risk_engine.risk_limits.position_concentration if self.risk_engine else 0.4
+            current_concentration = risk_metrics.get('max_concentration', 0)
+            if current_concentration > max_concentration * 0.5:  # Start penalizing at 50% of limit
+                concentration_ratio = current_concentration / max_concentration
+                concentration_penalty = (concentration_ratio - 0.5) * 3.0  # Stronger concentration penalty
             
-            # Trading activity bonus (encourage trading)
-            trading_activity_bonus = min(active_positions / max_possible_positions, 1.0)
+            # CRITICAL FIX: Add drawdown penalty
+            max_drawdown = abs(risk_metrics.get('max_drawdown', 0))
+            drawdown_penalty = min(max_drawdown * 10.0, 2.0)  # Cap at 2.0
             
-            # Combined risk penalty (ensure it's bounded)
-            risk_penalty = np.clip(
-                0.3 * leverage_penalty +
-                0.3 * drawdown_penalty +
-                0.2 * var_penalty +
-                0.2 * concentration_penalty,
-                0.0, 1.0
-            )
+            # CRITICAL FIX: Add trading activity incentive - encourage moderate trading 
+            trade_count = len([t for t in self.trades if t['timestamp'] == self.current_step])
+            trading_incentive = 0.0
+            if 0 < trade_count <= 5:  # Reward moderate trading (1-5 trades per step)
+                trading_incentive = 0.02 * trade_count
+            elif trade_count > 5:  # Penalize excessive trading
+                trading_incentive = 0.06 - (trade_count - 5) * 0.02  # Starts at 0.06 and decreases
             
-            # Final reward calculation with weighted components
-            reward = (
-                0.25 * sharpe +                  # Reward risk-adjusted returns (Sharpe)
-                0.15 * sortino +                 # Reward downside risk-adjusted returns (Sortino)
-                0.15 * calmar +                  # Reward drawdown-adjusted returns (Calmar)
-                0.15 * diversification_score +   # Reward diversification
-                0.20 * risk_penalty +            # Penalize excessive risk
-                0.10 * trading_activity_bonus    # Encourage trading activity
-            )
+            # CRITICAL FIX: Penalize negative balance more severely
+            balance_penalty = 0.0
+            if self.balance < 0:
+                balance_penalty = 3.0
+            elif self.balance < self.initial_balance * 0.5:
+                balance_penalty = 1.0  # Penalty for losing more than 50% of initial capital
+                
+            # Combine all components
+            reward = base_reward + risk_reward + trading_incentive - leverage_penalty - concentration_penalty - drawdown_penalty - balance_penalty
             
-            # Ensure reward is properly bounded
-            reward = np.clip(reward, -1.0, 1.0)
+            # Bound the reward to prevent extreme values
+            reward = np.clip(reward, -10.0, 10.0)
             
-            # Add risk metrics to the risk_metrics dict for evaluation
-            risk_metrics['sharpe_ratio'] = float(sharpe)
-            risk_metrics['sortino_ratio'] = float(sortino)
-            risk_metrics['calmar_ratio'] = float(calmar)
-            
-            # Log reward components
-            if self.verbose:
-                logger.debug(f"Reward components:")
-                logger.debug(f"  Sharpe: {sharpe:.4f}")
-                logger.debug(f"  Sortino: {sortino:.4f}")
-                logger.debug(f"  Calmar: {calmar:.4f}")
-                logger.debug(f"  Diversification: {diversification_score:.4f}")
-                logger.debug(f"  Leverage penalty: {leverage_penalty:.4f}")
-                logger.debug(f"  Drawdown penalty: {drawdown_penalty:.4f}")
-                logger.debug(f"  VaR penalty: {var_penalty:.4f}")
-                logger.debug(f"  Concentration penalty: {concentration_penalty:.4f}")
-                logger.debug(f"  Trading bonus: {trading_activity_bonus:.4f}")
-                logger.debug(f"  Risk penalty: {risk_penalty:.4f}")
-                logger.debug(f"  Final reward: {reward:.4f}")
+            # if self.verbose:
+            #     logger.info(f"Reward components: return={portfolio_return:.4f}, risk={risk_reward:.4f}, "
+            #              f"trade_incentive={trading_incentive:.4f}, leverage_penalty={leverage_penalty:.4f}, "
+            #              f"concentration_penalty={concentration_penalty:.4f}, drawdown_penalty={drawdown_penalty:.4f}, "
+            #              f"balance_penalty={balance_penalty:.4f}, final_reward={reward:.4f}")
             
             return float(reward)
             
@@ -921,28 +1109,49 @@ class InstitutionalPerpetualEnv(gym.Env):
         try:
             # Check if we've reached the end of data
             if self.current_step >= len(self.df) - 1:
-                # logger.info("Episode done: Reached end of data")
+                logger.info("Episode done: Reached end of data")
                 return True
             
             # Calculate current risk metrics
             risk_metrics = self._calculate_risk_metrics()
             
-            # Check account depletion
-            if risk_metrics['portfolio_value'] <= 0:
-                # logger.info("Episode done: Account depleted")
+            # Check account depletion - dynamic threshold based on initial balance and max_drawdown
+            # Allow for negative values but terminate on severe depletion
+            severe_depletion_threshold = -self.initial_balance * self.max_drawdown
+            if risk_metrics['portfolio_value'] <= severe_depletion_threshold:
+                # logger.info(f"Episode done: Account severely depleted (${risk_metrics['portfolio_value']:.2f}, threshold: ${severe_depletion_threshold:.2f})")
                 return True
             
-            # Check risk limits using risk engine
+            # Check max steps per episode (100 steps is good for 100k total timesteps)
+            # This ensures we get approximately 1000 episodes with 100k training steps
+            # if self.current_step - self.start_step >= 100:
+            #     logger.debug("Episode done: Reached max steps per episode (100)")
+            #     return True
+            
+            # Check risk limits using risk engine - but don't terminate on every violation
             try:
                 is_within_limits, violations = self.risk_engine.check_risk_limits(risk_metrics)
                 if not is_within_limits:
-                    # logger.info(f"Episode done: Risk limits violated - {', '.join(violations)}")
+                    # Only terminate on extremely serious violations
+                    serious_violation = False
+                    
+                    for violation in violations:
+                        if "bankruptcy" in violation.lower():
+                            serious_violation = True
+                            break
+                        if "max_drawdown" in violation.lower() and risk_metrics.get('current_drawdown', 0) > 0.95:
+                            serious_violation = True
+                            break
+                    
+                    if serious_violation:
+                        logger.info(f"Episode done: Serious risk limit violations - {', '.join(violations)}")
                     return True
             except Exception as e:
                 logger.error(f"Error checking risk limits: {str(e)}")
                 # Continue if risk check fails
                 pass
             
+            # CRITICAL FIX: Don't terminate episode prematurely - let it run the full length
             return False
             
         except Exception as e:
@@ -984,99 +1193,123 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Calculate current portfolio value with safety check
             portfolio_value = max(self._calculate_portfolio_value(), self.initial_balance * 0.1)
             
-            # IMPORTANT FIX: Lower threshold for trade execution to ensure trades happen
-            # Convert signal [-1, 1] to target leverage [0, max_leverage]
-            # Use a minimum leverage to ensure trades are executed
-            target_leverage = max(abs(signal) * self.max_leverage, 0.2)  # Increased minimum leverage from 0.1 to 0.2
+            # CRITICAL FIX: Add realistic position sizing constraints
+            # Convert signal [-1, 1] to target leverage
+            # Use a reasonable minimum leverage to ensure trades happen
+            target_leverage = max(abs(signal) * self.max_leverage, 0.1)
             
             # Determine direction (-1 or 1) from signal
             direction = np.sign(signal)
             if direction == 0 or abs(direction) < 0.001:  # Handle zero or near-zero signal case
-                direction = 1 if np.random.random() > 0.5 else -1  # Random direction for zero signal
+                return 0.0  # No trade if no clear direction
             
-            # Calculate target position size
+            # CRITICAL FIX: Apply concentration limits
+            if self.risk_engine:
+                max_position_value = portfolio_value * self.risk_engine.risk_limits.position_concentration
+            else:
+                max_position_value = portfolio_value * 0.4  # Default to 40% if no risk engine
+                
+            # Calculate target position value with concentration limit
             target_value = portfolio_value * target_leverage * direction
+            if abs(target_value) > max_position_value:
+                target_value = max_position_value * direction
+                
+            # Convert to target position size
             target_size = target_value / price if price > 0 else 0
+            
+            # CRITICAL FIX: Add asset-specific position limits
+            max_asset_units = {
+                'BTCUSDT': 10,      # Max ~$400k per BTC
+                'ETHUSDT': 100,     # Max ~$200k per ETH 
+                'SOLUSDT': 500,     # Max ~$100k per SOL
+            }.get(asset, 1000)      # Default limit
+            
+            if abs(target_size) > max_asset_units:
+                target_size = max_asset_units * direction
+                
+            # Calculate size difference
             size_diff = target_size - old_position
             
-            # IMPORTANT FIX: Ensure minimum trade size relative to portfolio
-            # Reduced minimum trade size to make it easier to execute trades
-            min_trade_size = portfolio_value * 0.003 / price  # Reduced from 0.005 to 0.003 (0.3% of portfolio)
+            # Skip tiny trades
+            min_trade_size = portfolio_value * 0.001 / price  # 0.1% of portfolio
             if abs(size_diff) < min_trade_size:
-                size_diff = min_trade_size * np.sign(size_diff) if size_diff != 0 else min_trade_size * direction
+                return 0.0  # No meaningful trade
             
-            # Calculate commission
-            commission = abs(size_diff) * price * self.commission
+            # CRITICAL FIX: Ensure trade size is realistic and executable
+            max_trade_size = portfolio_value / price  # Can't trade more than portfolio value
+            if abs(size_diff) > max_trade_size:
+                size_diff = max_trade_size * np.sign(size_diff)
             
-            # IMPORTANT FIX: Always ensure we can execute the trade
-            # If insufficient balance, scale down the trade size instead of canceling
-            if commission > self.balance:
-                if self.verbose:
-                    logger.warning(f"Insufficient balance for commission: {commission:.2f} > {self.balance:.2f}")
-                # Scale down the trade size but ensure it's still meaningful
-                scale_factor = max(0.2, self.balance / (commission * 1.05))  # Increased from 0.1 to 0.2, reduced buffer
+            # Calculate commission with realistic transaction costs
+            base_commission = abs(size_diff) * price * self.commission
+            slippage_cost = abs(size_diff) * price * 0.0002  # 0.02% slippage
+            total_cost = base_commission + slippage_cost
+            
+            # Check if balance can cover costs
+            if total_cost > self.balance:
+                # Scale down trade size if insufficient funds
+                scale_factor = self.balance / (total_cost * 1.1)  # 10% safety margin
                 size_diff *= scale_factor
-                commission = abs(size_diff) * price * self.commission
-                if self.verbose:
-                    logger.info(f"Scaled down trade size by factor {scale_factor:.4f}")
+                total_cost = abs(size_diff) * price * (self.commission + 0.0002)
             
-            # IMPORTANT FIX: Ensure minimum trade size even after scaling
-            # Reduced minimum threshold to allow smaller trades
-            if abs(size_diff) < min_trade_size * 0.05:  # Reduced from 0.1 to 0.05 (5% of minimum size)
-                size_diff = min_trade_size * 0.05 * np.sign(size_diff) if size_diff != 0 else min_trade_size * 0.05 * direction
-                commission = abs(size_diff) * price * self.commission
+            # Update balance and execute trade
+            self.balance -= total_cost
+            self.total_costs += total_cost
             
-            # NEW: Randomly force some trades to succeed (during training only)
-            # This helps with exploration by ensuring some trades go through
-            if np.random.random() < 0.1:  # 10% chance to force trade
-                # Ensure the trade is at least 0.5% of portfolio value
-                forced_size = portfolio_value * 0.005 / price * direction
-                if abs(forced_size) > abs(size_diff):
-                    if self.verbose:
-                        logger.info(f"Forcing larger trade: {forced_size:.6f} instead of {size_diff:.6f}")
-                    size_diff = forced_size
-                    commission = abs(size_diff) * price * self.commission
+            # Calculate PnL from old position if closing or reducing
+            pnl = 0.0
+            if old_position != 0 and ((old_position > 0 and size_diff < 0) or 
+                                      (old_position < 0 and size_diff > 0)):
+                # Closing or reducing position
+                if abs(size_diff) >= abs(old_position):  # Fully closing or flipping
+                    if old_position > 0:  # Long position
+                        pnl = old_position * (price - old_entry_price)
+                    else:  # Short position
+                        pnl = old_position * (old_entry_price - price)
+                    position_size = size_diff + old_position
+                    entry_price = price  # New entry price for remaining/flipped position
+                else:  # Partially reducing
+                    closed_size = min(abs(old_position), abs(size_diff))
+                    if old_position > 0:  # Long position
+                        pnl = closed_size * (price - old_entry_price)
+                    else:  # Short position
+                        pnl = closed_size * (old_entry_price - price)
+                    position_size = old_position + size_diff
+                    entry_price = old_entry_price  # Keep same entry for remaining
+            else:
+                # Increasing existing position or opening new
+                if old_position == 0:
+                    # New position
+                    position_size = size_diff
+                    entry_price = price
+                else:
+                    # Adding to existing position - calculate weighted average entry
+                    position_size = old_position + size_diff
+                    entry_price = (old_position * old_entry_price + size_diff * price) / position_size
             
-            # Calculate PnL for closing part of the position
-            trade_pnl = -commission
-            if old_position != 0 and np.sign(old_position) != np.sign(target_size) and abs(old_position) > 0:
-                # Closing position (full or partial)
-                closing_size = min(abs(old_position), abs(target_size)) * np.sign(old_position)
-                closing_pnl = closing_size * (price - old_entry_price)
-                trade_pnl += closing_pnl
-                if self.verbose:
-                    logger.info(f"Closing position PnL: {closing_pnl:.2f}")
-            
-            # Update balance
-            self.balance += trade_pnl
+            # CRITICAL FIX: Final sanity check on position size
+            if abs(position_size) > max_asset_units:
+                # logger.warning(f"Position size for {asset} exceeds limit after execution: {position_size}. Capping at {max_asset_units * np.sign(position_size)}")
+                position_size = max_asset_units * np.sign(position_size)
             
             # Update position
-            self.positions[asset]['size'] = target_size
-            
-            # Update entry price with weighted average if increasing position
-            if old_position != 0 and np.sign(old_position) == np.sign(target_size) and abs(target_size) > abs(old_position):
-                # Increasing existing position
-                new_size = abs(target_size) - abs(old_position)
-                total_size = abs(target_size)
-                self.positions[asset]['entry_price'] = (old_entry_price * abs(old_position) + price * new_size) / total_size
-            elif np.sign(old_position) != np.sign(target_size) or old_position == 0:
-                # New position or flipped direction
-                self.positions[asset]['entry_price'] = price
-            
-            # IMPORTANT FIX: Always log trades for debugging
-            logger.info(f"Trade executed for {asset}: Old={old_position:.4f}, New={target_size:.4f}, "
-                       f"Price={price:.2f}, PnL={trade_pnl:.2f}")
+            self.positions[asset]['size'] = position_size
+            self.positions[asset]['entry_price'] = entry_price
             
             # Add trade to history
             self.trades.append({
-                'asset': asset,
                 'timestamp': self.current_step,
+                'asset': asset,
                 'size': size_diff,
                 'price': price,
-                'pnl': trade_pnl
+                'cost': total_cost,
+                'realized_pnl': pnl  # CRITICAL FIX: Change 'pnl' to 'realized_pnl' for consistency
             })
             
-            return trade_pnl
+            # if self.verbose:
+                # logger.info(f"Trade executed: {asset} {size_diff:.6f} @ {price:.2f}, Cost: {total_cost:.2f}, PnL: {pnl:.2f}")
+            
+            return pnl
             
         except Exception as e:
             logger.error(f"Error executing trade: {str(e)}")
@@ -1169,8 +1402,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         for i, asset in enumerate(self.assets):
             try:
                 # Get market data for this asset
-                asset_data = self.df.iloc[max(0, self.current_step-30):self.current_step+1]
-                asset_data = asset_data.xs(asset, level=0, axis=1)
+                asset_data = self.df.iloc[max(0, self.current_step-30):self.current_step+1].xs(asset, level=0, axis=1)
                 
                 # Calculate metrics
                 if 'close' in asset_data.columns:
@@ -1244,11 +1476,6 @@ class InstitutionalPerpetualEnv(gym.Env):
                                 scaled_magnitude = action_magnitude * (confidence ** 0.8)
                             
                             scaled_action[i] = sign * scaled_magnitude
-                            
-                            # # Log significant scaling
-                            # if abs(scaled_action[i] - raw_action) > 0.2:
-                            #     logger.info(f"Uncertainty scaling for {asset}: {raw_action:.2f} -> {scaled_action[i]:.2f} " 
-                            #               f"(uncertainty: {uncertainty_score:.2f})")
             
             except Exception as e:
                 logger.error(f"Error in uncertainty scaling for {asset}: {str(e)}")
@@ -1328,14 +1555,14 @@ class InstitutionalPerpetualEnv(gym.Env):
             active_positions = sum(1 for pos in self.positions.values() if abs(pos['size']) > 1e-8)
             
             # Log metrics for debugging only if verbose is enabled or we have active positions
-            if self.verbose or active_positions > 0:
-                logger.info(f"Portfolio metrics - Step {self.current_step}:")
-                logger.info(f"  Value: {current_value:.2f}")
-                logger.info(f"  Total Exposure: {total_exposure:.2f}")
-                logger.info(f"  Leverage: {current_leverage:.4f}")
-                logger.info(f"  Drawdown: {current_drawdown:.4f}")
-                logger.info(f"  Return: {current_return:.4f}")
-                logger.info(f"  Active Positions: {active_positions}")
+            if self.verbose and active_positions > 0:
+                logger.debug(f"Portfolio metrics - Step {self.current_step}:")
+                logger.debug(f"  Value: {current_value:.2f}")
+                logger.debug(f"  Total Exposure: {total_exposure:.2f}")
+                logger.debug(f"  Leverage: {current_leverage:.4f}")
+                logger.debug(f"  Drawdown: {current_drawdown:.4f}")
+                logger.debug(f"  Return: {current_return:.4f}")
+                logger.debug(f"  Active Positions: {active_positions}")
                 
                 # Log position details if we have active positions
                 if active_positions > 0:
@@ -1347,7 +1574,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                                 f"{asset}: size={pos['size']:.4f}, value={pos['size']*mark_price:.2f}, "
                                 f"entry={pos['entry_price']:.2f}, current={mark_price:.2f}"
                             )
-                    logger.info(f"  Position Details: {', '.join(position_details)}")
+                    logger.debug(f"  Position Details: {', '.join(position_details)}")
             
         except Exception as e:
             logger.error(f"Error updating history: {str(e)}")
@@ -1443,7 +1670,14 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Add global portfolio data
             try:
                 # Calculate recent PnL using last 100 trades
-                recent_trades_pnl = sum(trade['pnl'] for trade in self.trades[-100:])
+                # CRITICAL FIX: Handle both 'pnl' and 'realized_pnl' keys for backwards compatibility
+                recent_trades_pnl = 0.0
+                for trade in self.trades[-100:]:
+                    if 'pnl' in trade:
+                        recent_trades_pnl += trade['pnl']
+                    elif 'realized_pnl' in trade:
+                        recent_trades_pnl += trade['realized_pnl']
+                
                 active_positions = sum(1 for p in self.positions.values() if abs(p['size']) > 1e-8)
                 
                 observation.extend([
@@ -1498,7 +1732,7 @@ class InstitutionalPerpetualEnv(gym.Env):
     def set_position_holding_bonus(self, bonus_factor=0.02):
         """Set the multiplier for position holding time bonuses"""
         self.position_holding_bonus_factor = float(bonus_factor)
-        logger.info(f"Position holding bonus factor set to {self.position_holding_bonus_factor}")
+        # logger.info(f"Position holding bonus factor set to {self.position_holding_bonus_factor}")
         return self.position_holding_bonus_factor
     
     def set_uncertainty_scaling(self, scaling_factor=1.0):

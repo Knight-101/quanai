@@ -32,7 +32,7 @@ trading:
 # Risk Management
 risk_management:
   limits:
-    max_drawdown: 0.2  # 20%
+    max_drawdown: 0.3  # 30%
     var_limit: 0.05  # 5% VaR limit
     max_leverage: 20.0  # Maximum leverage
     position_concentration: 0.4  # Maximum position size as fraction of portfolio
@@ -118,7 +118,7 @@ data:
   exchanges:
     - "binance"
   cache_dir: "data"
-  history_days: 1825
+  history_days: 100
   min_history_points: 1000
 
 # Monitoring
@@ -153,8 +153,8 @@ logging:
   level: "WARNING"
   log_dir: "logs"
   wandb:
-    project: "quan-perp"
-    entity: "quan-ai"
+    project: "quan-perp-ai"
+    entity: "quan-perp-ai"
     tags: ["production", "perpetual"]
     mode: "online"
   wandb_mode: "online"

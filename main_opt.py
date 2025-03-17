@@ -485,6 +485,8 @@ class TradingSystem:
         env = InstitutionalPerpetualEnv(
             df=df,
             assets=assets,
+            initial_balance=self.config['trading']['initial_balance'],
+            max_drawdown=self.config['risk_management']['limits']['max_drawdown'],
             window_size=self.config['model']['window_size'],
             max_leverage=self.config['trading']['max_leverage'],
             commission=self.config['trading']['transaction_fee'],
@@ -504,33 +506,86 @@ class TradingSystem:
         
     def _setup_model(self, args=None) -> PPO:
         """Consolidated model setup"""
-        policy_kwargs = self.policy_kwargs
+        # Define optimized policy kwargs with the provided values
+        policy_kwargs = {
+            "net_arch": dict(
+                pi=[128, 64],  # Optimized policy network architecture
+                vf=[256, 64]   # Optimized value network architecture
+            ),
+            "activation_fn": nn.ReLU,
+            "ortho_init": True,
+            "log_std_init": -0.5,
+            "optimizer_class": torch.optim.Adam,
+            "optimizer_kwargs": dict(
+                eps=1e-5,
+                weight_decay=1e-5
+            ),
+            "features_extractor_class": ResNetFeatureExtractor,  # Use ResNetFeatureExtractor
+            "features_extractor_kwargs": {
+                "features_dim": 256,           # Optimized features dimension
+                "dropout_rate": 0.088,         # Optimized dropout rate
+                "use_layer_norm": True
+            }
+        }
         
         device = 'cuda' if (args and args.gpus > 0) else 'cpu'
         
-        return PPO(
+        # Create a learning rate schedule function that decays from 0.0005 to 0.000025
+        def linear_schedule(initial_value: float, final_value: float):
+            """
+            Linear learning rate schedule.
+            
+            :param initial_value: Initial learning rate.
+            :param final_value: Final learning rate.
+            :return: schedule that computes current learning rate depending on remaining progress
+            """
+            def func(progress_remaining: float) -> float:
+                """
+                Progress will decrease from 1 (beginning) to 0 (end)
+                :param progress_remaining:
+                :return: current learning rate
+                """
+                return final_value + progress_remaining * (initial_value - final_value)
+            return func
+        
+        # Set up dynamic learning rate schedule starting from 0.0005
+        learning_rate = linear_schedule(0.0005, 0.000025)
+        
+        # Create and return the PPO model with all optimized parameters
+        model = PPO(
             "MlpPolicy",
             self.env,
-            learning_rate=1e-4,
+            learning_rate=learning_rate,  # Dynamic learning rate schedule
             n_steps=2048,
-            batch_size=64,
-            n_epochs=5,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.1,
+            batch_size=256,  # Increased batch size for better stability
+            n_epochs=10,     # More epochs for better convergence
+            gamma=0.9536529734618079, 
+            gae_lambda=0.9346152432802582,
+            clip_range=0.25,  # Slightly higher clip range
             clip_range_vf=None,
             normalize_advantage=True,
-            ent_coef=0.005,
-            vf_coef=0.5,
-            max_grad_norm=0.5,
+            ent_coef=0.0471577615690282,   # Increased for better exploration
+            vf_coef=0.7,
+            max_grad_norm=0.65,
             use_sde=True,
-            sde_sample_freq=4,
-            target_kl=0.03,
+            sde_sample_freq=16,
+            target_kl=0.07,
             tensorboard_log=self.config['logging'].get('tensorboard_dir', 'logs/tensorboard'),
             policy_kwargs=policy_kwargs,
             verbose=1,
             device=device
         )
+        
+        # Configure environment with regime-aware parameters
+        if hasattr(self.env, "env_method"):
+            # Enable regime awareness
+            self.env.env_method("set_regime_aware", True)
+            # Set position holding bonus
+            self.env.env_method("set_position_holding_bonus", 0.04689468349771604)
+            # Set uncertainty scaling
+            self.env.env_method("set_uncertainty_scaling", 1.2472096863889177)
+        
+        return model
         
     def create_study(self):
         """Create Optuna study for hyperparameter optimization"""
@@ -671,10 +726,10 @@ class TradingSystem:
             # Create model with sampled hyperparameters
             try:
                 # Define network architecture
-                net_arch = {
-                    "pi": [pi_1, pi_2],
-                    "vf": [vf_1, vf_2]
-                }
+                net_arch = [dict(
+                    pi=[pi_1, pi_2],
+                    vf=[vf_1, vf_2]
+                )]
                 
                 # Create custom policy kwargs
                 policy_kwargs = {
@@ -961,7 +1016,11 @@ class TradingSystem:
             
             logger.info(f"Starting evaluation episode {episode+1} with initial portfolio value: {portfolio_value}")
             
-            while not done:
+            # CRITICAL FIX: Run each episode for multiple steps
+            # The episode should only terminate when done=True from the environment
+            max_episode_steps = 100  # Allow up to 100 steps per episode for evaluation
+            
+            while not done and step_count < max_episode_steps:
                 # Get action from model
                 action, _ = model.predict(obs, deterministic=False)  # Use stochastic actions for evaluation
                 
@@ -1016,16 +1075,17 @@ class TradingSystem:
                         # logger.info(f"Trade executed at step {step_count} (via trades_executed flag)")
                     
                     # Check positions directly
-                    if 'positions' in info:
-                        positions = info['positions']
-                        active_positions = []
-                        for asset, pos in positions.items():
-                            if isinstance(pos, dict) and abs(pos.get('size', 0)) > 1e-8:
-                                active_positions.append(f"{asset}: {pos.get('size', 0):.4f}")
-                        
+                    if 'active_positions' in info:
+                        active_positions = info['active_positions']
                         if active_positions:
-                            logger.info(f"Active positions: {', '.join(active_positions)}")
-                            trade_detected = True
+                            position_str = []
+                            for asset, size in active_positions.items():
+                                if isinstance(size, (int, float)) and abs(size) > 1e-8:
+                                    position_str.append(f"{asset}: {size:.4f}")
+                            
+                            if position_str:
+                                logger.info(f"Active positions: {', '.join(position_str)}")
+                                trade_detected = True
                     
                     # Check recent trades count
                     if info.get('recent_trades_count', 0) > 0:
@@ -1038,14 +1098,14 @@ class TradingSystem:
                         trade_detected = True
                     
                     # Check total_trades_count
-                    if info.get('total_trades_count', 0) > 0:
-                        logger.info(f"Total trades count: {info.get('total_trades_count')}")
+                    if info.get('total_trades', 0) > 0:
+                        logger.info(f"Total trades count: {info.get('total_trades')}")
                         trade_detected = True
                 
                 if trade_detected:
                     episode_trades += 1
                     trades_executed += 1
-                    # logger.info(f"Trade detected at step {step_count} in episode {episode+1}")
+                    logger.info(f"Trade detected at step {step_count} in episode {episode+1}")
                 
                 # CRITICAL FIX: Properly extract and store risk metrics
                 if isinstance(info, dict):
@@ -1092,17 +1152,17 @@ class TradingSystem:
                         if 'max_drawdown' in hist_metrics and hist_metrics['max_drawdown'] > 0:
                             drawdowns.append(hist_metrics['max_drawdown'])
                     
-                    # Debug logging for first few steps
-                    if len(episode_rewards) <= 5:
-                        logger.debug(f"Step {len(episode_rewards)} info: {info}")
-            
+                    # Update terminal information
+                    if done:
+                        logger.info(f"Episode {episode+1} terminated at step {step_count}")
+                
             portfolio_values.append(portfolio_value)
             rewards.extend(episode_rewards)
             
             # IMPORTANT FIX: Track trades for this episode
             all_trades.append(episode_trades)
             
-            logger.info(f"Episode {episode+1} completed: Steps={step_count}, Final Portfolio={portfolio_value:.2f}, "
+            logger.info(f"Episode {episode+1} completed: Steps={step_count}, Final Portfolio=${portfolio_value:.2f}, "
                        f"Trades Executed={episode_trades}")
         
         # IMPORTANT FIX: Better logging of trade execution
@@ -1315,11 +1375,11 @@ class TradingSystem:
             raise
 
     def train(self):
-        """Optimized training method without curriculum learning"""
+        """Optimized training method for 1M timesteps"""
         if not self.model or not self.env:
             raise RuntimeError("System not initialized. Call initialize() first.")
         
-        logger.info("Starting model training...")
+        logger.info("Starting model training for 1,000,000 timesteps...")
         
         # Setup callbacks for checkpointing and evaluation
         callbacks = []
@@ -1332,11 +1392,11 @@ class TradingSystem:
         )
         callbacks.append(checkpoint_callback)
         
-        # Evaluation callback - evaluate every 50k steps
+        # Evaluation callback - evaluate every 100k steps
         eval_callback = EvalCallback(
             eval_env=self.env,
             n_eval_episodes=5,
-            eval_freq=50000,
+            eval_freq=100000,  # Increased from 50k to 100k
             log_path=self.config['logging']['log_dir'],
             deterministic=True,
             render=False
@@ -1344,7 +1404,7 @@ class TradingSystem:
         callbacks.append(eval_callback)
         
         # Train the model with optimized parameters
-        total_timesteps = self.config['training'].get('total_timesteps', 2_000_000)
+        total_timesteps = 2_000_000  # Set to 1M timesteps
         
         try:
             self.model.learn(
@@ -1573,7 +1633,8 @@ async def main():
         await trading_system.initialize(args)
         
         # Run hyperparameter optimization
-        trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, total_timesteps=100000)
+        # Comment out optimization for direct training with 1M timestep parameters
+        # trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, total_timesteps=1000)
         
         # Train the model with best parameters
         trading_system.train()
