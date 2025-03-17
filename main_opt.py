@@ -1386,7 +1386,7 @@ class TradingSystem:
         
         # Checkpoint callback - save every 100k steps
         checkpoint_callback = CheckpointCallback(
-            save_freq=100000,
+            save_freq=10000,
             save_path=self.config['model']['checkpoint_dir'],
             name_prefix="ppo_trading"
         )
@@ -1396,7 +1396,7 @@ class TradingSystem:
         eval_callback = EvalCallback(
             eval_env=self.env,
             n_eval_episodes=5,
-            eval_freq=100000,  # Increased from 50k to 100k
+            eval_freq=10000, 
             log_path=self.config['logging']['log_dir'],
             deterministic=True,
             render=False

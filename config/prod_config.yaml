@@ -243,7 +243,7 @@ training:
         sharpe: 2.0
         win_rate: 0.58
   checkpointing:
-    frequency: 100000  # Save every 100k steps
+    frequency: 10000  # Save every 10k steps
     keep_best: 5
   evaluation:
     freq: 10000
