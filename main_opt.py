@@ -244,8 +244,8 @@ def parse_args():
                         help='Maximum allowed leverage')
     parser.add_argument('--training-steps', type=int, default=2_000_000,
                         help='Total training timesteps')
-    parser.add_argument('--gpus', type=int, default=0,
-                        help='Number of GPUs to use (0 for CPU)')
+    parser.add_argument('--gpus', type=int, default=1,
+                        help='Number of GPUs to use (0 for CPU only, 1+ to enable GPU acceleration)')
     parser.add_argument('--log-dir', type=str, default='logs',
                         help='Directory for TensorBoard logs')
     parser.add_argument('--model-dir', type=str, default='models',
@@ -528,7 +528,17 @@ class TradingSystem:
             }
         }
         
-        device = 'cuda' if (args and args.gpus > 0) else 'cpu'
+        # FIX: Better GPU detection and explicit device setting
+        cuda_available = torch.cuda.is_available()
+        if cuda_available and (args is None or getattr(args, 'gpus', 0) > 0):
+            device = 'cuda'
+            logger.info(f"CUDA is available. Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            device = 'cpu'
+            if cuda_available:
+                logger.warning("CUDA is available but not being used. Set --gpus > 0 to enable GPU.")
+            else:
+                logger.warning("CUDA is not available. Using CPU.")
         
         # Create a learning rate schedule function that decays from 0.0005 to 0.000025
         def linear_schedule(initial_value: float, final_value: float):
@@ -575,6 +585,9 @@ class TradingSystem:
             verbose=1,
             device=device
         )
+        
+        # Log device information after model creation
+        logger.info(f"Model created with device: {model.device}")
         
         # Configure environment with regime-aware parameters
         if hasattr(self.env, "env_method"):
@@ -1592,6 +1605,9 @@ class TradingSystem:
             final_data = final_data.replace([np.inf, -np.inf], np.nan)
             final_data = final_data.ffill().bfill()
             
+            # Log all feature columns for verification
+            logger.info(f"Final feature columns: {final_data.columns.get_level_values('feature').unique().tolist()}")
+            
             return final_data
             
         except Exception as e:
@@ -1612,6 +1628,18 @@ async def main():
         # Parse arguments and load config
         args = parse_args()
         config = load_config('config/prod_config.yaml')
+        
+        # Log GPU status at the start
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            if args.gpus > 0:
+                logger.info(f"CUDA is available with {gpu_count} GPU(s). Using GPU for training.")
+                for i in range(min(gpu_count, args.gpus)):
+                    logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+            else:
+                logger.warning(f"CUDA is available with {gpu_count} GPU(s), but training on CPU (--gpus=0).")
+        else:
+            logger.warning("CUDA is not available. Training will use CPU only.")
         
         # Set verbosity level based on command-line argument
         if args.verbose:
