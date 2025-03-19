@@ -549,7 +549,7 @@ class TradingSystem:
             return func
         
         # Set up dynamic learning rate schedule starting from 0.0005
-        learning_rate = linear_schedule(0.0005, 0.000025)
+        learning_rate = linear_schedule(0.0001, 0.000015)
         
         # Create and return the PPO model with all optimized parameters
         model = PPO(

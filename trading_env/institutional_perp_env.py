@@ -1124,9 +1124,9 @@ class InstitutionalPerpetualEnv(gym.Env):
             
             # Check max steps per episode (100 steps is good for 100k total timesteps)
             # This ensures we get approximately 1000 episodes with 100k training steps
-            # if self.current_step - self.start_step >= 100:
-            #     logger.debug("Episode done: Reached max steps per episode (100)")
-            #     return True
+            if self.current_step - self.start_step >= 10:
+                # logger.debug("Episode done: Reached max steps per episode (100)")
+                return True
             
             # Check risk limits using risk engine - but don't terminate on every violation
             try:
@@ -1145,7 +1145,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                     
                     if serious_violation:
                         logger.info(f"Episode done: Serious risk limit violations - {', '.join(violations)}")
-                    return True
+                        return True
             except Exception as e:
                 logger.error(f"Error checking risk limits: {str(e)}")
                 # Continue if risk check fails
