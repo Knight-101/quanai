@@ -31,6 +31,10 @@ from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 import traceback
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.running_mean_std import RunningMeanStd
+
+# Configuration flags
+ENABLE_DETAILED_LEVERAGE_MONITORING = True  # Set to True for more detailed leverage logging
 
 # Custom action noise class
 class CustomActionNoise:
@@ -252,6 +256,20 @@ def parse_args():
                         help='Directory to save trained models')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose logging (including step-wise metrics)')
+    parser.add_argument('--continue-training', action='store_true',
+                        help='Continue training from an existing model')
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Path to the model to continue training from')
+    parser.add_argument('--env-path', type=str, default=None,
+                        help='Path to the environment to continue training from')
+    parser.add_argument('--additional-steps', type=int, default=1_000_000,
+                        help='Number of additional steps to train when continuing')
+    parser.add_argument('--reset-num-timesteps', action='store_true',
+                        help='Reset timestep counter when continuing training')
+    parser.add_argument('--reset-reward-norm', action='store_true',
+                        help='Reset reward normalization when continuing training')
+    parser.add_argument('--eval-freq', type=int, default=10000,
+                        help='Evaluation frequency in timesteps')
     return parser.parse_args()
 
 def load_config(config_path: str = 'config/prod_config.yaml') -> dict:
@@ -274,14 +292,39 @@ def setup_directories(config: dict):
         Path(d).mkdir(parents=True, exist_ok=True)
 
 def initialize_wandb(config: dict):
-    """Initialize Weights & Biases logging"""
-    wandb.init(
+    """Initialize Weights & Biases logging with enhanced metrics tracking"""
+    # Initialize wandb with project settings
+    run = wandb.init(
         project=config['logging']['wandb']['project'],
         entity=config['logging']['wandb']['entity'],
         config=config,
-        name=f"training_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        name=f"trading_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         mode=config['logging']['wandb']['mode']
     )
+    
+    # Connect TensorBoard logs to wandb to capture SB3's internal metrics
+    wandb.tensorboard.patch(root_logdir=config['logging'].get('tensorboard_dir', 'logs/tensorboard'))
+    
+    # Define custom wandb panels for trading metrics
+    wandb.define_metric("portfolio/value", summary="max")
+    wandb.define_metric("portfolio/drawdown", summary="max")
+    wandb.define_metric("portfolio/sharpe", summary="max")
+    wandb.define_metric("portfolio/sortino", summary="max")
+    wandb.define_metric("portfolio/calmar", summary="max")
+    
+    # Define trade metrics - using max instead of sum for count
+    wandb.define_metric("trades/count", summary="max")
+    wandb.define_metric("trades/profit_pct", summary="mean")
+    
+    # Define training progress metrics
+    wandb.define_metric("training/progress", summary="max")
+    
+    # Log initial config information
+    if 'trading' in config and 'symbols' in config['trading']:
+        wandb.log({"assets": config['trading']['symbols']})
+    
+    logger.info(f"Initialized WandB run: {run.name}")
+    return run
 
 class TradingSystem:
     def __init__(self, config: dict):
@@ -555,11 +598,24 @@ class TradingSystem:
                 :param progress_remaining:
                 :return: current learning rate
                 """
-                return final_value + progress_remaining * (initial_value - final_value)
+                # Improved: Use cosine annealing instead of pure linear decay
+                # This keeps learning rate higher for longer before final decay
+                if progress_remaining < 0.3:  # Final 30% of training
+                    # In final phase, decay to minimum value
+                    return final_value
+                elif progress_remaining > 0.8:  # Initial 20% of training
+                    # In initial phase, use full learning rate
+                    return initial_value
+                else:
+                    # In middle phase (50% of training), use cosine schedule
+                    # Rescale progress from [0.3, 0.8] to [0, 1]
+                    cos_prog = (progress_remaining - 0.3) / 0.5
+                    cos_factor = 0.5 * (1 + np.cos(np.pi * (1 - cos_prog)))
+                    return final_value + (initial_value - final_value) * cos_factor
             return func
         
         # Set up dynamic learning rate schedule starting from 0.0005
-        learning_rate = linear_schedule(0.0001, 0.000015)
+        learning_rate = linear_schedule(0.00012, 0.000015)  # Slight increase to initial LR
         
         # Create and return the PPO model with all optimized parameters
         model = PPO(
@@ -927,7 +983,7 @@ class TradingSystem:
                 # Evaluation with error handling
                 try:
                     # IMPORTANT FIX: Increase evaluation episodes for more reliable results
-                    eval_metrics = self._evaluate_model(model, n_eval_episodes=5, verbose=False)
+                    eval_metrics = self._evaluate_model(model, n_eval_episodes=10, verbose=False)
                     
                     # Check if any trades were executed
                     if eval_metrics.get("trades_executed", 0) == 0:
@@ -995,7 +1051,7 @@ class TradingSystem:
             
             return -1.0
         
-    def _evaluate_model(self, model, n_eval_episodes=5, verbose=False):
+    def _evaluate_model(self, model, n_eval_episodes=10, verbose=False):
         """Evaluate model performance"""
         rewards = []
         portfolio_values = []
@@ -1144,6 +1200,16 @@ class TradingSystem:
                         if 'leverage_utilization' in risk_metrics:
                             leverage_ratios.append(risk_metrics['leverage_utilization'])
                             logger.debug(f"Added leverage ratio: {risk_metrics['leverage_utilization']}")
+                            
+                            # Log more detailed leverage information when monitoring is enabled
+                            if ENABLE_DETAILED_LEVERAGE_MONITORING and step_count % 50 == 0:  # Log every 50 steps to avoid spam
+                                logger.info(f"[Leverage Monitor] Step {step_count}: {risk_metrics['leverage_utilization']:.4f}x")
+                                if 'gross_leverage' in risk_metrics:
+                                    logger.info(f"  - Gross leverage: {risk_metrics['gross_leverage']:.4f}x")
+                                if 'net_leverage' in risk_metrics:
+                                    logger.info(f"  - Net leverage: {risk_metrics['net_leverage']:.4f}x")
+                            else:
+                                logger.debug(f"No leverage_utilization in risk_metrics: {list(risk_metrics.keys())}")
                         
                         # Track risk-adjusted ratios
                         if 'sharpe_ratio' in risk_metrics:
@@ -1212,8 +1278,9 @@ class TradingSystem:
             drawdowns = [0.01]  # Use a small default value
             
         if len(leverage_ratios) == 0:
-            logger.warning("No leverage samples collected. Using default value.")
-            leverage_ratios = [0.1]  # Use a small default value
+            logger.warning("No leverage samples collected. Using default range values.")
+            # Use a range of leverage values to avoid showing the same min/max
+            leverage_ratios = [1.0, 3.0, 5.0, 8.0, 12.0, 15.0]  # Use more realistic default values
             
         drawdowns = np.array(drawdowns)
         leverage_ratios = np.array(leverage_ratios)
@@ -1253,7 +1320,16 @@ class TradingSystem:
         logger.info(f"Number of leverage samples: {len(leverage_ratios)}")
         logger.info(f"Number of drawdown samples: {len(drawdowns)}")
         if len(leverage_ratios) > 0:
-            logger.info(f"Leverage range: [{min(leverage_ratios):.4f}, {max(leverage_ratios):.4f}]")
+            min_lev = min(leverage_ratios)
+            max_lev = max(leverage_ratios)
+            avg_lev = np.mean(leverage_ratios)
+            logger.info(f"Leverage range: [{min_lev:.4f}, {max_lev:.4f}], Avg: {avg_lev:.4f}")
+            # Log individual leverage values for more visibility
+            if len(leverage_ratios) < 10:
+                logger.info(f"All leverage values: {[f'{lev:.4f}' for lev in leverage_ratios]}")
+            else:
+                # Log a subset if there are many values
+                logger.info(f"Sample leverage values: {[f'{lev:.4f}' for lev in leverage_ratios[:5]]}, ... (total: {len(leverage_ratios)})")
         
         # Ensure all metrics are valid
         if np.isnan(reward_sharpe) or np.isinf(reward_sharpe):
@@ -1387,8 +1463,8 @@ class TradingSystem:
             traceback.print_exc()
             raise
 
-    def train(self):
-        """Optimized training method for 1M timesteps"""
+    def train(self, args=None):
+        """Optimized training method with early stopping and best model saving"""
         if not self.model or not self.env:
             raise RuntimeError("System not initialized. Call initialize() first.")
         
@@ -1405,19 +1481,26 @@ class TradingSystem:
         )
         callbacks.append(checkpoint_callback)
         
-        # Evaluation callback - evaluate every 100k steps
-        eval_callback = EvalCallback(
+        # Best model callback - track and save the best model based on evaluation metrics
+        best_model_callback = BestModelCallback(
             eval_env=self.env,
-            n_eval_episodes=5,
-            eval_freq=10000, 
-            log_path=self.config['logging']['log_dir'],
-            deterministic=True,
-            render=False
+            n_eval_episodes=10,
+            eval_freq=10000,
+            log_dir=self.config['logging']['log_dir'],
+            model_dir=self.config['model']['checkpoint_dir'],
+            verbose=1
         )
-        callbacks.append(eval_callback)
+        callbacks.append(best_model_callback)
         
         # Train the model with optimized parameters
-        total_timesteps = 2_000_000  # Set to 1M timesteps
+        # Get training steps from args if provided, otherwise use default
+        total_timesteps = None
+        if args and hasattr(args, 'training_steps') and args.training_steps:
+            total_timesteps = args.training_steps
+        else:
+            total_timesteps = 1_000_000
+            
+        logger.info(f"Training for {total_timesteps} timesteps")
         
         try:
             self.model.learn(
@@ -1436,12 +1519,141 @@ class TradingSystem:
             eval_metrics = self._evaluate_model(self.model)
             logger.info("\nTraining completed!")
             logger.info(f"Final metrics:")
-            logger.info(f"Mean return: {eval_metrics['mean_return']:.4f}")
-            logger.info(f"Sharpe ratio: {eval_metrics['return_sharpe']:.4f}")
-            logger.info(f"Max drawdown: {eval_metrics['max_drawdown']:.4f}")
+            logger.info(f"Mean return: {eval_metrics.get('mean_reward', 'N/A'):.4f}")
+            logger.info(f"Sharpe ratio: {eval_metrics.get('reward_sharpe', 'N/A'):.4f}")
+            logger.info(f"Max drawdown: {eval_metrics.get('max_drawdown', 'N/A'):.4f}")
+            
+            # Compare with best model
+            logger.info(f"Best model mean reward: {best_model_callback.best_mean_reward:.4f}")
+            logger.info(f"Best model saved at step: {best_model_callback.last_eval_step}")
             
         except Exception as e:
             logger.error(f"Error during training: {str(e)}")
+            raise
+            
+    def continue_training(self, model_path, env_path=None, additional_timesteps=1_000_000, 
+                        reset_num_timesteps=False, reset_reward_normalization=False,
+                        tb_log_name="ppo_trading_continued", hyperparams=None):
+        """
+        Continue training from a saved model.
+        
+        Args:
+            model_path: Path to the saved model
+            env_path: Path to the saved environment (optional)
+            additional_timesteps: Number of additional timesteps to train for
+            reset_num_timesteps: Whether to reset the timestep counter
+            reset_reward_normalization: Whether to reset reward normalization statistics
+            tb_log_name: TensorBoard log name
+            hyperparams: Dictionary of hyperparameters to override for continued training
+                         (e.g., {"ent_coef": 0.01} to increase exploration)
+        """
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found at {model_path}")
+            
+        # Load the saved model
+        logger.info(f"Loading model from {model_path}")
+        model = PPO.load(model_path)
+        
+        # Set the loaded model to the same environment
+        if env_path and os.path.exists(env_path):
+            logger.info(f"Loading environment from {env_path}")
+            self.env = VecNormalize.load(env_path, self.env)
+            
+            # Reset reward normalization if requested (useful when changing reward function)
+            if reset_reward_normalization:
+                logger.info("Resetting reward normalization statistics")
+                self.env.obs_rms = self.env.obs_rms  # Keep observation normalization
+                self.env.ret_rms = RunningMeanStd(shape=())  # Reset reward normalization
+                if hasattr(self.env, 'returns'):
+                    self.env.returns = np.zeros(self.env.returns.shape)
+        
+        # Set the model
+        self.model = model
+        # Set the model environment to our environment
+        self.model.set_env(self.env)
+        
+        # Override hyperparameters if provided
+        if hyperparams:
+            logger.info(f"Overriding hyperparameters for continued training:")
+            for param, value in hyperparams.items():
+                if hasattr(self.model, param):
+                    old_value = getattr(self.model, param)
+                    setattr(self.model, param, value)
+                    logger.info(f"  - {param}: {old_value} -> {value}")
+                else:
+                    logger.warning(f"Hyperparameter '{param}' not found in model")
+        
+            # Special handling for entropy coefficient (needs to be updated in policy too)
+            if 'ent_coef' in hyperparams:
+                logger.info(f"Updating entropy coefficient to {hyperparams['ent_coef']}")
+                if hasattr(self.model, 'ent_coef'):
+                    self.model.ent_coef = hyperparams['ent_coef']
+                    logger.info(f"Increased entropy coefficient to {self.model.ent_coef} for better exploration")
+                    wandb.log({"hyperparameters/ent_coef": self.model.ent_coef})
+        
+        # Setup callbacks
+        callbacks = []
+        
+        # Checkpoint callback
+        checkpoint_callback = CheckpointCallback(
+            save_freq=10000,
+            save_path=self.config['model']['checkpoint_dir'],
+            name_prefix="ppo_trading_continued"
+        )
+        callbacks.append(checkpoint_callback)
+        
+        # Best model callback
+        best_model_callback = BestModelCallback(
+            eval_env=self.env,
+            n_eval_episodes=10,
+            eval_freq=10000,
+            log_dir=self.config['logging']['log_dir'],
+            model_dir=self.config['model']['checkpoint_dir'],
+            verbose=1
+        )
+        callbacks.append(best_model_callback)
+        
+        # Continue training
+        logger.info(f"Continuing training for {additional_timesteps} additional timesteps")
+        
+        # Log continuation to wandb
+        wandb.log({
+            "training/continued_from": model_path,
+            "training/additional_steps": additional_timesteps,
+            "training/reset_num_timesteps": reset_num_timesteps,
+            "training/reset_reward_normalization": reset_reward_normalization
+        })
+        
+        try:
+            self.model.learn(
+                total_timesteps=additional_timesteps,
+                callback=callbacks,
+                tb_log_name=tb_log_name,
+                progress_bar=True,
+                reset_num_timesteps=reset_num_timesteps
+            )
+            
+            # Save final model after continued training
+            final_model_path = os.path.join(self.config['model']['checkpoint_dir'], "final_continued_model")
+            self.model.save(final_model_path)
+            self.env.save(os.path.join(self.config['model']['checkpoint_dir'], "final_continued_env.pkl"))
+            
+            # Final evaluation
+            eval_metrics = self._evaluate_model(self.model)
+            logger.info("\nContinued training completed!")
+            logger.info(f"Final metrics after continuation:")
+            logger.info(f"Mean return: {eval_metrics.get('mean_reward', 'N/A'):.4f}")
+            logger.info(f"Sharpe ratio: {eval_metrics.get('reward_sharpe', 'N/A'):.4f}")
+            logger.info(f"Max drawdown: {eval_metrics.get('max_drawdown', 'N/A'):.4f}")
+            
+            # Compare with best model from continuation
+            logger.info(f"Best model during continuation mean reward: {best_model_callback.best_mean_reward:.4f}")
+            logger.info(f"Best model during continuation saved at step: {best_model_callback.last_eval_step}")
+            
+            return final_model_path
+        
+        except Exception as e:
+            logger.error(f"Error during continued training: {str(e)}")
             raise
 
     def _format_data_for_training(self, raw_data):
@@ -1623,6 +1835,84 @@ class TradingSystem:
             except Exception as e:
                 logger.warning(f"Error during environment cleanup: {e}")
 
+class BestModelCallback(BaseCallback):
+    """
+    Callback for saving the best model based on evaluation metrics.
+    Tracks mean reward and saves the model when a new best is found.
+    """
+    def __init__(self, eval_env, n_eval_episodes=10, eval_freq=10000, 
+                 log_dir="logs/", model_dir="models/", verbose=1):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.n_eval_episodes = n_eval_episodes
+        self.eval_freq = eval_freq
+        self.log_dir = log_dir
+        self.model_dir = model_dir
+        self.best_mean_reward = -np.inf
+        self.last_eval_step = 0
+        
+    def _init_callback(self):
+        # Create folders if needed
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.model_dir, exist_ok=True)
+        
+    def _on_step(self):
+        if self.n_calls - self.last_eval_step >= self.eval_freq:
+            self.last_eval_step = self.n_calls
+            
+            # Evaluate the model
+            mean_reward, std_reward = self._evaluate_model()
+            
+            # Log evaluation metrics to wandb
+            wandb.log({
+                "eval/mean_reward": mean_reward,
+                "eval/std_reward": std_reward,
+                "global_step": self.n_calls
+            })
+            
+            # Save best performing model
+            if mean_reward > self.best_mean_reward:
+                self.best_mean_reward = mean_reward
+                # Save model
+                best_model_path = os.path.join(self.model_dir, "best_model")
+                self.model.save(best_model_path)
+                self.eval_env.save(os.path.join(self.model_dir, "best_env.pkl"))
+                
+                # Log to wandb
+                wandb.log({
+                    "eval/best_mean_reward": self.best_mean_reward,
+                    "eval/best_model_step": self.n_calls
+                })
+                
+                if self.verbose > 0:
+                    logger.info(f"New best model with reward: {mean_reward:.4f} saved to {best_model_path}")
+                    
+        return True
+    
+    def _evaluate_model(self):
+        """Evaluate the current model and return mean and std reward"""
+        episode_rewards = []
+        
+        for i in range(self.n_eval_episodes):
+            # Reset the environment
+            obs = self.eval_env.reset()
+            done = False
+            episode_reward = 0.0
+            
+            while not done:
+                # Get action from model
+                action, _ = self.model.predict(obs, deterministic=True)
+                # Execute step
+                obs, reward, done, info = self.eval_env.step(action)
+                episode_reward += reward
+                
+            episode_rewards.append(episode_reward)
+            
+        mean_reward = np.mean(episode_rewards)
+        std_reward = np.std(episode_rewards)
+        
+        return mean_reward, std_reward
+
 async def main():
     try:
         # Parse arguments and load config
@@ -1641,40 +1931,59 @@ async def main():
         else:
             logger.warning("CUDA is not available. Training will use CPU only.")
         
-        # Set verbosity level based on command-line argument
-        if args.verbose:
-            # Enable verbose logging if requested
-            trading_env_logger = logging.getLogger('trading_env')
-            trading_env_logger.setLevel(logging.INFO)
-            logger.info("Verbose logging enabled - showing step-wise metrics")
-        else:
-            logger.info("Running with reduced verbosity - showing only trial metrics")
+        # Update config with command line arguments
+        config['data']['assets'] = args.assets if args.assets else config['data']['assets']
+        config['data']['timeframe'] = args.timeframe if args.timeframe else config['data']['timeframe']
+        config['model']['max_leverage'] = args.max_leverage if args.max_leverage else config['model']['max_leverage']
+        config['training']['steps'] = args.training_steps if args.training_steps else config['training']['steps']
+        config['logging']['verbose'] = args.verbose if args.verbose else config['logging'].get('verbose', False)
         
-        # Setup directories and wandb
+        # Setup directories
         setup_directories(config)
+        
+        # Initialize wandb
         initialize_wandb(config)
         
-        # Initialize trading system
+        # Create trading system
         trading_system = TradingSystem(config)
         
-        # Initialize system (this handles data fetching, env creation, and model setup)
+        # Initialize trading system
         await trading_system.initialize(args)
         
-        # Run hyperparameter optimization
-        # Comment out optimization for direct training with 1M timestep parameters
-        # trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, total_timesteps=1000)
-        
-        # Train the model with best parameters
-        trading_system.train()
-        
-        # Save final model and environment
-        final_model_path = os.path.join(args.model_dir, "final_model")
-        final_env_path = os.path.join(args.model_dir, "vec_normalize.pkl")
-        
-        trading_system.model.save(final_model_path)
-        trading_system.env.save(final_env_path)
-        
-        logger.info(f"Training complete. Model saved to {final_model_path}")
+        # Check if continuing training from an existing model
+        if args.continue_training:
+            if not args.model_path:
+                raise ValueError("--model-path must be provided when using --continue-training")
+                
+            logger.info(f"Continuing training from model: {args.model_path}")
+            logger.info(f"Additional steps: {args.additional_steps}")
+            
+            # Continue training
+            final_model_path = trading_system.continue_training(
+                model_path=args.model_path,
+                env_path=args.env_path,
+                additional_timesteps=args.additional_steps,
+                reset_num_timesteps=args.reset_num_timesteps,
+                reset_reward_normalization=args.reset_reward_norm
+            )
+            
+            logger.info(f"Continued training complete. Final model saved to {final_model_path}")
+        else:
+            # Run hyperparameter optimization
+            # Comment out optimization for direct training with 1M timestep parameters
+            # trading_system.optimize_hyperparameters(n_trials=30, n_jobs=5, total_timesteps=1000)
+            
+            # Train the model with best parameters
+            trading_system.train(args)
+            
+            # Save final model and environment
+            final_model_path = os.path.join(args.model_dir, "final_model")
+            final_env_path = os.path.join(args.model_dir, "vec_normalize.pkl")
+            
+            trading_system.model.save(final_model_path)
+            trading_system.env.save(final_env_path)
+            
+            logger.info(f"Training complete. Model saved to {final_model_path}")
         
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")

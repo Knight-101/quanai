@@ -326,3 +326,32 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Disclaimer
 
 This software is for educational purposes only. Do not risk money which you are afraid to lose. USE THE SOFTWARE AT YOUR OWN RISK. THE AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING RESULTS.
+
+Trial 4 finished with value: 1.1168126649229622 and parameters: {'learning_rate': 0.0005356572063094488, 'n_steps': 2048, 'batch_size': 128, 'gamma': 0.9536529734618079, 'gae_lambda': 0.9346152432802582, 'clip_range': 0.2260780969174847, 'ent_coef': 0.04775447618080806, 'vf_coef': 0.623876015278098, 'max_grad_norm': 0.620474967527223, 'n_epochs': 12, 'use_sde': False, 'target_kl': 0.034746805835711846, 'pi_1': 512, 'pi_2': 256, 'vf_1': 512, 'vf_2': 64, 'features_dim': 64, 'dropout_rate': 0.06008148949622054, 'regime_aware': False}. Best is trial 4 with value: 1.1168126649229622.
+
+Trial 29 finished with value: 3.3697924063361104 and parameters: {'learning_rate': 9.317018864348141e-05, 'n_steps': 2048, 'batch_size': 256,
+'gamma': 0.9414038289603377,
+'gae_lambda': 0.94002100952802,
+'clip_range': 0.2704772671316055,
+'ent_coef': 0.0471577615690282,
+'vf_coef': 0.7814629084515918,
+'max_grad_norm': 0.6992537258614491,
+'n_epochs': 5,
+'use_sde': True,
+'sde_sample_freq': 16,
+'target_kl': 0.0715298806542812,
+'pi_1': 128, 'pi_2': 64, 'vf_1': 256, 'vf_2': 64,
+'features_dim': 256, 'dropout_rate': 0.08859278252962563, 'regime_aware': True,
+'position_holding_bonus': 0.04689468349771604,
+'uncertainty_scaling': 1.2472096863889177}. Best is trial 29 with value: 3.3697924063361104.
+
+!rm -rf _ ._
+!git clone https://Knight-101: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@github.com/Knight-101/quanai.git .
+
+# optional code to pull changes
+
+!git pull
+
+!pip install -r requirements.txt
+
+!python main_opt.py

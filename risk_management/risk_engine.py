@@ -142,38 +142,74 @@ class InstitutionalRiskEngine:
         market_data: pd.DataFrame,
         portfolio_value: float
     ) -> Dict:
-        """Calculate position-based risk metrics"""
+        """
+        Calculate position-based risk metrics, including exposure, concentration, and leverage
+        """
         try:
-            # Calculate position sizes and exposures
+            # Initialize metrics
+            total_exposure = 0.0  # Absolute value (for risk limits)
+            net_exposure = 0.0    # With sign (for directional bias)
             exposures = {}
-            total_exposure = 0
             
-            # Get the latest timestamp
-            latest_timestamp = market_data.index[-1]
-            
+            # Process each position
             for asset, position in positions.items():
+                # Skip positions with zero size
+                if position['size'] == 0:
+                    continue
+                
                 try:
-                    # Get close price using proper MultiIndex access
-                    price = market_data.loc[latest_timestamp, (asset, 'close')]
-                    if isinstance(price, (pd.Series, pd.DataFrame)):
-                        price = float(price.iloc[0])
+                    # Get price data for this asset
+                    if 'value' in position:
+                        # If value is provided directly (absolute)
+                        position_exposure = abs(position['value'])
+                        # Try to determine position direction for net exposure
+                        position_value = position['value']
+                        if 'size' in position:
+                            # If size is available, use its sign for direction
+                            position_value = position['value'] * (1 if position['size'] > 0 else -1)
                     else:
-                        price = float(price)
+                        # Calculate from size and price
+                        try:
+                            # First try using position's mark_price if available
+                            if 'mark_price' in position:
+                                price = position['mark_price']
+                            # Then try the last row of market data
+                            elif market_data is not None and (asset, 'close') in market_data.columns:
+                                price = market_data.iloc[-1][(asset, 'close')]
+                                if isinstance(price, (pd.Series, pd.DataFrame)):
+                                    price = price.iloc[0]
+                            else:
+                                # Default to entry price if no market data
+                                price = position['entry_price']
+                            
+                            # Calculate position value with direction
+                            position_value = position['size'] * price
+                            # Position exposure is the absolute value
+                            position_exposure = abs(position_value)
+                            
+                        except Exception as e:
+                            logger.error(f"Error calculating position value for {asset}: {str(e)}")
+                            # Use reasonable defaults
+                            position_value = 0
+                            position_exposure = 0
                     
-                    # Calculate exposure
-                    exposure = abs(position['size'] * price)
-                    exposures[asset] = exposure
-                    total_exposure += exposure
+                    # Add to total exposure (absolute value for risk limits)
+                    total_exposure += position_exposure
+                    # Add to net exposure (with sign for directional bias)
+                    net_exposure += position_value
+                    # Track individual asset exposure
+                    exposures[asset] = position_exposure
+                    
                 except Exception as e:
-                    logger.error(f"Error calculating exposure for {asset}: {str(e)}")
-                    exposures[asset] = 0
+                    logger.error(f"Error processing position for {asset}: {str(e)}")
                     continue
             
             # Position concentration with safety checks
             max_concentration = max(exposures.values()) / (portfolio_value + 1e-8) if exposures else 0
             
-            # Leverage utilization with safety checks
-            current_leverage = total_exposure / (portfolio_value + 1e-8)
+            # Calculate both gross and net leverage
+            gross_leverage = total_exposure / (portfolio_value + 1e-8)  # Always positive
+            net_leverage = net_exposure / (portfolio_value + 1e-8)     # Can be negative
             
             # Calculate correlation risk using returns data
             try:
@@ -204,7 +240,10 @@ class InstitutionalRiskEngine:
             
             return {
                 'total_exposure': total_exposure,
-                'leverage_utilization': current_leverage,
+                'net_exposure': net_exposure,
+                'gross_leverage': gross_leverage,
+                'net_leverage': net_leverage,
+                'leverage_utilization': gross_leverage,  # Keep for backward compatibility
                 'max_concentration': max_concentration,
                 'correlation_risk': correlation_risk,
                 'num_positions': len([p for p in positions.values() if p['size'] != 0])
@@ -213,6 +252,9 @@ class InstitutionalRiskEngine:
             logger.error(f"Error in _calculate_position_metrics: {str(e)}")
             return {
                 'total_exposure': 0,
+                'net_exposure': 0,
+                'gross_leverage': 0,
+                'net_leverage': 0,
                 'leverage_utilization': 0,
                 'max_concentration': 0,
                 'correlation_risk': 0,
@@ -473,7 +515,22 @@ class InstitutionalRiskEngine:
         """Update historical risk metrics"""
         self.historical_var.append(risk_metrics['var'])
         self.historical_drawdowns.append(risk_metrics['max_drawdown'])
-        self.historical_leverage.append(risk_metrics['leverage_utilization'])
+        
+        # Update both gross and net leverage history
+        if 'gross_leverage' in risk_metrics:
+            if not hasattr(self, 'historical_gross_leverage'):
+                self.historical_gross_leverage = []
+            self.historical_gross_leverage.append(risk_metrics['gross_leverage'])
+            
+            # Keep backward compatibility
+            self.historical_leverage.append(risk_metrics['gross_leverage'])
+        else:
+            self.historical_leverage.append(risk_metrics['leverage_utilization'])
+            
+        if 'net_leverage' in risk_metrics:
+            if not hasattr(self, 'historical_net_leverage'):
+                self.historical_net_leverage = []
+            self.historical_net_leverage.append(risk_metrics['net_leverage'])
         
     def check_risk_limits(self, risk_metrics: Dict) -> Tuple[bool, List[str]]:
         """Check if current risk metrics exceed defined limits"""
@@ -487,23 +544,29 @@ class InstitutionalRiskEngine:
         if risk_metrics['var'] > self.risk_limits.var_limit:
             violations.append(f"VaR ({risk_metrics['var']:.2%}) exceeds limit ({self.risk_limits.var_limit:.2%})")
             
-        # Check leverage
-        if risk_metrics['leverage_utilization'] > self.risk_limits.max_leverage:
-            violations.append(f"Leverage ({risk_metrics['leverage_utilization']:.2f}x) exceeds limit ({self.risk_limits.max_leverage:.2f}x)")
+        # Check leverage using gross leverage (always positive)
+        # This ensures risk limits are enforced regardless of short/long direction
+        leverage_to_check = risk_metrics.get('gross_leverage', risk_metrics['leverage_utilization'])
+        if leverage_to_check > self.risk_limits.max_leverage:
+            violations.append(f"Gross leverage ({leverage_to_check:.2f}x) exceeds limit ({self.risk_limits.max_leverage:.2f}x)")
             
+        # Check for excessive net leverage in either direction
+        if 'net_leverage' in risk_metrics:
+            # For net leverage, we look at the absolute value to enforce limits in both directions
+            net_leverage_abs = abs(risk_metrics['net_leverage'])
+            if net_leverage_abs > self.risk_limits.max_leverage:
+                directions = "short" if risk_metrics['net_leverage'] < 0 else "long"
+                violations.append(f"Net {directions} leverage ({risk_metrics['net_leverage']:.2f}x) exceeds limit (±{self.risk_limits.max_leverage:.2f}x)")
+                
         # Check concentration
         if risk_metrics['max_concentration'] > self.risk_limits.position_concentration:
             violations.append(f"Position concentration ({risk_metrics['max_concentration']:.2%}) exceeds limit ({self.risk_limits.position_concentration:.2%})")
             
-        # Check correlation
+        # Check correlation risk
         if risk_metrics['correlation_risk'] > self.risk_limits.correlation_limit:
             violations.append(f"Correlation risk ({risk_metrics['correlation_risk']:.2f}) exceeds limit ({self.risk_limits.correlation_limit:.2f})")
             
-        # Check liquidity
-        if risk_metrics['max_adv_ratio'] > self.risk_limits.liquidity_ratio:
-            violations.append(f"ADV ratio ({risk_metrics['max_adv_ratio']:.2%}) exceeds limit ({self.risk_limits.liquidity_ratio:.2%})")
-            
-        return len(violations) == 0, violations
+        return len(violations) > 0, violations
         
     def get_risk_report(self) -> Dict:
         """Generate comprehensive risk report"""

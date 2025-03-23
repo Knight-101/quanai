@@ -28,6 +28,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                  risk_free_rate: float = 0.02,
                  initial_balance: float = 10000.0,  # Make initial balance configurable
                  max_drawdown: float = 0.3,  # Make max drawdown configurable
+                 maintenance_margin: float = 0.1,  # Maintenance margin as fraction of initial balance
                  verbose: bool = False):  # Add verbose flag
         
         super().__init__()
@@ -51,11 +52,14 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.balance = self.initial_balance
         self.commission = commission
         self.max_leverage = max_leverage
+        # DEX trading requirements: leverage must be at least 1.0x and at most max_leverage
+        # Leverage values are continuous from 1.0 to max_leverage (e.g., 1.5x, 3.2x, etc.)
         self.window_size = window_size
         self.current_step = self.window_size
         self.funding_fee_multiplier = funding_fee_multiplier
         self.max_drawdown = max_drawdown  # Use the passed parameter
         self.risk_free_rate = risk_free_rate
+        self.maintenance_margin = maintenance_margin  # Store maintenance margin
         
         # Extract unique assets from MultiIndex
         self.assets = assets
@@ -69,7 +73,9 @@ class InstitutionalPerpetualEnv(gym.Env):
                 self.last_prices[asset] = 1000.0  # Default fallback price
         
         # Initialize positions
-        self.positions = {asset: {'size': 0.0, 'entry_price': 0.0, 'last_price': 0.0} 
+        self.positions = {asset: {'size': 0, 'entry_price': 0, 'funding_accrued': 0,
+                                 'last_price': self._get_mark_price(asset) if not self.df.empty else 1000.0,
+                                 'leverage': 0.0} 
                          for asset in self.assets}
         
         # Initialize total costs tracking
@@ -147,7 +153,9 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.balance = self.initial_balance
         self.peak_balance = self.initial_balance
         self.peak_value = self.initial_balance
-        self.positions = {asset: {'size': 0, 'entry_price': 0, 'funding_accrued': 0, 'last_price': self._get_mark_price(asset)} 
+        self.positions = {asset: {'size': 0, 'entry_price': 0, 'funding_accrued': 0,
+                                 'last_price': self._get_mark_price(asset) if not self.df.empty else 1000.0,
+                                 'leverage': 0.0} 
                          for asset in self.assets}
         self.last_action = None
         self.done = False
@@ -179,8 +187,18 @@ class InstitutionalPerpetualEnv(gym.Env):
         initial_positions = {asset: {'size': 0, 'entry_price': 0} for asset in self.assets}
         self.positions_history.append(initial_positions)
         
+        # IMPORTANT FIX: Initialize position tracking variables
+        self.position_duration = {asset: 0 for asset in self.assets}
+        self.position_profits = {asset: [] for asset in self.assets}
+        
+        # Initialize action vector
+        self.last_action_vector = np.zeros(len(self.assets))
+        
+        # Reset tracking counters
+        self.consecutive_no_trade_steps = 0
+        
         # Log reset
-        # logger.info(f"Environment reset: window_size={self.window_size}, initial_balance={self.initial_balance}")
+        logger.info(f"Environment reset: window_size={self.window_size}, initial_balance={self.initial_balance}")
         
         return self._get_observation(), {}
         
@@ -194,7 +212,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Check if we've reached the end of data
             if self.current_step >= len(self.df) - 1:
                 # Return final state with done flag
-                # logger.info(f"Reached end of data at step {self.current_step}")
+                logger.info(f"Reached end of data at step {self.current_step}")
                 return self._get_observation(), 0, True, False, self._get_info({})
             
             # Advance to next step
@@ -245,7 +263,17 @@ class InstitutionalPerpetualEnv(gym.Env):
                 # CRITICAL FIX: Convert signal to target position size with proper allocation
                 # Use normalized allocation to distribute leverage across assets
                 asset_allocation = normalized_allocation[i]
-                target_leverage = abs(signal) * self.max_leverage * asset_allocation
+                # Apply minimum leverage of 1.0x to comply with DEX requirements
+                raw_leverage = abs(signal) * self.max_leverage
+                # Ensure each asset has at least 1.0x leverage if signal is strong enough
+                min_leverage = 1.0 if abs(signal) > 0.1 else 0.0  # Only apply minimum if signal is significant
+                target_leverage = max(raw_leverage * asset_allocation, min_leverage)
+                
+                # Store the target leverage in a way that can be accessed during trade execution
+                if abs(signal) > 0.1:  # Only update leverage when we have a significant signal
+                    # This will be used in execute_trades to set the actual leverage
+                    self.positions[asset]['target_leverage'] = target_leverage
+                
                 direction = np.sign(signal) if np.abs(signal) > 1e-8 else 0
                 portfolio_value = self._calculate_portfolio_value()
                 target_value = direction * target_leverage * portfolio_value
@@ -263,16 +291,31 @@ class InstitutionalPerpetualEnv(gym.Env):
                     target_size = target_value / price
                     
                     # CRITICAL FIX: Add asset-specific position limits
+                    # Calculate max asset value based on portfolio size and leverage
+                    max_asset_value = min(portfolio_value * self.max_leverage, 2000000)  # Cap at $2M for safety
+                    
+                    # Calculate max units for each asset based on its price
+                    # More liquid assets can have larger positions
                     max_asset_units = {
-                        'BTCUSDT': 10,      # Max ~$400k per BTC position
-                        'ETHUSDT': 100,     # Max ~$200k per ETH position
-                        'SOLUSDT': 500,      # Max ~$100k per SOL position
-                    }.get(asset, 1000)      # Default limit for other assets
+                        'BTCUSDT': max_asset_value / price * 0.8,  # 80% of max for BTC (most liquid)
+                        'ETHUSDT': max_asset_value / price * 0.7,  # 70% of max for ETH 
+                        'SOLUSDT': max_asset_value / price * 0.5,  # 50% of max for SOL (less liquid)
+                    }.get(asset, max_asset_value / price * 0.3)  # Default 30% for other assets
+                    
+                    # Additional hard cap based on standard lot sizes for each asset
+                    hard_caps = {
+                        'BTCUSDT': 100,      # Hard cap of 100 BTC 
+                        'ETHUSDT': 1000,     # Hard cap of 1000 ETH
+                        'SOLUSDT': 5000,     # Hard cap of 5000 SOL
+                    }.get(asset, 10000)      # Default cap for other assets
+                    
+                    # Use the smaller of the two limits
+                    max_asset_units = min(max_asset_units, hard_caps)
                     
                     if abs(target_size) > max_asset_units:
                         target_size = max_asset_units * direction
-                        # if self.verbose:
-                        #     logger.info(f"Position size for {asset} limited by max units: {target_size:.2f}")
+                        if self.verbose:
+                            logger.debug(f"Capping target {asset} size from {target_size:.2f} to {max_asset_units * direction:.2f} units")
                 else:
                     target_size = 0
                 
@@ -303,7 +346,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                     logger.debug(f"Executed {len(trades)} trades at step {self.current_step}")
             elif 'scaled_trades' in simulation_result and simulation_result['scaled_trades']:
                 # Execute scaled trades that comply with risk limits
-                # logger.info(f"Executing scaled trades to comply with risk limits")
+                logger.info(f"Executing scaled trades to comply with risk limits")
                 self._execute_trades(simulation_result['scaled_trades'])
                 trades_executed = True
             else:
@@ -312,6 +355,12 @@ class InstitutionalPerpetualEnv(gym.Env):
             
             # ENHANCED: Update trade counts for frequency tracking
             self.trade_counts.append(1 if trades_executed else 0)
+            
+            # ENHANCED: Update consecutive no trade steps counter
+            if trades_executed:
+                self.consecutive_no_trade_steps = 0  # Reset counter when trades are executed
+            else:
+                self.consecutive_no_trade_steps += 1  # Increment counter when no trades
             
             # CRITICAL FIX: Apply funding costs and update positions before calculating final portfolio value
             self._update_positions()
@@ -374,7 +423,7 @@ class InstitutionalPerpetualEnv(gym.Env):
     def _simulate_trades(self, trades: List[Dict]) -> Dict:
         """Simulate trades to check risk limits"""
         try:
-            simulated_positions = self.positions.copy()
+            simulated_positions = copy.deepcopy(self.positions)
             
             for trade in trades:
                 asset = trade['asset']
@@ -397,7 +446,8 @@ class InstitutionalPerpetualEnv(gym.Env):
             
             # Calculate simulated risk metrics
             portfolio_value = self.balance  # Start with cash balance
-            total_exposure = 0
+            gross_exposure = 0  # Total absolute exposure (for risk limits)
+            net_exposure = 0    # Net directional exposure (for leverage direction)
             asset_values = {}
             
             for asset, position in simulated_positions.items():
@@ -408,17 +458,60 @@ class InstitutionalPerpetualEnv(gym.Env):
                 # Get current price
                 price = self._get_mark_price(asset)
                 
-                # Calculate position value and add to total
-                position_value = position['size'] * price
-                portfolio_value += position_value
-                total_exposure += abs(position_value)
-                asset_values[asset] = abs(position_value)
+                # CRITICAL FIX: Calculate unrealized PnL correctly for both long and short positions
+                unrealized_pnl = position['size'] * (price - position['entry_price'])
+                portfolio_value += unrealized_pnl
+                
+                # Calculate both gross and net exposure
+                position_value = position['size'] * price  # With sign (negative for shorts)
+                position_exposure = abs(position_value)    # Absolute value (for risk)
+                
+                gross_exposure += position_exposure  # Always positive (for risk limits)
+                net_exposure += position_value       # Can be negative (for directional leverage)
+                asset_values[asset] = position_exposure
             
-            # Ensure we don't divide by zero
+            # Ensure we don't divide by zero and portfolio value isn't extremely negative
             portfolio_value = max(portfolio_value, self.initial_balance * 0.01)
             
-            # Calculate leverage
-            leverage = total_exposure / portfolio_value
+            # Calculate leverage - now with proper sign for direction
+            # For risk purposes, we use gross leverage (always positive)
+            gross_leverage = gross_exposure / portfolio_value
+            
+            # For tracking directional exposure, we use net leverage (can be negative)
+            net_leverage = net_exposure / portfolio_value
+            
+            # CRITICAL FIX: Enforce maximum leverage limit on gross leverage
+            # This ensures risk limits are enforced regardless of direction
+            max_allowed_leverage = self.max_leverage  # Use configured max_leverage without hardcoding
+            
+            if gross_leverage > max_allowed_leverage:
+                # Scale down positions to achieve target leverage
+                scale_factor = max_allowed_leverage / gross_leverage
+                
+                # Create scaled trades
+                scaled_trades = []
+                for trade in trades:
+                    if 'size_change' in trade:
+                        scaled_trade = trade.copy()
+                        scaled_trade['size_change'] = trade['size_change'] * scale_factor
+                        if abs(scaled_trade['size_change']) > 1e-8:  # Only include non-zero trades
+                            scaled_trades.append(scaled_trade)
+                
+                # Recalculate leverage with scaled trades
+                gross_leverage = max_allowed_leverage
+                
+                # Log leverage scaling
+                logger.warning(f"Scaling down trades to maintain leverage below {max_allowed_leverage:.2f}x (was {gross_leverage:.2f}x)")
+                
+                return {
+                    'portfolio_value': portfolio_value,
+                    'gross_leverage': gross_leverage,
+                    'net_leverage': net_leverage * scale_factor,  # Scale net leverage too
+                    'max_concentration': max(asset_values.values()) / portfolio_value if asset_values else 0,
+                    'risk_limit_exceeded': True,
+                    'exceeded_limits': [f"Leverage {gross_leverage:.2f}x > {max_allowed_leverage:.2f}x"],
+                    'scaled_trades': scaled_trades
+                }
             
             # Calculate position concentration
             max_concentration = 0
@@ -434,9 +527,9 @@ class InstitutionalPerpetualEnv(gym.Env):
             exceeded_limits = []
             
             # Check leverage limit
-            if leverage > self.max_leverage:
+            if gross_leverage > self.max_leverage:
                 risk_limit_exceeded = True
-                exceeded_limits.append(f"Leverage {leverage:.2f}x > {self.max_leverage:.2f}x")
+                exceeded_limits.append(f"Leverage {gross_leverage:.2f}x > {self.max_leverage:.2f}x")
             
             # Check concentration limit
             concentration_limit = 0.4  # Default, can be overridden by risk engine
@@ -455,9 +548,9 @@ class InstitutionalPerpetualEnv(gym.Env):
                 # Calculate scaling factor
                 scale_factor = 0.8  # Default scale down by 20%
                 
-                if leverage > self.max_leverage:
+                if gross_leverage > self.max_leverage:
                     # Scale to get within leverage limit
-                    leverage_scale = (self.max_leverage * 0.9) / leverage
+                    leverage_scale = (self.max_leverage * 0.9) / gross_leverage
                     scale_factor = min(scale_factor, leverage_scale)
                 
                 if max_concentration > concentration_limit:
@@ -473,10 +566,11 @@ class InstitutionalPerpetualEnv(gym.Env):
                         if abs(scaled_trade['size_change']) > 1e-8:  # Only include non-zero trades
                             scaled_trades.append(scaled_trade)
                 
-                # logger.info(f"Scaling trades by factor {scale_factor:.4f} to comply with risk limits")
+                logger.info(f"Scaling trades by factor {scale_factor:.4f} to comply with risk limits")
                 return {
                     'portfolio_value': portfolio_value,
-                    'leverage': leverage,
+                    'gross_leverage': gross_leverage,
+                    'net_leverage': net_leverage,
                     'max_concentration': max_concentration,
                     'risk_limit_exceeded': risk_limit_exceeded,
                     'exceeded_limits': exceeded_limits,
@@ -486,7 +580,8 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Return simulated metrics
             return {
                 'portfolio_value': portfolio_value,
-                'leverage': leverage,
+                'gross_leverage': gross_leverage,
+                'net_leverage': net_leverage,
                 'max_concentration': max_concentration,
                 'risk_limit_exceeded': risk_limit_exceeded,
                 'exceeded_limits': exceeded_limits,
@@ -497,7 +592,8 @@ class InstitutionalPerpetualEnv(gym.Env):
             logger.error(f"Error in simulating trades: {str(e)}")
             return {
                 'portfolio_value': self.balance,
-                'leverage': 0,
+                'gross_leverage': 0,
+                'net_leverage': 0,
                 'max_concentration': 0,
                 'risk_limit_exceeded': True,
                 'exceeded_limits': ["Error in simulation"],
@@ -507,6 +603,9 @@ class InstitutionalPerpetualEnv(gym.Env):
     def _execute_trades(self, trades: List[Dict]):
         """Smart order execution with transaction cost model"""
         try:
+            # CRITICAL FIX: Calculate portfolio value at the beginning of trade execution
+            portfolio_value = self._calculate_portfolio_value()
+            
             for trade in trades:
                 asset = trade['asset']
                 
@@ -588,19 +687,47 @@ class InstitutionalPerpetualEnv(gym.Env):
                     
                     self.total_costs += total_cost
                     
-                    # Add trade to history with realized PnL
+                    # INDUSTRY-LEVEL FIX: Properly handle leverage for DEX-style trading
+                    position_size = self.positions[asset]['size']  # Current position size after update
+                    
+                    # Use target leverage when establishing/modifying position
+                    if abs(position_size) > 1e-8:  # Only for non-zero positions
+                        # Get the target leverage from the stored value during signal processing
+                        target_leverage = self.positions[asset].get('target_leverage', 0.0)
+                        
+                        # For new positions or when adding to position, use the target leverage
+                        if original_position == 0 or (np.sign(original_position) == np.sign(size_change)):
+                            # When opening or increasing position, use the target leverage
+                            self.positions[asset]['leverage'] = max(target_leverage, 1.0)  # Minimum 1.0x for DEX
+                        
+                        # For existing positions being reduced, keep the existing leverage
+                        # This maintains the leverage when taking partial profits
+                        
+                        # Ensure leverage is capped at max_leverage
+                        self.positions[asset]['leverage'] = min(self.positions[asset]['leverage'], self.max_leverage)
+                        
+                        # Use the position's leverage for reporting
+                        actual_leverage = self.positions[asset]['leverage']
+                    else:
+                        # Zero position has zero leverage
+                        self.positions[asset]['leverage'] = 0.0
+                        actual_leverage = 0.0
+                    
+                    # Add trade to history
                     self.trades.append({
                         'timestamp': self.current_step,
                         'asset': asset,
                         'size': size_change,
                         'price': execution_price,
                         'cost': total_cost,
-                        'realized_pnl': realized_pnl  # CRITICAL FIX: Use 'realized_pnl' for consistency
+                        'realized_pnl': realized_pnl,  # CRITICAL FIX: Change 'pnl' to 'realized_pnl' for consistency
+                        'leverage': actual_leverage  # Use the calculated actual leverage
                     })
                     
-                    # if self.verbose:
-                    #     logger.info(f"Trade executed: {asset} {size_change:.4f} @ {execution_price:.2f}, " +
-                    #               f"Cost: {total_cost:.2f}, Realized PnL: {realized_pnl:.2f}")
+                    # Add leverage information to logging
+                    if self.verbose:
+                        logger.info(f"Trade executed: {asset} {size_change:.6f} @ {execution_price:.2f}, " +
+                                   f"Cost: {total_cost:.2f}, PnL: {realized_pnl:.2f}, Leverage: {actual_leverage:.2f}x")
                 else:
                     # Here we would handle the old trade format, but this branch is deprecated
                     # and shouldn't be called with our new trading logic
@@ -635,87 +762,98 @@ class InstitutionalPerpetualEnv(gym.Env):
                     self.position_profits[asset] = []
             
             # CRITICAL FIX: Calculate total portfolio value before funding
-            total_portfolio_value = self._calculate_portfolio_value()
+            portfolio_value_before_funding = self._calculate_portfolio_value()
             
+            # Update positions with funding rates
             for asset in self.assets:
                 try:
                     position = self.positions[asset]
+                    position_size = position['size']
+                    
+                    # Skip updating if no position
+                    if abs(position_size) <= 1e-8:
+                        continue
+                        
+                    # Update funding rates based on current data
+                    funding_rate = self._get_funding_rate(asset)
+                    self.funding_rates[asset] = funding_rate
+                    
+                    # Update mark price
                     mark_price = self._get_mark_price(asset)
                     
-                    if abs(position['size']) > 1e-8:
-                        # Store previous price for PnL calculation
-                        prev_price = position.get('last_price', mark_price)
-                        
-                        # Calculate unrealized PnL from price movement
-                        price_change_pnl = position['size'] * (mark_price - prev_price)
-                        total_pnl += price_change_pnl
-                        
-                        # Calculate and apply funding rate
-                        funding_rate = self._get_funding_rate(asset)
-                        
-                        # Funding is paid by longs to shorts when positive, and by shorts to longs when negative
-                        # For long positions (positive size), subtract positive funding rate (pay)
-                        # For short positions (negative size), add positive funding rate (receive)
-                        funding_cost = position['size'] * mark_price * funding_rate * self.funding_fee_multiplier
-                        
-                        # Track funding for metrics
-                        self.funding_accrued[asset] += funding_cost
-                        
-                        # CRITICAL FIX: Only apply funding if there are sufficient funds
-                        # and limit maximum funding impact
-                        if funding_cost > 0:  # Paying funding
-                            # Limit funding cost to at most 5% of position value
-                            max_funding = abs(position['size'] * mark_price * 0.05)
-                            funding_cost = min(funding_cost, max_funding)
-                            
-                            # Check if we can afford funding
-                            if funding_cost > self.balance:
-                                # Reduce funding cost to available balance
-                                funding_cost = max(0, self.balance * 0.9)  # Keep some buffer
-                                
-                                # Reduce position size if running out of funds
-                                new_size = position['size'] * 0.5  # Cut position in half
-                                
-                                # if self.verbose:
-                                #     logger.warning(f"Reducing {asset} position due to funding costs: {position['size']:.4f} -> {new_size:.4f}")
-                                
-                                # Close half the position due to insufficient funds
-                                size_to_close = position['size'] - new_size
-                                close_price = mark_price * (1 - 0.001 * np.sign(position['size']))  # 0.1% slippage
-                                
-                                # Calculate PnL from closing
-                                close_pnl = size_to_close * (close_price - position['entry_price'])
-                                
-                                # Update position
-                                position['size'] = new_size
-                                
-                                # Add realized PnL to balance
-                                self.balance += close_pnl
-                                
-                                # if self.verbose:
-                                #     logger.info(f"Partial close of {asset}: {size_to_close:.4f} @ {close_price:.2f}, PnL: {close_pnl:.2f}")
-                        
-                        # CRITICAL FIX: Apply funding to balance (even if reduced)
-                        # We already handled negative case, and we track the total for metrics
-                        self.balance -= funding_cost
-                        self.total_costs += funding_cost
-                        
-                        # Improve logging of funding impacts
-                        if abs(funding_cost) > 0.01:  # Only log meaningful amounts (> 1 cent)
-                            logger.debug(f"Applied funding for {asset}: ${funding_cost:.4f} (rate: {funding_rate*100:.6f}%)")
-                        
-                        # Position last price already updated above
-                        position['last_price'] = mark_price
+                    # Skip if mark price is zero or not positive
+                    if mark_price <= 0:
+                        continue
+                    
+                    # Calculate time-weighted funding (8-hourly rate per step)
+                    # Apply funding fee multiplier to control intensity
+                    # Realistic funding rates are ~0.01% per 8 hours
+                    funding_fee = position_size * mark_price * funding_rate * self.funding_fee_multiplier
+                    
+                    # Track funding costs over time
+                    self.funding_accrued[asset] += funding_fee
+                    
+                    # Apply funding fee to balance
+                    funding_cost = funding_fee
+                    
+                    # Update position value with funding
+                    # Long positions pay funding when rate is positive
+                    # Short positions pay funding when rate is negative
+                    if (position_size > 0 and funding_rate > 0) or (position_size < 0 and funding_rate < 0):
+                        # Position pays funding
+                        self.balance -= abs(funding_cost)
+                    else:
+                        # Position receives funding
+                        self.balance += abs(funding_cost)
+                    
+                    # Update last price
+                    position['last_price'] = mark_price
+                    
+                    # Calculate unrealized PnL for this update
+                    unrealized_pnl = position_size * (mark_price - position['entry_price'])
+                    total_pnl += unrealized_pnl
+
                 except Exception as e:
                     logger.error(f"Error updating position for {asset}: {str(e)}")
                     continue
+            
+            # Calculate current portfolio value after updates
+            current_portfolio_value = self._calculate_portfolio_value()
+            
+            # CRITICAL FIX: Check for liquidation condition
+            maintenance_threshold = self.initial_balance * self.maintenance_margin
+            
+            # SAFETY IMPROVEMENT: Also trigger liquidation if portfolio value drops below -50% of initial balance
+            # This prevents extreme negative portfolio values
+            early_liquidation_threshold = -self.initial_balance * 0.5
+            
+            if current_portfolio_value < maintenance_threshold or current_portfolio_value < early_liquidation_threshold:
+                # Portfolio value below maintenance margin or extremely negative, liquidate all positions
+                if current_portfolio_value < maintenance_threshold:
+                    logger.warning(f"LIQUIDATION TRIGGERED: Portfolio value (${current_portfolio_value:.2f}) below maintenance margin (${maintenance_threshold:.2f})")
+                else:
+                    logger.warning(f"EMERGENCY LIQUIDATION TRIGGERED: Portfolio value (${current_portfolio_value:.2f}) extremely negative, closing all positions")
+                
+                # Close all positions
+                self._close_all_positions()
+                
+                # Set liquidation flag
+                self.liquidated = True
+                
+                # Update portfolio value after liquidation
+                current_portfolio_value = self._calculate_portfolio_value()
+                
+                # Apply liquidation penalty (1% of initial balance)
+                liquidation_penalty = self.initial_balance * 0.01
+                self.balance -= liquidation_penalty
+                logger.warning(f"Applied liquidation penalty: ${liquidation_penalty:.2f}")
             
             # CRITICAL FIX: Add to portfolio history after all updates
             self.portfolio_history.append({
                 'step': self.current_step,
                 'timestamp': get_utc_now() if 'get_utc_now' in globals() else datetime.now(),
                 'balance': self.balance,
-                'value': self._calculate_portfolio_value(),
+                'value': current_portfolio_value,
                 'return': 0.0,  # Will be calculated in _update_history
                 'leverage': 0.0, # Will be calculated in _update_history
                 'drawdown': 0.0, # Will be calculated in _update_history
@@ -755,6 +893,13 @@ class InstitutionalPerpetualEnv(gym.Env):
                     # The unrealized PnL is: position_size * (mark_price - entry_price)
                     unrealized_pnl = position_size * (mark_price - entry_price)
                     
+                    # EXTREME SAFETY CHECK: Limit maximum possible loss per position
+                    # No position should lose more than 3x the initial balance
+                    max_loss_per_position = self.initial_balance * 3
+                    if unrealized_pnl < -max_loss_per_position:
+                        logger.warning(f"Extreme loss detected in {asset} position: ${unrealized_pnl:.2f}, capping at ${-max_loss_per_position:.2f}")
+                        unrealized_pnl = -max_loss_per_position
+                    
                     # The position value is position_size * mark_price (absolute value)
                     position_value = abs(position_size * mark_price)
                     
@@ -775,6 +920,13 @@ class InstitutionalPerpetualEnv(gym.Env):
             
             # Final portfolio value is cash balance plus unrealized PnL
             final_value = self.balance + total_unrealized_pnl
+            
+            # EXTREME SAFETY CHECK: Limit the maximum possible portfolio loss
+            # Portfolio shouldn't lose more than 5x initial balance
+            min_possible_value = -self.initial_balance * 5
+            if final_value < min_possible_value:
+                logger.warning(f"Extreme portfolio loss detected: ${final_value:.2f}, capping at ${min_possible_value:.2f}")
+                final_value = min_possible_value
             
             # Log detailed breakdown
             logger.debug(f"Portfolio value: ${final_value:.2f} = Cash (${self.balance:.2f}) + Unrealized PnL (${total_unrealized_pnl:.2f})")
@@ -803,169 +955,176 @@ class InstitutionalPerpetualEnv(gym.Env):
             logger.error(f"Error getting funding rate for {asset}: {str(e)}")
             return 0.0001  # Default funding rate (0.01% per 8 hours)
         
-    def _calculate_risk_metrics(self) -> Dict:
-        """Calculate current risk metrics"""
+    def _calculate_risk_metrics(self, refresh_metrics=False):
+        """Calculate risk metrics for the current state"""
+        if len(self.positions) == 0 and not refresh_metrics and hasattr(self, 'risk_metrics'):
+            return self.risk_metrics
+        
         try:
-            # Calculate basic metrics
-            total_exposure = 0
-            total_pnl = 0
-            
-            # Get current market data window with proper MultiIndex handling
-            market_data = self.df.iloc[self.current_step - self.window_size:self.current_step + 1].copy()
-            
-            # Ensure market data has unique index
-            market_data = market_data.loc[~market_data.index.duplicated(keep='first')]
-            
-            # Calculate portfolio value and positions
+            # Start with current balance
             portfolio_value = self.balance
-            positions_dict = {}
+            gross_exposure = 0
+            net_exposure = 0
+            positions_data = []  # For metrics that need to process all positions
+            asset_values = {}    # For concentration calculation
             
+            # Process each position
             for asset, position in self.positions.items():
+                # Skip positions with negligible size
+                if abs(position['size']) < 1e-8:
+                    continue
+                
                 try:
-                    # Get mark price using proper MultiIndex access
-                    mark_price = market_data.iloc[-1][(asset, 'close')]
-                    if isinstance(mark_price, (pd.Series, pd.DataFrame)):
-                        mark_price = mark_price.iloc[0]
-                    mark_price = float(mark_price)
+                    # Get current price
+                    mark_price = self._get_mark_price(asset)
                     
-                    position_value = position['size'] * mark_price
-                    total_exposure += abs(position_value)
-                    total_pnl += position['size'] * (mark_price - position['entry_price'])
-                    portfolio_value += position_value
+                    # Calculate unrealized PnL
+                    unrealized_pnl = position['size'] * (mark_price - position['entry_price'])
+                    portfolio_value += unrealized_pnl
                     
-                    # Update positions dict for risk engine
-                    positions_dict[asset] = {
-                        'size': float(position['size']),
-                        'value': float(position_value),
-                        'entry_price': float(position['entry_price'])
+                    # Calculate both gross and net exposure
+                    position_value = position['size'] * mark_price  # With sign (negative for shorts)
+                    position_exposure = abs(position_value)         # Absolute value (for risk limits)
+                    
+                    gross_exposure += position_exposure  # Always positive (for risk limits)
+                    net_exposure += position_value       # Can be negative (for directional leverage)
+                    
+                    asset_values[asset] = position_exposure
+                    
+                    # Prepare position data for risk engine
+                    position_data = {
+                        'asset': asset,
+                        'size': position['size'],
+                        'entry_price': position['entry_price'],
+                        'mark_price': mark_price,
+                        'unrealized_pnl': unrealized_pnl,
+                        'position_value': position_value,
+                        'position_exposure': position_exposure,
                     }
+                    positions_data.append(position_data)
+                    
                 except Exception as e:
-                    logger.error(f"Error processing position for {asset}: {str(e)}")
-                    positions_dict[asset] = {'size': 0, 'value': 0, 'entry_price': 0}
+                    logger.error(f"Error processing position {asset}: {e}")
             
-            # Calculate risk metrics using risk engine
-            try:
-                risk_metrics = self.risk_engine.calculate_portfolio_risk(
-                    positions=positions_dict,
-                    market_data=market_data,
-                    portfolio_value=portfolio_value
-                )
-            except Exception as e:
-                logger.error(f"Error in risk engine calculations: {str(e)}")
-                # Provide default risk metrics if risk engine fails
-                risk_metrics = {
-                    'var': 0.0,
-                    'expected_shortfall': 0.0,
-                    'volatility': 0.0,
-                    'max_drawdown': 0.0,
-                    'leverage_utilization': total_exposure / (portfolio_value + 1e-8),
-                    'max_concentration': 0.0,
-                    'correlation_risk': 0.0,
-                    'max_adv_ratio': 0.0,
-                    'total_liquidation_cost': 0.0,
-                    'max_liquidation_cost': 0.0
-                }
+            # Calculate portfolio value for leverage (with safety check)
+            portfolio_value_for_leverage = max(portfolio_value, self.initial_balance * 0.1)
             
-            # Ensure all required metrics are present
-            required_metrics = [
-                'var', 'expected_shortfall', 'volatility', 'max_drawdown',
-                'leverage_utilization', 'max_concentration', 'correlation_risk',
-                'max_adv_ratio', 'total_liquidation_cost', 'max_liquidation_cost'
-            ]
+            # Calculate both types of leverage
+            gross_leverage = gross_exposure / portfolio_value_for_leverage
+            net_leverage = net_exposure / portfolio_value_for_leverage
             
-            for metric in required_metrics:
-                if metric not in risk_metrics:
-                    risk_metrics[metric] = 0.0
-            
-            # Add basic portfolio metrics
-            risk_metrics.update({
-                'total_exposure': total_exposure,
-                'total_pnl': total_pnl,
+            # Initialize all risk metrics to zero in case we don't have a risk engine
+            metrics = {
+                'total_exposure': gross_exposure,
+                'net_exposure': net_exposure,
+                'gross_leverage': gross_leverage,
+                'net_leverage': net_leverage,  # Can be negative for short-biased portfolios
+                'leverage_utilization': gross_leverage,  # Add this for compatibility with main_opt.py
+                'max_drawdown': getattr(self, 'max_drawdown', 0),
+                'sharpe_ratio': 0,
+                'sortino_ratio': 0,
+                'calmar_ratio': 0,
+                'total_pnl': 0,
+                'pnl_volatility': 0,
                 'portfolio_value': portfolio_value,
                 'balance': self.balance,
-                'current_drawdown': (self.peak_balance - portfolio_value) / (self.peak_balance + 1e-8)
-            })
+                'current_drawdown': max(0, 1 - portfolio_value / self.max_portfolio_value) if hasattr(self, 'max_portfolio_value') else 0,
+            }
             
-            # CRITICAL FIX: Ensure historical collections are updated
-            # Update leverage history
-            if 'leverage_utilization' in risk_metrics:
-                leverage = risk_metrics['leverage_utilization']
-                if not hasattr(self, 'historical_leverage'):
-                    self.historical_leverage = deque(maxlen=10000)
-                self.historical_leverage.append(leverage)
+            # Additional metrics calculation through Risk Engine
+            if self.risk_engine and refresh_metrics:
+                try:
+                    risk_metrics = self.risk_engine.calculate_risk_metrics(
+                        positions=positions_data,
+                        portfolio_value=portfolio_value,
+                        balance=self.balance,
+                        initial_balance=self.initial_balance,
+                        # FIXED: portfolio_history is a list of dictionaries, extract values correctly
+                        returns_history=[entry['value'] for entry in self.portfolio_history] if len(self.portfolio_history) > 0 else None,
+                    )
+                    # Update with risk engine metrics
+                    metrics.update(risk_metrics)
+                except Exception as e:
+                    logger.error(f"Error calculating risk metrics: {e}")
             
-            # Update drawdown history
-            if 'current_drawdown' in risk_metrics:
-                drawdown = risk_metrics['current_drawdown']
-                if not hasattr(self, 'drawdown_history'):
-                    self.drawdown_history = deque(maxlen=10000)
-                self.drawdown_history.append(drawdown)
-            
-            # CRITICAL FIX: Calculate and add risk-adjusted ratios
-            # These are needed for proper evaluation
-            if not hasattr(self, 'returns_history') or len(self.returns_history) < 2:
-                # Not enough history for proper calculation
-                risk_metrics['sharpe_ratio'] = 0.0
-                risk_metrics['sortino_ratio'] = 0.0
-                risk_metrics['calmar_ratio'] = 0.0
+            # Update history of leverage and drawdown
+            if hasattr(self, 'leverage_history'):
+                self.leverage_history.append(gross_leverage)
             else:
-                # Calculate returns
-                returns = np.array(list(self.returns_history))
+                self.leverage_history = [gross_leverage]
                 
-                # Calculate Sharpe ratio (with safety checks)
-                if len(returns) > 1 and np.std(returns) > 0:
-                    sharpe = np.mean(returns) / np.std(returns)
-                    risk_metrics['sharpe_ratio'] = np.clip(sharpe, -3.0, 3.0)
-                else:
-                    risk_metrics['sharpe_ratio'] = 0.0
+            if hasattr(self, 'net_leverage_history'):
+                self.net_leverage_history.append(net_leverage)
+            else:
+                self.net_leverage_history = [net_leverage]
                 
-                # Calculate Sortino ratio (with safety checks)
-                negative_returns = returns[returns < 0]
-                if len(negative_returns) > 0:
-                    downside_dev = np.std(negative_returns)
-                    if downside_dev > 0:
-                        sortino = np.mean(returns) / downside_dev
-                        risk_metrics['sortino_ratio'] = np.clip(sortino, -3.0, 3.0)
-                    else:
-                        risk_metrics['sortino_ratio'] = 0.0
-                else:
-                    risk_metrics['sortino_ratio'] = 0.0
+            # Calculate drawdown
+            if not hasattr(self, 'max_portfolio_value'):
+                self.max_portfolio_value = portfolio_value
+            elif portfolio_value > self.max_portfolio_value:
+                self.max_portfolio_value = portfolio_value
                 
-                # Calculate Calmar ratio (with safety checks)
-                if hasattr(self, 'drawdown_history') and len(self.drawdown_history) > 0:
-                    max_dd = max(self.drawdown_history)
-                    if max_dd > 0:
-                        calmar = np.mean(returns) / max_dd
-                        risk_metrics['calmar_ratio'] = np.clip(calmar, -3.0, 3.0)
-                    else:
-                        risk_metrics['calmar_ratio'] = 0.0
-                else:
-                    risk_metrics['calmar_ratio'] = 0.0
+            current_drawdown = max(0, 1 - portfolio_value / self.max_portfolio_value)
             
-            return risk_metrics
+            if hasattr(self, 'drawdown_history'):
+                self.drawdown_history.append(current_drawdown)
+            else:
+                self.drawdown_history = [current_drawdown]
+                
+            # Update maximum drawdown
+            if current_drawdown > getattr(self, 'max_drawdown', 0):
+                self.max_drawdown = current_drawdown
+                
+            # Risk-adjusted ratios calculation (with safety checks)
+            if len(self.portfolio_history) > 1:
+                try:
+                    # Calculate returns
+                    returns = []
+                    # FIXED: portfolio_history is a list of dictionaries, not a dictionary
+                    # Extract portfolio values from the history
+                    values = [entry['value'] for entry in self.portfolio_history]
+                    for i in range(1, len(values)):
+                        if values[i-1] > 0:
+                            returns.append((values[i] - values[i-1]) / values[i-1])
+                        else:
+                            returns.append(0)
+                    
+                    # Calculate metrics if we have returns
+                    if len(returns) > 0:
+                        # Sharpe ratio
+                        if np.std(returns) > 0:
+                            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252)  # Annualized
+                            metrics['sharpe_ratio'] = sharpe
+                        
+                        # Sortino ratio (downside deviation)
+                        negative_returns = [r for r in returns if r < 0]
+                        if len(negative_returns) > 0 and np.std(negative_returns) > 0:
+                            sortino = np.mean(returns) / np.std(negative_returns) * np.sqrt(252)
+                            metrics['sortino_ratio'] = sortino
+                        
+                        # Calmar ratio (return / max drawdown)
+                        if self.max_drawdown > 0:
+                            total_return = (portfolio_value / self.initial_balance) - 1
+                            calmar = total_return / self.max_drawdown
+                            metrics['calmar_ratio'] = calmar
+                except Exception as e:
+                    logger.error(f"Error calculating risk-adjusted ratios: {e}")
+                    logger.exception("Detailed traceback for risk-adjusted ratios error:")
+            
+            # Save metrics for future reference
+            self.risk_metrics = metrics
+            return metrics
             
         except Exception as e:
-            logger.error(f"Error in _calculate_risk_metrics: {str(e)}")
-            # Return safe default values if calculation fails
+            logger.error(f"Error in _calculate_risk_metrics: {e}")
+            # Return basic metrics in case of error
             return {
-                'var': 0.0,
-                'expected_shortfall': 0.0,
-                'volatility': 0.0,
-                'max_drawdown': 0.0,
-                'leverage_utilization': 0.0,
-                'max_concentration': 0.0,
-                'correlation_risk': 0.0,
-                'max_adv_ratio': 0.0,
-                'total_liquidation_cost': 0.0,
-                'max_liquidation_cost': 0.0,
-                'total_exposure': 0.0,
-                'total_pnl': 0.0,
+                'total_exposure': 0,
+                'net_exposure': 0,
+                'gross_leverage': 0,
+                'net_leverage': 0,
                 'portfolio_value': self.balance,
                 'balance': self.balance,
-                'current_drawdown': 0.0,
-                'sharpe_ratio': 0.0,
-                'sortino_ratio': 0.0,
-                'calmar_ratio': 0.0
             }
         
     def _calculate_risk_adjusted_reward(self, total_pnl: float, risk_metrics: Dict) -> float:
@@ -984,22 +1143,24 @@ class InstitutionalPerpetualEnv(gym.Env):
             # CRITICAL FIX: Add sanity checks for unrealistic returns
             if abs(portfolio_return) > 0.1:  # >10% return in a single step is suspicious
                 if abs(portfolio_return) > 0.5:  # >50% return is extremely unrealistic
-                    # logger.warning(f"Highly unrealistic return detected: {portfolio_return:.2%}, applying severe penalty")
                     # Apply very severe penalty for extremely unrealistic returns
                     if portfolio_return > 0:
                         portfolio_return = 0.05  # Cap positive return at 5%
                     else:
                         portfolio_return = -0.05  # Cap negative return at -5%
                 else:
-                    # logger.warning(f"Unrealistic return detected: {portfolio_return:.2%}, applying penalty")
                     # Apply moderate penalty for unrealistic returns
                     if portfolio_return > 0:
                         portfolio_return = 0.1  # Cap positive return at 10%
                     else:
                         portfolio_return = -0.1  # Cap negative return at -10%
             
-            # CRITICAL FIX: Scale returns more reasonably for learning signal
-            base_reward = portfolio_return * 5.0  # Scale returns but less aggressively
+            # IMPROVED: Scale returns differently - increase reward for positive returns
+            # and decrease penalty for negative returns to encourage more trading
+            if portfolio_return > 0:
+                base_reward = portfolio_return * 6.0  # Increased multiplier for positive returns
+            else:
+                base_reward = portfolio_return * 4.0  # Reduced multiplier for negative returns
             
             # Risk-adjusted components
             sharpe = risk_metrics.get('sharpe_ratio', 0)
@@ -1011,8 +1172,8 @@ class InstitutionalPerpetualEnv(gym.Env):
             sortino = np.clip(sortino, -5, 5)
             calmar = np.clip(calmar, -5, 5)
             
-            # Combine risk-adjusted metrics with less weight
-            risk_reward = (sharpe + sortino + calmar) / 3.0 * 0.5  # Reduced weight for risk metrics
+            # IMPROVED: Give more weight to risk-adjusted metrics
+            risk_reward = (sharpe + sortino + calmar) / 3.0 * 0.7  # Increased weight from 0.5 to 0.7
             
             # CRITICAL FIX: Penalize excessive risk more aggressively
             leverage_penalty = 0.0
@@ -1032,36 +1193,39 @@ class InstitutionalPerpetualEnv(gym.Env):
                 concentration_ratio = current_concentration / max_concentration
                 concentration_penalty = (concentration_ratio - 0.5) * 3.0  # Stronger concentration penalty
             
-            # CRITICAL FIX: Add drawdown penalty
+            # IMPROVED: Reduce drawdown penalty
             max_drawdown = abs(risk_metrics.get('max_drawdown', 0))
-            drawdown_penalty = min(max_drawdown * 10.0, 2.0)  # Cap at 2.0
+            drawdown_penalty = min(max_drawdown * 8.0, 1.5)  # Reduced from 10.0 to 8.0, cap at 1.5 instead of 2.0
             
-            # CRITICAL FIX: Add trading activity incentive - encourage moderate trading 
+            # IMPROVED: Strengthen trading activity incentive
             trade_count = len([t for t in self.trades if t['timestamp'] == self.current_step])
             trading_incentive = 0.0
-            if 0 < trade_count <= 5:  # Reward moderate trading (1-5 trades per step)
-                trading_incentive = 0.02 * trade_count
+            if trade_count == 0:
+                # New penalty for no trading to encourage activity
+                trading_incentive = -0.02
+            elif 0 < trade_count <= 5:  # Reward moderate trading (1-5 trades per step)
+                trading_incentive = 0.03 * trade_count  # Increased from 0.02
             elif trade_count > 5:  # Penalize excessive trading
-                trading_incentive = 0.06 - (trade_count - 5) * 0.02  # Starts at 0.06 and decreases
+                trading_incentive = 0.09 - (trade_count - 5) * 0.015  # Starts at 0.09 (increased) and decreases more slowly
             
-            # CRITICAL FIX: Penalize negative balance more severely
+            # IMPROVED: Balance penalty for negative balance
             balance_penalty = 0.0
             if self.balance < 0:
-                balance_penalty = 3.0
+                balance_penalty = 2.5  # Reduced from 3.0
             elif self.balance < self.initial_balance * 0.5:
-                balance_penalty = 1.0  # Penalty for losing more than 50% of initial capital
+                balance_penalty = 0.8  # Reduced from 1.0
+                
+            # IMPROVED: Add bonus for maintaining balance above initial
+            balance_bonus = 0.0
+            if portfolio_value > self.initial_balance * 1.05:  # 5% above initial
+                # Add increasing bonus for better performance, capped at 0.5
+                balance_bonus = min((portfolio_value / self.initial_balance - 1) * 2, 0.5)
                 
             # Combine all components
-            reward = base_reward + risk_reward + trading_incentive - leverage_penalty - concentration_penalty - drawdown_penalty - balance_penalty
+            reward = base_reward + risk_reward + trading_incentive + balance_bonus - leverage_penalty - concentration_penalty - drawdown_penalty - balance_penalty
             
             # Bound the reward to prevent extreme values
             reward = np.clip(reward, -10.0, 10.0)
-            
-            # if self.verbose:
-            #     logger.info(f"Reward components: return={portfolio_return:.4f}, risk={risk_reward:.4f}, "
-            #              f"trade_incentive={trading_incentive:.4f}, leverage_penalty={leverage_penalty:.4f}, "
-            #              f"concentration_penalty={concentration_penalty:.4f}, drawdown_penalty={drawdown_penalty:.4f}, "
-            #              f"balance_penalty={balance_penalty:.4f}, final_reward={reward:.4f}")
             
             return float(reward)
             
@@ -1112,6 +1276,11 @@ class InstitutionalPerpetualEnv(gym.Env):
                 logger.info("Episode done: Reached end of data")
                 return True
             
+            # Check if liquidation has occurred
+            if self.liquidated:
+                logger.info("Episode done: Account liquidated due to insufficient margin")
+                return True
+            
             # Calculate current risk metrics
             risk_metrics = self._calculate_risk_metrics()
             
@@ -1119,45 +1288,32 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Allow for negative values but terminate on severe depletion
             severe_depletion_threshold = -self.initial_balance * self.max_drawdown
             if risk_metrics['portfolio_value'] <= severe_depletion_threshold:
-                # logger.info(f"Episode done: Account severely depleted (${risk_metrics['portfolio_value']:.2f}, threshold: ${severe_depletion_threshold:.2f})")
+                logger.info(f"Episode done: Account severely depleted (${risk_metrics['portfolio_value']:.2f}, threshold: ${severe_depletion_threshold:.2f})")
+                return True
+                
+            # Check max drawdown exceeded
+            if 'current_drawdown' in risk_metrics and risk_metrics['current_drawdown'] > self.max_drawdown:
+                logger.info(f"Episode done: Max drawdown exceeded ({risk_metrics['current_drawdown']:.2%} > {self.max_drawdown:.2%})")
                 return True
             
-            # Check max steps per episode (100 steps is good for 100k total timesteps)
-            # This ensures we get approximately 1000 episodes with 100k training steps
-            # if self.current_step - self.start_step >= 10:
-                # logger.debug("Episode done: Reached max steps per episode (100)")
-                # return True
+            # Check for risk limit violations
+            if self.risk_engine:
+                # Check VaR limit
+                if 'var' in risk_metrics and risk_metrics['var'] > self.risk_engine.risk_limits.var_limit:
+                    logger.info(f"Episode done: VaR limit exceeded ({risk_metrics['var']:.2%} > {self.risk_engine.risk_limits.var_limit:.2%})")
+                    return True
+                
+                # Check for extended leverage violation
+                if 'leverage_utilization' in risk_metrics and risk_metrics['leverage_utilization'] > self.max_leverage * 1.1:
+                    logger.info(f"Episode done: Leverage limit exceeded ({risk_metrics['leverage_utilization']:.2f}x > {self.max_leverage * 1.1:.2f}x)")
+                    return True
             
-            # Check risk limits using risk engine - but don't terminate on every violation
-            try:
-                is_within_limits, violations = self.risk_engine.check_risk_limits(risk_metrics)
-                if not is_within_limits:
-                    # Only terminate on extremely serious violations
-                    serious_violation = False
-                    
-                    for violation in violations:
-                        if "bankruptcy" in violation.lower():
-                            serious_violation = True
-                            break
-                        if "max_drawdown" in violation.lower() and risk_metrics.get('current_drawdown', 0) > 0.95:
-                            serious_violation = True
-                            break
-                    
-                    if serious_violation:
-                        logger.info(f"Episode done: Serious risk limit violations - {', '.join(violations)}")
-                        return True
-            except Exception as e:
-                logger.error(f"Error checking risk limits: {str(e)}")
-                # Continue if risk check fails
-                pass
-            
-            # CRITICAL FIX: Don't terminate episode prematurely - let it run the full length
+            # Continue the episode
             return False
             
         except Exception as e:
             logger.error(f"Error in _is_done: {str(e)}")
-            # Return True to safely terminate if we can't determine state
-            return True
+            return True  # Terminate on error
 
     def update_parameters(self, **kwargs):
         """Update environment parameters for curriculum learning"""
@@ -1186,6 +1342,9 @@ class InstitutionalPerpetualEnv(gym.Env):
     def _execute_trade(self, asset_idx: int, signal: float, price: float) -> float:
         """Execute a trade for a single asset and return the PnL"""
         try:
+            # Initialize target_leverage at the beginning to ensure it's always defined
+            target_leverage = max(abs(signal) * self.max_leverage, 1.0)
+            
             asset = self.assets[asset_idx]
             old_position = self.positions[asset]['size']
             old_entry_price = self.positions[asset]['entry_price']
@@ -1195,8 +1354,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             
             # CRITICAL FIX: Add realistic position sizing constraints
             # Convert signal [-1, 1] to target leverage
-            # Use a reasonable minimum leverage to ensure trades happen
-            target_leverage = max(abs(signal) * self.max_leverage, 0.1)
+            # Use minimum leverage of 1.0x to comply with DEX requirements
             
             # Determine direction (-1 or 1) from signal
             direction = np.sign(signal)
@@ -1213,20 +1371,37 @@ class InstitutionalPerpetualEnv(gym.Env):
             target_value = portfolio_value * target_leverage * direction
             if abs(target_value) > max_position_value:
                 target_value = max_position_value * direction
-                
+            
             # Convert to target position size
             target_size = target_value / price if price > 0 else 0
             
             # CRITICAL FIX: Add asset-specific position limits
+            # Calculate max asset value based on portfolio size and leverage
+            max_asset_value = min(portfolio_value * self.max_leverage, 2000000)  # Cap at $2M for safety
+            
+            # Calculate max units for each asset based on its price
+            # More liquid assets can have larger positions
             max_asset_units = {
-                'BTCUSDT': 10,      # Max ~$400k per BTC
-                'ETHUSDT': 100,     # Max ~$200k per ETH 
-                'SOLUSDT': 500,     # Max ~$100k per SOL
-            }.get(asset, 1000)      # Default limit
+                'BTCUSDT': max_asset_value / price * 0.8,  # 80% of max for BTC (most liquid)
+                'ETHUSDT': max_asset_value / price * 0.7,  # 70% of max for ETH 
+                'SOLUSDT': max_asset_value / price * 0.5,  # 50% of max for SOL (less liquid)
+            }.get(asset, max_asset_value / price * 0.3)  # Default 30% for other assets
+            
+            # Additional hard cap based on standard lot sizes for each asset
+            # This prevents unrealistically large positions in any asset
+            hard_caps = {
+                'BTCUSDT': 100,      # Hard cap of 100 BTC 
+                'ETHUSDT': 1000,     # Hard cap of 1000 ETH
+                'SOLUSDT': 5000,     # Hard cap of 5000 SOL
+            }.get(asset, 10000)      # Default cap for other assets
+            
+            # Use the smaller of the two limits
+            max_asset_units = min(max_asset_units, hard_caps)
             
             if abs(target_size) > max_asset_units:
-                target_size = max_asset_units * direction
-                
+                logger.debug(f"Capping target {asset} size from {target_size:.2f} to {max_asset_units * np.sign(target_size):.2f} units")
+                target_size = max_asset_units * np.sign(target_size)
+            
             # Calculate size difference
             size_diff = target_size - old_position
             
@@ -1296,6 +1471,33 @@ class InstitutionalPerpetualEnv(gym.Env):
             self.positions[asset]['size'] = position_size
             self.positions[asset]['entry_price'] = entry_price
             
+            # Calculate leverage properly based on total position size and portfolio
+            # FIXED: Use total position size (after trade) for leverage calculation, not just size_diff
+            total_position_value = abs(position_size * price)
+            
+            # INDUSTRY-LEVEL FIX: Properly handle leverage for DEX-style trading
+            if abs(position_size) > 1e-8:  # Only for non-zero positions
+                # Get the target leverage from the stored value during signal processing
+                target_leverage = self.positions[asset].get('target_leverage', 0.0)
+                
+                # For new positions or when adding to position, use the target leverage
+                if old_position == 0 or (np.sign(old_position) == np.sign(size_diff)):
+                    # When opening or increasing position, use the target leverage
+                    self.positions[asset]['leverage'] = max(target_leverage, 1.0)  # Minimum 1.0x for DEX
+                
+                # For existing positions being reduced, keep the existing leverage
+                # This maintains the leverage when taking partial profits
+                
+                # Ensure leverage is capped at max_leverage
+                self.positions[asset]['leverage'] = min(self.positions[asset]['leverage'], self.max_leverage)
+                
+                # Use the position's leverage for reporting
+                actual_leverage = self.positions[asset]['leverage']
+            else:
+                # Zero position has zero leverage
+                self.positions[asset]['leverage'] = 0.0
+                actual_leverage = 0.0
+            
             # Add trade to history
             self.trades.append({
                 'timestamp': self.current_step,
@@ -1303,19 +1505,22 @@ class InstitutionalPerpetualEnv(gym.Env):
                 'size': size_diff,
                 'price': price,
                 'cost': total_cost,
-                'realized_pnl': pnl  # CRITICAL FIX: Change 'pnl' to 'realized_pnl' for consistency
+                'realized_pnl': pnl,  # CRITICAL FIX: Change 'pnl' to 'realized_pnl' for consistency
+                'leverage': actual_leverage  # Use the calculated actual leverage
             })
             
-            # if self.verbose:
-                # logger.info(f"Trade executed: {asset} {size_diff:.6f} @ {price:.2f}, Cost: {total_cost:.2f}, PnL: {pnl:.2f}")
+            # Add leverage information to logging
+            if self.verbose:
+                logger.info(f"Trade executed: {asset} {size_diff:.6f} @ {price:.2f}, " +
+                           f"Cost: {total_cost:.2f}, PnL: {pnl:.2f}, Leverage: {actual_leverage:.2f}x")
             
             return pnl
             
         except Exception as e:
-            logger.error(f"Error executing trade: {str(e)}")
+            logger.error(f"Error executing trade for asset idx {asset_idx}: {str(e)}")
+            import traceback
             traceback.print_exc()
-            # IMPORTANT FIX: Return a small negative value instead of 0 to indicate error
-            return -0.1
+            return 0.0  # Return no PnL on error
 
     def _get_mark_price(self, asset: str) -> float:
         """Get current mark price for an asset"""
@@ -1364,6 +1569,8 @@ class InstitutionalPerpetualEnv(gym.Env):
             'step': self.current_step,
             'portfolio_value': self._calculate_portfolio_value(),
             'balance': self.balance,
+            'gross_leverage': risk_metrics.get('gross_leverage', 0),  # Add gross leverage (always positive)
+            'net_leverage': risk_metrics.get('net_leverage', 0),      # Add net leverage (can be negative for shorts)
             'positions': {asset: {'size': pos['size'], 'entry_price': pos['entry_price']} 
                           for asset, pos in self.positions.items()},
             'total_trades': len(self.trades),
@@ -1487,15 +1694,17 @@ class InstitutionalPerpetualEnv(gym.Env):
     def _update_history(self):
         """Update portfolio history"""
         try:
-            current_value = self.balance
-            total_exposure = 0
+            # CRITICAL FIX: Use the actual portfolio value calculation method
+            # which correctly handles both long and short positions
+            current_value = self._calculate_portfolio_value()
             
-            # Calculate current portfolio value and exposure
+            # Calculate total exposure (this is still needed for leverage)
+            total_exposure = 0
             for asset, position in self.positions.items():
                 mark_price = self._get_mark_price(asset)
-                position_value = position['size'] * mark_price
-                current_value += position_value
-                total_exposure += abs(position_value)  # Use absolute value for exposure
+                # Use absolute value for exposure calculation
+                position_value = abs(position['size'] * mark_price)
+                total_exposure += position_value
             
             # Safety check for portfolio value
             if current_value <= 0:
@@ -1504,7 +1713,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                 current_drawdown = 1  # Maximum drawdown
             else:
                 # Calculate current leverage with bounds
-                current_leverage = min(total_exposure / current_value, self.max_leverage * 1.1)
+                current_leverage = min(total_exposure / current_value, self.max_leverage)
                 
                 # Update peak value if current value is higher
                 if current_value > self.peak_value:
@@ -1570,9 +1779,11 @@ class InstitutionalPerpetualEnv(gym.Env):
                     for asset, pos in self.positions.items():
                         if abs(pos['size']) > 1e-8:
                             mark_price = self._get_mark_price(asset)
+                            unrealized_pnl = pos['size'] * (mark_price - pos['entry_price'])
                             position_details.append(
-                                f"{asset}: size={pos['size']:.4f}, value={pos['size']*mark_price:.2f}, "
-                                f"entry={pos['entry_price']:.2f}, current={mark_price:.2f}"
+                                f"{asset}: size={pos['size']:.4f}, value={abs(pos['size']*mark_price):.2f}, "
+                                f"entry={pos['entry_price']:.2f}, current={mark_price:.2f}, "
+                                f"pnl={unrealized_pnl:.2f}"
                             )
                     logger.debug(f"  Position Details: {', '.join(position_details)}")
             
@@ -1732,13 +1943,13 @@ class InstitutionalPerpetualEnv(gym.Env):
     def set_position_holding_bonus(self, bonus_factor=0.02):
         """Set the multiplier for position holding time bonuses"""
         self.position_holding_bonus_factor = float(bonus_factor)
-        # logger.info(f"Position holding bonus factor set to {self.position_holding_bonus_factor}")
+        logger.info(f"Position holding bonus factor set to {self.position_holding_bonus_factor}")
         return self.position_holding_bonus_factor
     
     def set_uncertainty_scaling(self, scaling_factor=1.0):
         """Set the scaling factor for uncertainty-based position sizing"""
         self.uncertainty_scaling_factor = float(scaling_factor)
-        # logger.info(f"Uncertainty scaling factor set to {self.uncertainty_scaling_factor}")
+        logger.info(f"Uncertainty scaling factor set to {self.uncertainty_scaling_factor}")
         return self.uncertainty_scaling_factor
     
     def _calculate_holding_time_reward(self) -> float:
