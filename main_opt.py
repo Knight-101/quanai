@@ -237,6 +237,194 @@ class ResNetFeatureExtractor(BaseFeaturesExtractor):
         
         return transformed_features
 
+class TransformerFeatureExtractor(BaseFeaturesExtractor):
+    """
+    Transformer-based feature extractor for time series data.
+    This architecture is specifically designed to capture long-range dependencies 
+    and temporal patterns in market data.
+    """
+    def __init__(self, observation_space, features_dim=128, dropout_rate=0.1, 
+                 d_model=64, nhead=4, num_layers=2, use_layer_norm=True):
+        super().__init__(observation_space, features_dim)
+        
+        # Get input dimension from observation space
+        n_input_features = int(np.prod(observation_space.shape))
+        
+        # Save parameters
+        self.dropout_rate = dropout_rate
+        self.use_layer_norm = use_layer_norm
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        
+        # Input embedding layer
+        self.input_embedding = nn.Sequential(
+            nn.Linear(n_input_features, d_model),
+            nn.LayerNorm(d_model) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Transformer encoder layer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model*4,
+            dropout=dropout_rate,
+            activation='gelu',
+            batch_first=True
+        )
+        
+        # Transformer encoder
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+        
+        # Output projection
+        self.output_projection = nn.Sequential(
+            nn.Linear(d_model, features_dim),
+            nn.LayerNorm(features_dim) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # Uncertainty head for risk estimation
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(d_model, 32),
+            nn.LayerNorm(32) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, observations):
+        # Input embedding
+        x = self.input_embedding(observations)
+        
+        # Reshape for transformer (batch_size, sequence_length=1, d_model)
+        # For now, we treat each observation as a sequence of length 1
+        x = x.unsqueeze(1)
+        
+        # Apply transformer encoder
+        transformer_output = self.transformer_encoder(x)
+        
+        # Extract output and squeeze sequence dimension
+        transformer_output = transformer_output.squeeze(1)
+        
+        # Calculate uncertainty estimate
+        uncertainty = self.uncertainty_head(transformer_output)
+        self._last_uncertainty = uncertainty
+        
+        # Output projection
+        features = self.output_projection(transformer_output)
+        
+        return features
+
+class HybridFeatureExtractor(BaseFeaturesExtractor):
+    """
+    Hybrid architecture combining ResNet and Transformer approaches.
+    This architecture leverages both the pattern recognition capabilities of ResNets
+    and the temporal dependency modeling of Transformers.
+    """
+    def __init__(self, observation_space, features_dim=128, dropout_rate=0.1,
+                d_model=64, nhead=4, transformer_layers=2, use_layer_norm=True):
+        super().__init__(observation_space, features_dim)
+        
+        # Get input dimension from observation space
+        n_input_features = int(np.prod(observation_space.shape))
+        
+        # Save parameters
+        self.dropout_rate = dropout_rate
+        self.use_layer_norm = use_layer_norm
+        
+        # First stage: ResNet-style processing
+        self.input_layer = nn.Sequential(
+            nn.Linear(n_input_features, 256),
+            nn.LayerNorm(256) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Residual blocks
+        self.res_block1 = self._make_res_block(256, 256)
+        self.res_block2 = self._make_res_block(256, 256)
+        
+        # Intermediate projection to d_model for transformer
+        self.intermediate_projection = nn.Sequential(
+            nn.Linear(256, d_model),
+            nn.LayerNorm(d_model) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # Second stage: Transformer processing
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model*4,
+            dropout=dropout_rate,
+            activation='gelu',
+            batch_first=True
+        )
+        
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=transformer_layers
+        )
+        
+        # Final output projection
+        self.output_projection = nn.Sequential(
+            nn.Linear(d_model, features_dim),
+            nn.LayerNorm(features_dim) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # Uncertainty head for risk estimation
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(d_model, 32),
+            nn.LayerNorm(32) if use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+    
+    def _make_res_block(self, in_features, out_features):
+        """Create a residual block with the same input/output dimension"""
+        return nn.Sequential(
+            nn.Linear(in_features, out_features),
+            nn.LayerNorm(out_features) if self.use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(out_features, out_features),
+            nn.LayerNorm(out_features) if self.use_layer_norm else nn.Identity(),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(self.dropout_rate)
+        )
+    
+    def forward(self, observations):
+        # First stage: ResNet processing
+        x = self.input_layer(observations)
+        res1 = x + self.res_block1(x)
+        res2 = res1 + self.res_block2(res1)
+        
+        # Project to transformer dimension
+        transformer_input = self.intermediate_projection(res2)
+        
+        # Reshape for transformer (batch_size, sequence_length=1, d_model)
+        transformer_input = transformer_input.unsqueeze(1)
+        
+        # Second stage: Transformer processing
+        transformer_output = self.transformer_encoder(transformer_input)
+        transformer_output = transformer_output.squeeze(1)
+        
+        # Calculate uncertainty
+        uncertainty = self.uncertainty_head(transformer_output)
+        self._last_uncertainty = uncertainty
+        
+        # Final output projection
+        features = self.output_projection(transformer_output)
+        
+        return features
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Institutional Perpetual Trading AI')
     parser.add_argument('--assets', nargs='+', default=['BTC/USD:USD', 'ETH/USD:USD', 'SOL/USD:USD'],
@@ -563,11 +751,14 @@ class TradingSystem:
                 eps=1e-5,
                 weight_decay=1e-5
             ),
-            "features_extractor_class": ResNetFeatureExtractor,  # Use ResNetFeatureExtractor
+            "features_extractor_class": HybridFeatureExtractor,  # Use HybridFeatureExtractor
             "features_extractor_kwargs": {
                 "features_dim": 256,           # Optimized features dimension
                 "dropout_rate": 0.088,         # Optimized dropout rate
-                "use_layer_norm": True
+                "use_layer_norm": True,
+                "d_model": 64,
+                "nhead": 4,
+                "transformer_layers": 2
             }
         }
         
@@ -750,19 +941,23 @@ class TradingSystem:
             target_kl = trial.suggest_float('target_kl', 0.01, 0.1)  # KL divergence target
             
             # Network architecture hyperparameters
-            pi_1 = trial.suggest_categorical('pi_1', [128, 256, 512])  # Policy network first layer
-            pi_2 = trial.suggest_categorical('pi_2', [64, 128, 256])   # Policy network second layer
-            vf_1 = trial.suggest_categorical('vf_1', [128, 256, 512])  # Value network first layer
-            vf_2 = trial.suggest_categorical('vf_2', [64, 128, 256])   # Value network second layer
+            pi_1 = trial.suggest_categorical('pi_1', [128, 256, 512])
+            pi_2 = trial.suggest_categorical('pi_2', [64, 128, 256])
+            vf_1 = trial.suggest_categorical('vf_1', [128, 256, 512])
+            vf_2 = trial.suggest_categorical('vf_2', [64, 128, 256])
             
-            # Features extractor hyperparameters
+            # Feature extractor hyperparameters
             features_dim = trial.suggest_categorical('features_dim', [64, 128, 256])
             dropout_rate = trial.suggest_float('dropout_rate', 0.05, 0.3)
             
-            # ENHANCED: Market regime-aware parameters
-            regime_aware = trial.suggest_categorical('regime_aware', [True, False])
-            position_holding_bonus = trial.suggest_float('position_holding_bonus', 0.01, 0.1) if regime_aware else 0.02
-            uncertainty_scaling = trial.suggest_float('uncertainty_scaling', 0.5, 2.0) if regime_aware else 1.0
+            # NEW: Transformer architecture hyperparameters
+            d_model = trial.suggest_categorical('d_model', [32, 64, 128])
+            nhead = trial.suggest_categorical('nhead', [2, 4, 8])
+            transformer_layers = trial.suggest_int('transformer_layers', 1, 3)
+            
+            # Environment-specific hyperparameters
+            uncertainty_scaling = trial.suggest_float('uncertainty_scaling', 0.5, 2.0)
+            position_holding_bonus = trial.suggest_float('position_holding_bonus', 0.01, 0.1)
             
             # Log sampled hyperparameters
             logger.info(f"║ Hyperparameters:                                                  ║")
@@ -784,7 +979,7 @@ class TradingSystem:
             logger.info(f"║   - vf_network: [{vf_1}, {vf_2}]                                        ║")
             logger.info(f"║   - features_dim: {features_dim:<58} ║")
             logger.info(f"║   - dropout_rate: {dropout_rate:<56} ║")
-            logger.info(f"║   - regime_aware: {regime_aware:<54} ║")
+            logger.info(f"║   - regime_aware: {uncertainty_scaling:<54} ║")
             logger.info(f"║   - position_holding_bonus: {position_holding_bonus:<48} ║")
             logger.info(f"║   - uncertainty_scaling: {uncertainty_scaling:<46} ║")
             logger.info(f"╚{'═' * 80}╝\n")
@@ -804,7 +999,7 @@ class TradingSystem:
                 policy_kwargs = {
                     "net_arch": net_arch,
                     "activation_fn": nn.ReLU,
-                    "features_extractor_class": ResNetFeatureExtractor,
+                    "features_extractor_class": HybridFeatureExtractor,
                     "features_extractor_kwargs": {"features_dim": features_dim, "dropout_rate": dropout_rate, "use_layer_norm": True}
                 }
                 
@@ -1388,11 +1583,14 @@ class TradingSystem:
             policy_kwargs = {
                 "net_arch": net_arch,
                 "activation_fn": nn.LeakyReLU,
-                "features_extractor_class": ResNetFeatureExtractor,
+                "features_extractor_class": HybridFeatureExtractor,
                 "features_extractor_kwargs": {
                     "features_dim": best_params.get("features_dim", 128),
                     "dropout_rate": best_params.get("dropout_rate", 0.15),
-                    "use_layer_norm": True
+                    "use_layer_norm": True,
+                    "d_model": best_params.get("d_model", 64),
+                    "nhead": best_params.get("nhead", 4),
+                    "transformer_layers": best_params.get("transformer_layers", 2)
                 }
             }
             

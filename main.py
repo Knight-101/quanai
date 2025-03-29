@@ -282,15 +282,20 @@ class TradingSystem:
         
     def _create_environment(self, data: pd.DataFrame) -> InstitutionalPerpetualEnv:
         """Consolidated environment creation"""
+        # Extract the assets list from the data
+        assets = list(data.columns.get_level_values('asset').unique())
+        
         env = InstitutionalPerpetualEnv(
             df=data,
+            assets=assets,  # Added assets parameter which is required
             initial_balance=self.config['trading']['initial_balance'],
             max_leverage=self.config['trading']['max_leverage'],
-            transaction_fee=self.config['trading']['transaction_fee'],
+            commission=self.config['trading']['transaction_fee'],  # Changed from transaction_fee to commission
             funding_fee_multiplier=self.config['trading']['funding_fee_multiplier'],
             risk_free_rate=self.config['trading']['risk_free_rate'],
             max_drawdown=self.config['risk_management']['limits']['max_drawdown'],
-            window_size=self.config['model']['window_size']
+            window_size=self.config['model']['window_size'],
+            verbose=True  # Enable verbose logging
         )
         
         # Wrap environment
