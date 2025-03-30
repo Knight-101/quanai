@@ -1076,7 +1076,7 @@ class InstitutionalRiskEngine:
         correlation_data = None
         
         # Debug logging to diagnose issues
-        logger.warning(f"DEBUG: get_max_position_size called for {asset} with portfolio_value=${portfolio_value:.2f}, price=${price:.2f}")
+        # logger.warning(f"DEBUG: get_max_position_size called for {asset} with portfolio_value=${portfolio_value:.2f}, price=${price:.2f}")
         
         # If we have positions and market data, calculate correlation-based limits
         if positions is not None and market_data is not None:

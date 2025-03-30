@@ -99,7 +99,7 @@ while [ $current_steps -lt $TOTAL_TARGET_STEPS ]; then
     if [ $phase -eq 2 ]; then
         next_increment=100000  # Same as initial
     elif [ $phase -eq 3 ]; then
-        next_increment=100000  # Same as previous for phase 3
+        next_increment=200000  # Same as previous for phase 3
     elif [ $phase -eq 4 ]; then
         next_increment=200000  # Double for phase 4
     elif [ $phase -eq 5 ]; then

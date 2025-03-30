@@ -25,7 +25,7 @@ trading:
   funding_rate:
     multiplier: 0.8
     max_funding_rate: 0.01
-  transaction_fee: 0.0004
+  commission: 0.0004  # Renamed from transaction_fee for consistency
   funding_fee_multiplier: 1.0
   risk_free_rate: 0.02  # Added annual risk-free rate (2%)
 

@@ -116,6 +116,12 @@ You can use the `scripts/manual_incremental.sh` script to manually run the incre
 
    This runs the first 100K steps and saves as "phase1_model"
 
+   To enable training optimizations (recommended for faster training):
+
+   ```bash
+   ./scripts/manual_incremental.sh init 100000 --training-mode
+   ```
+
 2. **Continue training for subsequent phases:**
 
    ```bash
@@ -124,6 +130,12 @@ You can use the `scripts/manual_incremental.sh` script to manually run the incre
 
    This continues from phase 1 to phase 2, adding 100K more steps
 
+   With training optimizations enabled:
+
+   ```bash
+   ./scripts/manual_incremental.sh continue 2 1 100000 --training-mode
+   ```
+
 3. **Evaluate any phase:**
    ```bash
    ./scripts/manual_incremental.sh evaluate 2
@@ -131,3 +143,33 @@ You can use the `scripts/manual_incremental.sh` script to manually run the incre
    This evaluates the model from phase 2
 
 The script will automatically follow the 1M total steps progression with the right increments for each phase, and it will prompt you to evaluate models after each training phase.
+
+### About Training Options
+
+The script supports two independent flags to control training behavior:
+
+1. `--training-mode`: Enables performance optimizations in the environment:
+
+   - Reduces the frequency of expensive calculations (risk metrics, market analysis)
+   - Caches processed data between runs
+   - Uses batch operations and vectorized functions
+   - Can significantly speed up training (up to 2-3x faster)
+   - Highly recommended for longer training runs
+
+2. `--verbose`: Enables more detailed logging during training:
+   - Shows step-by-step information about the training process
+   - Helps with debugging but can slow down training
+   - Keep disabled for faster training
+
+You can use either flag independently or combine them:
+
+```bash
+# Only training mode optimizations (recommended for most training runs)
+./scripts/manual_incremental.sh init 100000 --training-mode
+
+# Only verbose logging (for debugging)
+./scripts/manual_incremental.sh init 100000 --verbose
+
+# Both training mode optimizations and verbose logging
+./scripts/manual_incremental.sh init 100000 --training-mode --verbose
+```

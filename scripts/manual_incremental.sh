@@ -8,6 +8,7 @@ set -e  # Exit on errors
 MODEL_BASE_DIR="models/manual"
 LOG_BASE_DIR="logs/manual"
 ENABLE_LOGGING=false  # Set to true to redirect output to log files
+HYPERPARAMS=""  # Initialize empty hyperparams string
 
 # Create directories
 mkdir -p "$MODEL_BASE_DIR"
@@ -25,34 +26,46 @@ show_help() {
     echo ""
     echo "USAGE:"
     echo "  $0 [--log] init 100000                # Initial training for 100K steps"
+    echo "  $0 [--log] init 100000 --training-mode # Initial training with optimizations"
     echo "  $0 [--log] continue 2 1 100000        # Continue from phase 1 to phase 2 with 100K steps"
     echo "  $0 [--log] evaluate 2                 # Evaluate model from phase 2"
     echo ""
     echo "OPTIONS:"
     echo "  --log                          - Redirect output to log files (may hide progress bars)"
+    echo "  --verbose                      - Enable verbose output (more detailed logging)"
+    echo "  --training-mode                - Enable training optimizations for faster speed"
+    echo "  --hyperparams 'param1=value1,param2=value2' - Override hyperparameters for this training phase"
     echo ""
     echo "COMMANDS:"
-    echo "  init STEPS                     - Start initial training phase"
-    echo "  continue NEW_PHASE PREV_PHASE STEPS - Continue training from previous phase"
+    echo "  init STEPS [--verbose] [--training-mode] - Start initial training phase"
+    echo "  continue NEW_PHASE PREV_PHASE STEPS [--verbose] [--training-mode] - Continue training from previous phase"
     echo "  evaluate PHASE                 - Evaluate a model from a specific phase"
     echo "  help                           - Show this help message"
     echo ""
     echo "EXAMPLES:"
     echo "  # Complete 1M steps in phases:"
-    echo "  $0 init 100000                 # Phase 1: 100K"
-    echo "  $0 continue 2 1 100000         # Phase 2: +100K (total: 200K)"
-    echo "  $0 continue 3 2 100000         # Phase 3: +100K (total: 300K)"
-    echo "  $0 continue 4 3 200000         # Phase 4: +200K (total: 500K)"
-    echo "  $0 continue 5 4 300000         # Phase 5: +300K (total: 800K)"
-    echo "  $0 continue 6 5 200000         # Phase 6: +200K (total: 1M)"
+    echo "  $0 init 100000 --training-mode # Phase 1: 100K with performance optimizations"
+    echo "  $0 continue 2 1 100000 --training-mode # Phase 2: +100K (total: 200K) with optimizations"
+    echo "  $0 continue 3 2 100000 --training-mode # Phase 3: +100K (total: 300K) with optimizations"
+    echo "  $0 continue 4 3 200000 --training-mode # Phase 4: +200K (total: 500K) with optimizations"
+    echo "  $0 continue 5 4 300000 --training-mode # Phase 5: +300K (total: 800K) with optimizations"
+    echo "  $0 continue 6 5 200000 --training-mode # Phase 6: +200K (total: 1M) with optimizations"
 }
 
 # Function to run initial training
 run_initial_training() {
     local steps=$1
+    local verbose=$2
+    local training_mode=$3
     
     echo "===================================================================="
     echo "  STARTING INITIAL TRAINING (PHASE 1) WITH $steps STEPS"
+    if [ "$training_mode" = true ]; then
+        echo "  WITH TRAINING OPTIMIZATIONS ENABLED"
+    fi
+    if [ "$verbose" = true ]; then
+        echo "  WITH VERBOSE LOGGING ENABLED"
+    fi
     echo "===================================================================="
     echo ""
     
@@ -76,13 +89,31 @@ run_initial_training() {
     # Create log directory for this phase
     mkdir -p "$LOG_BASE_DIR/phase1"
     
+    # Build the command
+    COMMAND="python main_opt.py --training-steps $steps --model-dir \"$PHASE_DIR\""
+    
+    # Add verbose flag if requested
+    if [ "$verbose" = true ]; then
+        COMMAND="$COMMAND --verbose"
+    fi
+    
+    # Add training mode flag if requested
+    if [ "$training_mode" = true ]; then
+        COMMAND="$COMMAND --training-mode"
+    fi
+    
+    # Add hyperparams flag if requested
+    if [ -n "$HYPERPARAMS" ]; then
+        COMMAND="$COMMAND --hyperparams \"$HYPERPARAMS\""
+    fi
+    
     # Actual training command
     if [ "$ENABLE_LOGGING" = true ]; then
         echo "Output will be logged to $LOG_BASE_DIR/phase1/training.log"
-        python main_opt.py --training-steps $steps --model-dir "$PHASE_DIR" 2>&1 | tee "$LOG_BASE_DIR/phase1/training.log"
+        eval "$COMMAND 2>&1 | tee \"$LOG_BASE_DIR/phase1/training.log\""
     else
         echo "Showing live progress (not logging to file)..."
-        python main_opt.py --training-steps $steps --model-dir "$PHASE_DIR"
+        eval "$COMMAND"
     fi
     
     # Copy final model to phase1_model for consistency with other phases
@@ -107,12 +138,6 @@ run_initial_training() {
     echo "✅ Initial training complete!"
     echo "Model saved to $PHASE_DIR"
     echo ""
-    
-    # Offer to evaluate
-    read -p "Do you want to evaluate this model now? (y/n): " do_eval
-    if [[ $do_eval == "y" ]]; then
-        evaluate_model 1
-    fi
 }
 
 # Function to continue training
@@ -120,10 +145,18 @@ continue_training() {
     local new_phase=$1
     local prev_phase=$2
     local steps=$3
+    local verbose=$4
+    local training_mode=$5
     
     echo "===================================================================="
     echo "  CONTINUING TRAINING FROM PHASE $prev_phase TO PHASE $new_phase"
     echo "  ADDING $steps ADDITIONAL STEPS"
+    if [ "$training_mode" = true ]; then
+        echo "  WITH TRAINING OPTIMIZATIONS ENABLED"
+    fi
+    if [ "$verbose" = true ]; then
+        echo "  WITH VERBOSE LOGGING ENABLED"
+    fi
     echo "===================================================================="
     echo ""
     
@@ -171,6 +204,33 @@ continue_training() {
     # Create log directory for this phase
     mkdir -p "$LOG_BASE_DIR/phase$new_phase"
     
+    # Calculate global training progress (helpful for proper learning rate scheduling)
+    total_planned_steps=1000000  # Your expected total training across all phases
+    prev_steps_completed=0
+    
+    # Check if recommendations exist from previous phase
+    RECOMMENDATIONS_FILE="$PREV_PHASE_DIR/phase${new_phase}_recommendations.json"
+    if [ -f "$RECOMMENDATIONS_FILE" ] && [ -z "$HYPERPARAMS" ]; then
+        echo "Found parameter recommendations from previous phase"
+        # Extract recommendations using jq (make sure it's installed)
+        if command -v jq &> /dev/null; then
+            RECOMMENDED_LR=$(jq -r '.learning_rate' "$RECOMMENDATIONS_FILE")
+            RECOMMENDED_ENT=$(jq -r '.ent_coef' "$RECOMMENDATIONS_FILE")
+            
+            echo "Recommended learning_rate: $RECOMMENDED_LR"
+            echo "Recommended ent_coef: $RECOMMENDED_ENT"
+            
+            # Ask if user wants to use recommendations
+            read -p "Use recommended parameters? (y/n): " use_recommendations
+            if [[ $use_recommendations == "y" ]]; then
+                HYPERPARAMS="learning_rate=$RECOMMENDED_LR,ent_coef=$RECOMMENDED_ENT"
+                echo "Using recommended parameters: $HYPERPARAMS"
+            fi
+        else
+            echo "jq not found. Install jq for automatic parameter recommendations."
+        fi
+    fi
+    
     # Run continued training
     echo "Continuing training from phase $prev_phase with $steps additional steps..."
     echo "Loading model from: $PREV_MODEL_PATH"
@@ -179,35 +239,35 @@ continue_training() {
     fi
     echo "Saving new model to: $NEW_PHASE_DIR"
     
+    # Build the base command
+    if [ -n "$PREV_ENV_PATH" ]; then
+        COMMAND="python main_opt.py --continue-training --model-path \"$PREV_MODEL_PATH\" --env-path \"$PREV_ENV_PATH\" --additional-steps $steps --model-dir \"$NEW_PHASE_DIR\""
+    else
+        COMMAND="python main_opt.py --continue-training --model-path \"$PREV_MODEL_PATH\" --additional-steps $steps --model-dir \"$NEW_PHASE_DIR\""
+    fi
+    
+    # Add verbose flag if requested
+    if [ "$verbose" = true ]; then
+        COMMAND="$COMMAND --verbose"
+    fi
+    
+    # Add training mode flag if requested
+    if [ "$training_mode" = true ]; then
+        COMMAND="$COMMAND --training-mode"
+    fi
+    
+    # Add hyperparams flag if requested
+    if [ -n "$HYPERPARAMS" ]; then
+        COMMAND="$COMMAND --hyperparams \"$HYPERPARAMS\""
+    fi
+    
     # Actual training command
     if [ "$ENABLE_LOGGING" = true ]; then
         echo "Output will be logged to $LOG_BASE_DIR/phase$new_phase/training.log"
-        if [ -n "$PREV_ENV_PATH" ]; then
-            python main_opt.py --continue-training \
-                --model-path "$PREV_MODEL_PATH" \
-                --env-path "$PREV_ENV_PATH" \
-                --additional-steps $steps \
-                --model-dir "$NEW_PHASE_DIR" 2>&1 | tee "$LOG_BASE_DIR/phase$new_phase/training.log"
-        else
-            python main_opt.py --continue-training \
-                --model-path "$PREV_MODEL_PATH" \
-                --additional-steps $steps \
-                --model-dir "$NEW_PHASE_DIR" 2>&1 | tee "$LOG_BASE_DIR/phase$new_phase/training.log"
-        fi
+        eval "$COMMAND 2>&1 | tee \"$LOG_BASE_DIR/phase$new_phase/training.log\""
     else
         echo "Showing live progress (not logging to file)..."
-        if [ -n "$PREV_ENV_PATH" ]; then
-            python main_opt.py --continue-training \
-                --model-path "$PREV_MODEL_PATH" \
-                --env-path "$PREV_ENV_PATH" \
-                --additional-steps $steps \
-                --model-dir "$NEW_PHASE_DIR"
-        else
-            python main_opt.py --continue-training \
-                --model-path "$PREV_MODEL_PATH" \
-                --additional-steps $steps \
-                --model-dir "$NEW_PHASE_DIR"
-        fi
+        eval "$COMMAND"
     fi
     
     # Determine file extension based on input model
@@ -246,17 +306,11 @@ continue_training() {
     echo "Model saved to $NEW_PHASE_DIR/phase${new_phase}_model$EXT"
     echo ""
     
-    # Offer to evaluate
-    read -p "Do you want to evaluate this model now? (y/n): " do_eval
-    if [[ $do_eval == "y" ]]; then
-        evaluate_model $new_phase
-    fi
-    
     # Show next suggested phase
     next_phase=$((new_phase + 1))
     next_steps=100000
     if [ $new_phase -eq 2 ]; then
-        next_steps=100000
+        next_steps=200000
     elif [ $new_phase -eq 3 ]; then
         next_steps=200000
     elif [ $new_phase -eq 4 ]; then
@@ -267,127 +321,66 @@ continue_training() {
     
     echo ""
     echo "📋 NEXT SUGGESTED COMMAND:"
-    echo "./scripts/manual_incremental.sh continue $next_phase $new_phase $next_steps"
-    echo ""
-}
-
-# Function to evaluate a model
-evaluate_model() {
-    local phase=$1
-    
-    echo "===================================================================="
-    echo "  EVALUATING MODEL FROM PHASE $phase"
-    echo "===================================================================="
-    echo ""
-    
-    # Phase directory
-    PHASE_DIR="$MODEL_BASE_DIR/phase$phase"
-    
-    # Determine model path - check phase-specific model first
-    if [ -f "$PHASE_DIR/phase${phase}_model" ]; then
-        MODEL_PATH="$PHASE_DIR/phase${phase}_model"
-    elif [ -f "$PHASE_DIR/phase${phase}_model.zip" ]; then
-        MODEL_PATH="$PHASE_DIR/phase${phase}_model.zip"
-    elif [ -f "$PHASE_DIR/final_model" ]; then
-        MODEL_PATH="$PHASE_DIR/final_model"
-    elif [ -f "$PHASE_DIR/model" ]; then
-        MODEL_PATH="$PHASE_DIR/model"
-    elif [ -f "$PHASE_DIR/final_model.zip" ]; then
-        MODEL_PATH="$PHASE_DIR/final_model.zip"
-    elif [ -f "$PHASE_DIR/model.zip" ]; then
-        MODEL_PATH="$PHASE_DIR/model.zip"
+    if [ "$training_mode" = true ]; then
+        echo "./scripts/manual_incremental.sh continue $next_phase $new_phase $next_steps --training-mode"
     else
-        echo "❌ ERROR: Model from phase $phase does not exist at $PHASE_DIR"
-        exit 1
+        echo "./scripts/manual_incremental.sh continue $next_phase $new_phase $next_steps"
     fi
-    
-    # Determine environment path - check phase-specific env first
-    ENV_PATH=""
-    if [ -f "$PHASE_DIR/phase${phase}_env.pkl" ]; then
-        ENV_PATH="$PHASE_DIR/phase${phase}_env.pkl"
-    elif [ -f "$PHASE_DIR/final_env.pkl" ]; then
-        ENV_PATH="$PHASE_DIR/final_env.pkl"
-    elif [ -f "$PHASE_DIR/vec_normalize.pkl" ]; then
-        ENV_PATH="$PHASE_DIR/vec_normalize.pkl"
+    if [ "$verbose" = true ]; then
+        echo "To enable verbose logging, add the --verbose flag."
     fi
-    
-    # Create evaluation directory
-    mkdir -p "$LOG_BASE_DIR/eval_phase$phase"
-    
-    # Run evaluation
-    echo "Running evaluation for phase $phase model..."
-    echo "Using model: $MODEL_PATH"
-    if [ -n "$ENV_PATH" ]; then
-        echo "Using environment: $ENV_PATH"
-    fi
-    
-    if [ "$ENABLE_LOGGING" = true ]; then
-        echo "Output will be logged to $LOG_BASE_DIR/eval_phase$phase/eval.log"
-        if [ -n "$ENV_PATH" ]; then
-            python scripts/evaluate_model.py \
-                --model-path "$MODEL_PATH" \
-                --env-path "$ENV_PATH" \
-                --episodes 10 \
-                --phase $phase \
-                --output-dir "$LOG_BASE_DIR/eval_phase$phase" 2>&1 | tee "$LOG_BASE_DIR/eval_phase$phase/eval.log"
-        else
-            python scripts/evaluate_model.py \
-                --model-path "$MODEL_PATH" \
-                --episodes 10 \
-                --phase $phase \
-                --output-dir "$LOG_BASE_DIR/eval_phase$phase" 2>&1 | tee "$LOG_BASE_DIR/eval_phase$phase/eval.log"
-        fi
-    else
-        echo "Showing live progress (not logging to file)..."
-        if [ -n "$ENV_PATH" ]; then
-            python scripts/evaluate_model.py \
-                --model-path "$MODEL_PATH" \
-                --env-path "$ENV_PATH" \
-                --episodes 10 \
-                --phase $phase \
-                --output-dir "$LOG_BASE_DIR/eval_phase$phase"
-        else
-            python scripts/evaluate_model.py \
-                --model-path "$MODEL_PATH" \
-                --episodes 10 \
-                --phase $phase \
-                --output-dir "$LOG_BASE_DIR/eval_phase$phase"
-        fi
-    fi
-    
-    echo ""
-    echo "✅ Evaluation complete!"
-    echo "Results saved to $LOG_BASE_DIR/eval_phase$phase"
     echo ""
 }
 
 # Main command processing
 case "$1" in
     "init")
+        VERBOSE=false
+        TRAINING_MODE=false
+        STEPS=""
+        
         if [ -z "$2" ]; then
             echo "❌ ERROR: Please specify the number of steps for initial training"
             show_help
             exit 1
         fi
-        run_initial_training $2
+        
+        STEPS="$2"
+        
+        # Check for flags
+        for arg in "$@"; do
+            if [ "$arg" = "--verbose" ]; then
+                VERBOSE=true
+            fi
+            if [ "$arg" = "--training-mode" ]; then
+                TRAINING_MODE=true
+            fi
+        done
+        
+        run_initial_training $STEPS $VERBOSE $TRAINING_MODE
         ;;
     
     "continue")
+        VERBOSE=false
+        TRAINING_MODE=false
+        
         if [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
             echo "❌ ERROR: Missing arguments for continue command"
             show_help
             exit 1
         fi
-        continue_training $2 $3 $4
-        ;;
-    
-    "evaluate")
-        if [ -z "$2" ]; then
-            echo "❌ ERROR: Please specify the phase to evaluate"
-            show_help
-            exit 1
-        fi
-        evaluate_model $2
+        
+        # Check for flags
+        for arg in "$@"; do
+            if [ "$arg" = "--verbose" ]; then
+                VERBOSE=true
+            fi
+            if [ "$arg" = "--training-mode" ]; then
+                TRAINING_MODE=true
+            fi
+        done
+        
+        continue_training $2 $3 $4 $VERBOSE $TRAINING_MODE
         ;;
     
     "help" | "-h" | "--help")

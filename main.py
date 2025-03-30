@@ -26,6 +26,10 @@ import torch.nn as nn
 # from data_collection.collect_multimodal import MultiModalDataCollector
 # from data_system.multimodal_feature_extractor import MultiModalPerpFeatureExtractor
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+import traceback
+import pickle
+import time
+from gym import spaces
 
 # Setup logging
 logging.basicConfig(
@@ -290,12 +294,13 @@ class TradingSystem:
             assets=assets,  # Added assets parameter which is required
             initial_balance=self.config['trading']['initial_balance'],
             max_leverage=self.config['trading']['max_leverage'],
-            commission=self.config['trading']['transaction_fee'],  # Changed from transaction_fee to commission
+            commission=self.config['trading']['commission'],  # Changed from transaction_fee to commission
             funding_fee_multiplier=self.config['trading']['funding_fee_multiplier'],
             risk_free_rate=self.config['trading']['risk_free_rate'],
             max_drawdown=self.config['risk_management']['limits']['max_drawdown'],
             window_size=self.config['model']['window_size'],
-            verbose=True  # Enable verbose logging
+            verbose=True,  # Enable verbose logging
+            training_mode=True  # Enable training mode to reduce calculation frequency
         )
         
         # Wrap environment
@@ -477,15 +482,45 @@ class TradingSystem:
         """Format data into the structure expected by the trading environment"""
         logger.info("Starting data formatting...")
         
+        # OPTIMIZATION: Check for cached processed data first
+        cache_dir = Path(self.config['data']['cache_dir'])
+        cache_file = cache_dir / "processed_data_cache.pkl"
+        
+        # Check if cache exists and is recent (less than 1 day old)
+        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime < 86400):
+            try:
+                logger.info(f"Loading cached processed data from {cache_file}")
+                with open(cache_file, 'rb') as f:
+                    combined_data = pickle.load(f)
+                logger.info(f"Successfully loaded cached data with shape: {combined_data.shape}")
+                return combined_data
+            except Exception as e:
+                logger.warning(f"Failed to load cached data: {str(e)}. Processing from raw data.")
+        
         # Initialize an empty list to store DataFrames for each symbol
         symbol_dfs = []
         
+        # CRITICAL FIX: Validate raw_data structure before processing
+        if not raw_data or not isinstance(raw_data, dict):
+            raise ValueError("Invalid raw_data structure: must be a non-empty dictionary")
+            
         # Process each exchange's data
         for exchange, exchange_data in raw_data.items():
             logger.info(f"Processing exchange: {exchange}")
+            
+            # CRITICAL FIX: Validate exchange data
+            if not exchange_data or not isinstance(exchange_data, dict):
+                logger.warning(f"Invalid data for exchange {exchange}, skipping")
+                continue
+                
             for symbol, symbol_data in exchange_data.items():
                 logger.info(f"Processing symbol: {symbol}")
                 
+                # CRITICAL FIX: Validate symbol data
+                if symbol_data is None or symbol_data.empty:
+                    logger.warning(f"Empty data for {symbol}, skipping")
+                    continue
+                    
                 # Convert symbol to format expected by risk engine (e.g., BTC/USD:USD -> BTCUSDT)
                 formatted_symbol = symbol.split('/')[0] + "USDT" if not symbol.endswith('USDT') else symbol
                 logger.info(f"Formatted symbol: {formatted_symbol}")
@@ -495,66 +530,72 @@ class TradingSystem:
                     df = symbol_data.copy()
                     logger.info(f"Original columns: {df.columns}")
                     
+                    # CRITICAL FIX: Verify dataframe has expected index and structure
+                    if not isinstance(df.index, pd.DatetimeIndex):
+                        logger.warning(f"Converting index to DatetimeIndex for {formatted_symbol}")
+                        try:
+                            df.index = pd.to_datetime(df.index)
+                        except Exception as e:
+                            logger.error(f"Failed to convert index to datetime: {e}, using numeric index")
+                            df.index = pd.RangeIndex(start=0, stop=len(df))
+                    
                     # Create formatted DataFrame
                     formatted_data = pd.DataFrame(index=df.index)
                     
-                    # Add OHLCV data with proper numeric conversion
-                    for col in ['open', 'high', 'low', 'close']:
-                        if col not in df.columns:
-                            raise ValueError(f"Missing required price column {col} for {formatted_symbol}")
-                        formatted_data[col] = pd.to_numeric(df[col], errors='coerce')
+                    # OPTIMIZATION: Process all numeric columns in one batch operation
+                    for col in ['open', 'high', 'low', 'close', 'volume', 'funding_rate']:
+                        if col in df.columns:
+                            formatted_data[col] = pd.to_numeric(df[col], errors='coerce')
                     
-                    # Handle volume data
-                    if 'volume' in df.columns:
-                        formatted_data['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-                    else:
+                    # CRITICAL FIX: Validate price data consistency
+                    # Ensure high >= low and high,low are consistent with open,close
+                    formatted_data['high'] = formatted_data[['high', 'open', 'close']].max(axis=1)
+                    formatted_data['low'] = formatted_data[['low', 'open', 'close']].min(axis=1)
+                    
+                    # Handle missing columns with vectorized operations
+                    if 'volume' not in df.columns:
                         # Generate synthetic volume based on price volatility
                         returns = formatted_data['close'].pct_change()
                         vol = returns.rolling(window=20).std().fillna(0.01)
                         formatted_data['volume'] = formatted_data['close'] * vol * 1000
                     
-                    # Ensure volume is positive and non-zero
+                    # Ensure volume is positive and non-zero (vectorized)
                     formatted_data['volume'] = formatted_data['volume'].clip(lower=1.0)
                     
-                    # Handle funding rate
-                    if 'funding_rate' in df.columns:
-                        formatted_data['funding_rate'] = pd.to_numeric(df['funding_rate'], errors='coerce')
-                    else:
+                    # Handle funding rate with vectorized operations
+                    if 'funding_rate' not in df.columns:
                         # Use small random funding rate
                         formatted_data['funding_rate'] = np.random.normal(0, 0.0001, size=len(formatted_data))
                     
-                    # Handle market depth
-                    if 'bid_depth' in df.columns and 'ask_depth' in df.columns:
-                        formatted_data['bid_depth'] = pd.to_numeric(df['bid_depth'], errors='coerce')
-                        formatted_data['ask_depth'] = pd.to_numeric(df['ask_depth'], errors='coerce')
-                    else:
-                        # Generate synthetic depth based on volume
-                        formatted_data['bid_depth'] = formatted_data['volume'] * 0.4
-                        formatted_data['ask_depth'] = formatted_data['volume'] * 0.4
+                    # CRITICAL FIX: Constrain funding rates to reasonable bounds (vectorized)
+                    formatted_data['funding_rate'] = formatted_data['funding_rate'].clip(lower=-0.0075, upper=0.0075)
                     
-                    # Ensure depth is positive and non-zero
+                    # Handle market depth with vectorized operations
+                    if 'bid_depth' not in df.columns:
+                        formatted_data['bid_depth'] = formatted_data['volume'] * 0.4
+                    else:
+                        formatted_data['bid_depth'] = pd.to_numeric(df['bid_depth'], errors='coerce')
+                        
+                    if 'ask_depth' not in df.columns:
+                        formatted_data['ask_depth'] = formatted_data['volume'] * 0.4
+                    else:
+                        formatted_data['ask_depth'] = pd.to_numeric(df['ask_depth'], errors='coerce')
+                    
+                    # Ensure depth is positive and non-zero (vectorized)
                     formatted_data['bid_depth'] = formatted_data['bid_depth'].clip(lower=1.0)
                     formatted_data['ask_depth'] = formatted_data['ask_depth'].clip(lower=1.0)
                     
-                    # Add volatility
+                    # Add volatility with vectorized operations
                     close_returns = formatted_data['close'].pct_change()
                     formatted_data['volatility'] = close_returns.rolling(window=20).std().fillna(0.01)
                     
-                    # Handle missing values
+                    # OPTIMIZATION: Handle missing values with batch operations
                     # First replace infinities with NaN
                     formatted_data = formatted_data.replace([np.inf, -np.inf], np.nan)
-                    
                     # Forward fill any NaN values first
                     formatted_data = formatted_data.ffill()
-                    
                     # Then backward fill any remaining NaN values at the start
                     formatted_data = formatted_data.bfill()
-                    
-                    # Final NaN check
-                    if formatted_data.isna().any().any():
-                        logger.error(f"NaN values found in {formatted_symbol} data")
-                        logger.error(f"NaN columns: {formatted_data.columns[formatted_data.isna().any()]}")
-                        raise ValueError(f"NaN values remain in formatted data for {formatted_symbol}")
                     
                     # Create MultiIndex columns
                     formatted_data.columns = pd.MultiIndex.from_product(
@@ -574,72 +615,83 @@ class TradingSystem:
                     
                 except Exception as e:
                     logger.error(f"Error processing {formatted_symbol}: {str(e)}")
+                    traceback.print_exc()  # CRITICAL FIX: Add stacktrace for better debugging
                     continue
         
         # Combine all symbol data
         if not symbol_dfs:
             raise ValueError("No valid data to process")
         
-        # Concatenate all symbols' data and handle duplicates
+        # OPTIMIZATION: Combine DataFrames efficiently
         combined_data = pd.concat(symbol_dfs, axis=1)
         logger.info(f"Combined data shape before deduplication: {combined_data.shape}")
         
-        # Remove duplicate columns by taking the mean of duplicates
-        combined_data = combined_data.T.groupby(level=[0, 1]).mean().T
+        # OPTIMIZATION: Use vectorized operations for price jump detection
+        assets = combined_data.columns.get_level_values('asset').unique()
+        for asset in assets:
+            # Check for extreme price jumps (>50% in one period)
+            close_prices = combined_data.loc[:, (asset, 'close')]
+            pct_changes = close_prices.pct_change().abs()
+            extreme_jumps = pct_changes > 0.5  # 50% threshold
+            
+            if extreme_jumps.any():
+                jump_indices = pct_changes[extreme_jumps].index
+                logger.warning(f"Extreme price jumps detected for {asset} at: {jump_indices}")
+                
+                # Smooth extreme jumps vectorized
+                for idx in jump_indices:
+                    # Get index position
+                    pos = close_prices.index.get_loc(idx)
+                    if pos > 0 and pos < len(close_prices) - 1:
+                        # Replace with average of previous and next
+                        prev_val = close_prices.iloc[pos-1]
+                        next_val = close_prices.iloc[pos+1]
+                        smoother_val = (prev_val + next_val) / 2
+                        combined_data.loc[idx, (asset, 'close')] = smoother_val
+        
+        # OPTIMIZATION: Deduplicate efficiently
+        combined_data = combined_data.loc[:, ~combined_data.columns.duplicated()]
         logger.info(f"Combined data shape after deduplication: {combined_data.shape}")
         
-        # Sort the columns for consistency
-        combined_data = combined_data.sort_index(axis=1)
+        # Apply feature engineering if needed
+        if hasattr(self, 'feature_engine') and self.feature_engine is not None:
+            try:
+                processed_data = self.feature_engine.engineer_features({exchange: raw_data[exchange] for exchange in raw_data})
+                if not processed_data.empty:
+                    logger.info(f"Feature engineering complete. Shape: {processed_data.shape}")
+                    
+                    # Combine base features with engineered features
+                    final_data = pd.concat([combined_data, processed_data], axis=1)
+                    # Remove duplicates efficiently
+                    final_data = final_data.loc[:, ~final_data.columns.duplicated()]
+                    
+                    # Ensure all data is numeric with vectorized conversion
+                    for col in final_data.columns:
+                        final_data[col] = pd.to_numeric(final_data[col], errors='coerce')
+                    
+                    # Final cleanup with batch operations
+                    final_data = final_data.replace([np.inf, -np.inf], np.nan)
+                    final_data = final_data.ffill().bfill()
+                    
+                    combined_data = final_data
+            except Exception as e:
+                logger.error(f"Error in feature engineering: {str(e)}")
+                logger.warning("Falling back to base features only")
         
-        # Final verification
-        assets = combined_data.columns.get_level_values('asset').unique()
-        logger.info(f"Final assets: {assets}")
-        
-        for asset in assets:
-            logger.info(f"Verifying data for {asset}")
-            for feature in required_features:
-                # Check if the feature exists
-                if (asset, feature) not in combined_data.columns:
-                    raise ValueError(f"Missing {feature} for {asset} in final combined data")
-                
-                # Get the feature data
-                feature_data = combined_data.loc[:, (asset, feature)]
-                
-                # Check for NaN or infinite values
-                if not np.isfinite(feature_data).all():
-                    logger.warning(f"Found invalid values in {feature} for {asset}, fixing...")
-                    feature_data = feature_data.replace([np.inf, -np.inf], np.nan)
-                    feature_data = feature_data.ffill().bfill()
-                    combined_data.loc[:, (asset, feature)] = feature_data
-        
-        logger.info("Base data formatting completed successfully")
-        
-        # Process through feature engine
+        # OPTIMIZATION: Cache the processed data
         try:
-            processed_data = self.feature_engine.engineer_features({exchange: raw_data[exchange] for exchange in raw_data})
-            if processed_data.empty:
-                raise ValueError("Feature engineering produced empty DataFrame")
-            logger.info(f"Feature engineering complete. Shape: {processed_data.shape}")
-            logger.info(f"Additional features generated: {processed_data.columns.get_level_values('feature').unique()}")
-            
-            # Combine base features with engineered features
-            final_data = pd.concat([combined_data, processed_data], axis=1)
-            final_data = final_data.loc[:, ~final_data.columns.duplicated()]
-            
-            # Ensure all data is numeric
-            for col in final_data.columns:
-                final_data[col] = pd.to_numeric(final_data[col], errors='coerce')
-            
-            # Final NaN check and handling
-            final_data = final_data.replace([np.inf, -np.inf], np.nan)
-            final_data = final_data.ffill().bfill()
-            
-            return final_data
-            
+            logger.info(f"Saving processed data to cache: {cache_file}")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, 'wb') as f:
+                pickle.dump(combined_data, f)
+            logger.info("Cache saved successfully")
         except Exception as e:
-            logger.error(f"Error in feature engineering: {str(e)}")
-            logger.warning("Falling back to base features only")
-            return combined_data
+            logger.warning(f"Failed to save data cache: {str(e)}")
+        
+        logger.info(f"Final dataset: {combined_data.shape[0]} timepoints, {combined_data.shape[1]} features")
+        logger.info(f"Memory usage: {combined_data.memory_usage().sum() / 1024 / 1024:.2f} MB")
+        
+        return combined_data
 
 async def main():
     try:

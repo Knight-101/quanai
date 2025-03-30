@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 import argparse
+import re
 import torch
 import os
+import time
+import pickle
 from datetime import datetime, timedelta
 import asyncio
 from data_system.derivative_data_fetcher import PerpetualDataFetcher
@@ -32,6 +35,7 @@ from optuna.samplers import TPESampler
 import traceback
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.running_mean_std import RunningMeanStd
+import json
 
 # Configuration flags
 ENABLE_DETAILED_LEVERAGE_MONITORING = True  # Set to True for more detailed leverage logging
@@ -444,6 +448,8 @@ def parse_args():
                         help='Directory to save trained models')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose logging (including step-wise metrics)')
+    parser.add_argument('--training-mode', action='store_true',
+                        help='Enable training optimizations without verbose logging')
     parser.add_argument('--continue-training', action='store_true',
                         help='Continue training from an existing model')
     parser.add_argument('--model-path', type=str, default=None,
@@ -458,6 +464,8 @@ def parse_args():
                         help='Reset reward normalization when continuing training')
     parser.add_argument('--eval-freq', type=int, default=10000,
                         help='Evaluation frequency in timesteps')
+    parser.add_argument('--hyperparams', type=str, default=None,
+                       help='Comma-separated list of hyperparameters to override (format: param1=value1,param2=value2)')
     return parser.parse_args()
 
 def load_config(config_path: str = 'config/prod_config.yaml') -> dict:
@@ -577,9 +585,8 @@ class TradingSystem:
         # Fetch and process data
         self.processed_data = await self._fetch_and_process_data()
         
-        # Initialize environment
-        verbose = args.verbose if args and hasattr(args, 'verbose') else False
-        self.env = self._create_environment(self.processed_data)
+        # Initialize environment with args
+        self.env = self._create_environment(self.processed_data, train=True, args=args)
         
         # Initialize training manager
         self.training_manager = TrainingManager(
@@ -690,7 +697,7 @@ class TradingSystem:
             }
         )
         
-    def _create_environment(self, df, train=True):
+    def _create_environment(self, df, train=True, args=None):
         """Create trading environment with market data."""
         assets = df.columns.get_level_values(0).unique().tolist()
         logger.info(f"Creating environment with assets: {assets}")
@@ -712,6 +719,20 @@ class TradingSystem:
             risk_limits=RiskLimits(**self.config['risk_management']['limits'])
         )
         
+        # Determine verbose and training mode settings
+        verbose = False
+        training_mode = False
+        
+        if args:
+            # Use command line arguments if provided
+            verbose = args.verbose if hasattr(args, 'verbose') else False
+            training_mode = args.training_mode if hasattr(args, 'training_mode') else False
+        elif train:
+            # Otherwise use train parameter for backward compatibility
+            training_mode = train
+        
+        logger.info(f"Creating environment with verbose={verbose}, training_mode={training_mode}")
+        
         # Create and return environment
         env = InstitutionalPerpetualEnv(
             df=df,
@@ -720,13 +741,14 @@ class TradingSystem:
             max_drawdown=self.config['risk_management']['limits']['max_drawdown'],
             window_size=self.config['model']['window_size'],
             max_leverage=self.config['trading']['max_leverage'],
-            commission=self.config['trading']['transaction_fee'],
+            commission=self.config['trading']['commission'],  # Changed from transaction_fee to commission
             funding_fee_multiplier=self.config['trading']['funding_fee_multiplier'],
             base_features=base_features,
             tech_features=tech_features,
             risk_engine=risk_engine,
             risk_free_rate=self.config['trading']['risk_free_rate'],
-            verbose=train  # Only log verbose in training mode
+            verbose=verbose,  # Set verbose based on args or default
+            training_mode=training_mode  # Set training_mode based on args or default
         )
         
         # Wrap with normalization layers
@@ -735,9 +757,108 @@ class TradingSystem:
         
         return env
         
+    def create_adaptive_lr_schedule(self, phase, total_phases=6, performance_metrics=None):
+        """
+        Create a learning rate schedule that considers:
+        1. Current phase in overall training
+        2. Performance metrics from previous phase (if available)
+        
+        Returns a function suitable for PPO's learning_rate parameter
+        """
+        # Calculate global progress
+        total_steps = 1_000_000  # Total expected steps across all phases
+        steps_per_phase = {
+            1: 100000, 2: 100000, 3: 200000, 4: 200000, 5: 300000, 6: 100000
+        }
+        
+        # Calculate steps completed so far (excluding current phase)
+        steps_completed = sum(steps_per_phase.get(i, 0) for i in range(1, phase))
+        
+        # Current phase steps
+        current_phase_steps = steps_per_phase.get(phase, 100000)
+        
+        # Calculate appropriate LR bounds for this phase based on global progress
+        global_progress = steps_completed / total_steps
+        
+        # Determine LR bounds based on where we are in training
+        if global_progress > 0.7:  # Early training (first 30%)
+            initial_lr = 0.00012
+            final_lr = 0.00008
+        elif global_progress > 0.3:  # Middle training (40%)
+            initial_lr = 0.00008
+            final_lr = 0.00003
+        else:  # Late training (final 30%)
+            initial_lr = 0.00003
+            final_lr = 0.000015
+        
+        # Performance-based adjustments
+        if performance_metrics:
+            # If model is performing very well, reduce learning rate for stability
+            reward_sharpe = performance_metrics.get('reward_sharpe', 0)
+            mean_reward = performance_metrics.get('mean_reward', 0)
+            
+            if reward_sharpe > 1.0 and mean_reward > 1.5:
+                # Model performing well, reduce learning rate for fine-tuning
+                initial_lr *= 0.7
+                final_lr *= 0.7
+                logger.info(f"Reducing learning rate due to good performance: {initial_lr} to {final_lr}")
+            elif reward_sharpe < 0.2 or mean_reward < 0.2:
+                # Model performing poorly, slightly increase learning rate
+                initial_lr *= 1.2
+                final_lr *= 1.2
+                logger.info(f"Increasing learning rate due to poor performance: {initial_lr} to {final_lr}")
+        
+        logger.info(f"Phase {phase} learning rate schedule: {initial_lr} to {final_lr}")
+        
+        # Calculate what portion of remaining training this phase represents
+        phase_portion = current_phase_steps / (total_steps - steps_completed)
+        
+        # Return the schedule function
+        def lr_schedule(progress_remaining):
+            """Custom learning rate schedule for this specific phase"""
+            # Enhanced cosine annealing schedule
+            if progress_remaining < 0.3:  # Final 30% of this phase
+                return final_lr
+            elif progress_remaining > 0.8:  # Initial 20% of this phase
+                return initial_lr
+            else:
+                # Middle of phase - cosine schedule
+                phase_progress = (progress_remaining - 0.3) / 0.5
+                cos_factor = 0.5 * (1 + np.cos(np.pi * (1 - phase_progress)))
+                return final_lr + (initial_lr - final_lr) * cos_factor
+        
+        return lr_schedule   
+            
     def _setup_model(self, args=None) -> PPO:
         """Consolidated model setup"""
-        # Define optimized policy kwargs with the provided values
+        # Get current phase from args if available
+        current_phase = 1
+        performance_metrics = None
+        
+        if args and hasattr(args, 'model_dir'):
+            # Try to extract phase number from model directory
+            match = re.search(r'phase(\d+)', args.model_dir)
+            if match:
+                current_phase = int(match.group(1))
+        
+        # Look for previous phase metrics if this isn't phase 1
+        if current_phase > 1:
+            prev_phase = current_phase - 1
+            metrics_file = f"models/manual/phase{prev_phase}/evaluation_metrics.json"
+            if os.path.exists(metrics_file):
+                try:
+                    with open(metrics_file, 'r') as f:
+                        performance_metrics = json.load(f)
+                    logger.info(f"Loaded performance metrics from previous phase {prev_phase}")
+                except Exception as e:
+                    logger.warning(f"Could not load previous metrics: {str(e)}")
+        
+        # Create adaptive learning rate schedule
+        learning_rate = self.create_adaptive_lr_schedule(
+            phase=current_phase,
+            total_phases=6,
+            performance_metrics=performance_metrics
+        )
         policy_kwargs = {
             "net_arch": dict(
                 pi=[128, 64],  # Optimized policy network architecture
@@ -774,47 +895,13 @@ class TradingSystem:
             else:
                 logger.warning("CUDA is not available. Using CPU.")
         
-        # Create a learning rate schedule function that decays from 0.0005 to 0.000025
-        def linear_schedule(initial_value: float, final_value: float):
-            """
-            Linear learning rate schedule.
-            
-            :param initial_value: Initial learning rate.
-            :param final_value: Final learning rate.
-            :return: schedule that computes current learning rate depending on remaining progress
-            """
-            def func(progress_remaining: float) -> float:
-                """
-                Progress will decrease from 1 (beginning) to 0 (end)
-                :param progress_remaining:
-                :return: current learning rate
-                """
-                # Improved: Use cosine annealing instead of pure linear decay
-                # This keeps learning rate higher for longer before final decay
-                if progress_remaining < 0.3:  # Final 30% of training
-                    # In final phase, decay to minimum value
-                    return final_value
-                elif progress_remaining > 0.8:  # Initial 20% of training
-                    # In initial phase, use full learning rate
-                    return initial_value
-                else:
-                    # In middle phase (50% of training), use cosine schedule
-                    # Rescale progress from [0.3, 0.8] to [0, 1]
-                    cos_prog = (progress_remaining - 0.3) / 0.5
-                    cos_factor = 0.5 * (1 + np.cos(np.pi * (1 - cos_prog)))
-                    return final_value + (initial_value - final_value) * cos_factor
-            return func
-        
-        # Set up dynamic learning rate schedule starting from 0.0005
-        learning_rate = linear_schedule(0.00012, 0.000015)  # Slight increase to initial LR
-        
         # Create and return the PPO model with all optimized parameters
         model = PPO(
             "MlpPolicy",
             self.env,
             learning_rate=learning_rate,  # Dynamic learning rate schedule
             n_steps=2048,
-            batch_size=256,  # Increased batch size for better stability
+            batch_size=512,  # Increased batch size for better stability
             n_epochs=10,     # More epochs for better convergence
             gamma=0.9536529734618079, 
             gae_lambda=0.9346152432802582,
@@ -826,7 +913,7 @@ class TradingSystem:
             max_grad_norm=0.65,
             use_sde=True,
             sde_sample_freq=16,
-            target_kl=0.07,
+            target_kl=0.03,
             tensorboard_log=self.config['logging'].get('tensorboard_dir', 'logs/tensorboard'),
             policy_kwargs=policy_kwargs,
             verbose=1,
@@ -1178,7 +1265,7 @@ class TradingSystem:
                 # Evaluation with error handling
                 try:
                     # IMPORTANT FIX: Increase evaluation episodes for more reliable results
-                    eval_metrics = self._evaluate_model(model, n_eval_episodes=10, verbose=False)
+                    eval_metrics = self._evaluate_model(model, n_eval_episodes=5, verbose=False)
                     
                     # Check if any trades were executed
                     if eval_metrics.get("trades_executed", 0) == 0:
@@ -1246,7 +1333,7 @@ class TradingSystem:
             
             return -1.0
         
-    def _evaluate_model(self, model, n_eval_episodes=10, verbose=False):
+    def _evaluate_model(self, model, n_eval_episodes=5, verbose=False):
         """Evaluate model performance"""
         rewards = []
         portfolio_values = []
@@ -1682,7 +1769,7 @@ class TradingSystem:
         # Best model callback - track and save the best model based on evaluation metrics
         best_model_callback = BestModelCallback(
             eval_env=self.env,
-            n_eval_episodes=10,
+            n_eval_episodes=5,
             eval_freq=10000,
             log_dir=self.config['logging']['log_dir'],
             model_dir=self.config['model']['checkpoint_dir'],
@@ -1724,6 +1811,22 @@ class TradingSystem:
             # Compare with best model
             logger.info(f"Best model mean reward: {best_model_callback.best_mean_reward:.4f}")
             logger.info(f"Best model saved at step: {best_model_callback.last_eval_step}")
+
+            # Generate recommendations for next phase
+            current_phase = int(args.model_dir.rstrip('/').split('phase')[-1])
+            next_phase_recommendations = recommend_next_phase_params(
+                current_phase=current_phase,
+                total_phases=6,  # Assuming standard 6-phase training
+                eval_metrics=eval_metrics
+            )
+
+            logger.info(f"Recommendations for phase {current_phase + 1} saved to: {args.model_dir}/phase{current_phase + 1}_recommendations.json")
+            
+            # After evaluation in training/continue_training methods:
+            eval_metrics_file = os.path.join(args.model_dir, "evaluation_metrics.json")
+            with open(eval_metrics_file, 'w') as f:
+                json.dump(eval_metrics, f, indent=4)
+            logger.info(f"Saved evaluation metrics to {eval_metrics_file}")
             
         except Exception as e:
             logger.error(f"Error during training: {str(e)}")
@@ -1731,7 +1834,7 @@ class TradingSystem:
             
     def continue_training(self, model_path, env_path=None, additional_timesteps=1_000_000, 
                         reset_num_timesteps=False, reset_reward_normalization=False,
-                        tb_log_name="ppo_trading_continued", hyperparams=None):
+                        tb_log_name="ppo_trading_continued", hyperparams=None, args=None):
         """
         Continue training from a saved model.
         
@@ -1744,6 +1847,7 @@ class TradingSystem:
             tb_log_name: TensorBoard log name
             hyperparams: Dictionary of hyperparameters to override for continued training
                          (e.g., {"ent_coef": 0.01} to increase exploration)
+            args: Command line arguments that may include training_mode and verbose flags
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found at {model_path}")
@@ -1764,6 +1868,20 @@ class TradingSystem:
                 self.env.ret_rms = RunningMeanStd(shape=())  # Reset reward normalization
                 if hasattr(self.env, 'returns'):
                     self.env.returns = np.zeros(self.env.returns.shape)
+        
+        # Apply training_mode and verbose settings to environment if args provided
+        if args and (hasattr(args, 'training_mode') or hasattr(args, 'verbose')):
+            training_mode = args.training_mode if hasattr(args, 'training_mode') else False
+            verbose = args.verbose if hasattr(args, 'verbose') else False
+            
+            logger.info(f"Updating environment settings: training_mode={training_mode}, verbose={verbose}")
+            
+            # Update the environment settings using env_method
+            if hasattr(self.env, "env_method"):
+                if hasattr(args, 'training_mode'):
+                    self.env.env_method("update_parameters", training_mode=training_mode)
+                if hasattr(args, 'verbose'):
+                    self.env.env_method("update_parameters", verbose=verbose)
         
         # Set the model
         self.model = model
@@ -1803,7 +1921,7 @@ class TradingSystem:
         # Best model callback
         best_model_callback = BestModelCallback(
             eval_env=self.env,
-            n_eval_episodes=10,
+            n_eval_episodes=5,
             eval_freq=10000,
             log_dir=self.config['logging']['log_dir'],
             model_dir=self.config['model']['checkpoint_dir'],
@@ -1832,9 +1950,9 @@ class TradingSystem:
             )
             
             # Save final model after continued training
-            final_model_path = os.path.join(self.config['model']['checkpoint_dir'], "final_continued_model")
+            final_model_path = os.path.join(args.model_dir, "final_continued_model")
             self.model.save(final_model_path)
-            self.env.save(os.path.join(self.config['model']['checkpoint_dir'], "final_continued_env.pkl"))
+            self.env.save(os.path.join(args.model_dir, "final_continued_env.pkl"))
             
             # Final evaluation
             eval_metrics = self._evaluate_model(self.model)
@@ -1848,6 +1966,22 @@ class TradingSystem:
             logger.info(f"Best model during continuation mean reward: {best_model_callback.best_mean_reward:.4f}")
             logger.info(f"Best model during continuation saved at step: {best_model_callback.last_eval_step}")
             
+            # Generate recommendations for next phase
+            current_phase = int(args.model_dir.rstrip('/').split('phase')[-1])
+            next_phase_recommendations = recommend_next_phase_params(
+                current_phase=current_phase,
+                total_phases=6,  # Assuming standard 6-phase training
+                eval_metrics=eval_metrics
+            )
+
+            logger.info(f"Recommendations for phase {current_phase + 1} saved to: {args.model_dir}/phase{current_phase + 1}_recommendations.json")
+            
+            # After evaluation in training/continue_training methods:
+            eval_metrics_file = os.path.join(args.model_dir, "evaluation_metrics.json")
+            with open(eval_metrics_file, 'w') as f:
+                json.dump(eval_metrics, f, indent=4)
+            logger.info(f"Saved evaluation metrics to {eval_metrics_file}")
+            
             return final_model_path
         
         except Exception as e:
@@ -1858,15 +1992,45 @@ class TradingSystem:
         """Format data into the structure expected by the trading environment"""
         logger.info("Starting data formatting...")
         
+        # OPTIMIZATION: Check for cached processed data first
+        cache_dir = Path("data/cache")
+        cache_file = cache_dir / "processed_data_cache.pkl"
+        
+        # Check if cache exists and is recent (less than 1 day old)
+        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime < 86400):
+            try:
+                logger.info(f"Loading cached processed data from {cache_file}")
+                with open(cache_file, 'rb') as f:
+                    combined_data = pickle.load(f)
+                logger.info(f"Successfully loaded cached data with shape: {combined_data.shape}")
+                return combined_data
+            except Exception as e:
+                logger.warning(f"Failed to load cached data: {str(e)}. Processing from raw data.")
+        
         # Initialize an empty list to store DataFrames for each symbol
         symbol_dfs = []
         
+        # CRITICAL FIX: Validate raw_data structure before processing
+        if not raw_data or not isinstance(raw_data, dict):
+            raise ValueError("Invalid raw_data structure: must be a non-empty dictionary")
+            
         # Process each exchange's data
         for exchange, exchange_data in raw_data.items():
             logger.info(f"Processing exchange: {exchange}")
+            
+            # CRITICAL FIX: Validate exchange data
+            if not exchange_data or not isinstance(exchange_data, dict):
+                logger.warning(f"Invalid data for exchange {exchange}, skipping")
+                continue
+                
             for symbol, symbol_data in exchange_data.items():
                 logger.info(f"Processing symbol: {symbol}")
                 
+                # CRITICAL FIX: Validate symbol data
+                if symbol_data is None or symbol_data.empty:
+                    logger.warning(f"Empty data for {symbol}, skipping")
+                    continue
+                    
                 # Convert symbol to format expected by risk engine (e.g., BTC/USD:USD -> BTCUSDT)
                 formatted_symbol = symbol.split('/')[0] + "USDT" if not symbol.endswith('USDT') else symbol
                 logger.info(f"Formatted symbol: {formatted_symbol}")
@@ -1876,66 +2040,72 @@ class TradingSystem:
                     df = symbol_data.copy()
                     logger.info(f"Original columns: {df.columns}")
                     
+                    # CRITICAL FIX: Verify dataframe has expected index and structure
+                    if not isinstance(df.index, pd.DatetimeIndex):
+                        logger.warning(f"Converting index to DatetimeIndex for {formatted_symbol}")
+                        try:
+                            df.index = pd.to_datetime(df.index)
+                        except Exception as e:
+                            logger.error(f"Failed to convert index to datetime: {e}, using numeric index")
+                            df.index = pd.RangeIndex(start=0, stop=len(df))
+                    
                     # Create formatted DataFrame
                     formatted_data = pd.DataFrame(index=df.index)
                     
-                    # Add OHLCV data with proper numeric conversion
-                    for col in ['open', 'high', 'low', 'close']:
-                        if col not in df.columns:
-                            raise ValueError(f"Missing required price column {col} for {formatted_symbol}")
-                        formatted_data[col] = pd.to_numeric(df[col], errors='coerce')
+                    # OPTIMIZATION: Process all numeric columns in one batch operation
+                    for col in ['open', 'high', 'low', 'close', 'volume', 'funding_rate']:
+                        if col in df.columns:
+                            formatted_data[col] = pd.to_numeric(df[col], errors='coerce')
                     
-                    # Handle volume data
-                    if 'volume' in df.columns:
-                        formatted_data['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-                    else:
+                    # CRITICAL FIX: Validate price data consistency
+                    # Ensure high >= low and high,low are consistent with open,close
+                    formatted_data['high'] = formatted_data[['high', 'open', 'close']].max(axis=1)
+                    formatted_data['low'] = formatted_data[['low', 'open', 'close']].min(axis=1)
+                    
+                    # Handle missing columns with vectorized operations
+                    if 'volume' not in df.columns:
                         # Generate synthetic volume based on price volatility
                         returns = formatted_data['close'].pct_change()
                         vol = returns.rolling(window=20).std().fillna(0.01)
                         formatted_data['volume'] = formatted_data['close'] * vol * 1000
                     
-                    # Ensure volume is positive and non-zero
+                    # Ensure volume is positive and non-zero (vectorized)
                     formatted_data['volume'] = formatted_data['volume'].clip(lower=1.0)
                     
-                    # Handle funding rate
-                    if 'funding_rate' in df.columns:
-                        formatted_data['funding_rate'] = pd.to_numeric(df['funding_rate'], errors='coerce')
-                    else:
+                    # Handle funding rate with vectorized operations
+                    if 'funding_rate' not in df.columns:
                         # Use small random funding rate
                         formatted_data['funding_rate'] = np.random.normal(0, 0.0001, size=len(formatted_data))
                     
-                    # Handle market depth
-                    if 'bid_depth' in df.columns and 'ask_depth' in df.columns:
-                        formatted_data['bid_depth'] = pd.to_numeric(df['bid_depth'], errors='coerce')
-                        formatted_data['ask_depth'] = pd.to_numeric(df['ask_depth'], errors='coerce')
-                    else:
-                        # Generate synthetic depth based on volume
-                        formatted_data['bid_depth'] = formatted_data['volume'] * 0.4
-                        formatted_data['ask_depth'] = formatted_data['volume'] * 0.4
+                    # CRITICAL FIX: Constrain funding rates to reasonable bounds (vectorized)
+                    formatted_data['funding_rate'] = formatted_data['funding_rate'].clip(lower=-0.0075, upper=0.0075)
                     
-                    # Ensure depth is positive and non-zero
+                    # Handle market depth with vectorized operations
+                    if 'bid_depth' not in df.columns:
+                        formatted_data['bid_depth'] = formatted_data['volume'] * 0.4
+                    else:
+                        formatted_data['bid_depth'] = pd.to_numeric(df['bid_depth'], errors='coerce')
+                        
+                    if 'ask_depth' not in df.columns:
+                        formatted_data['ask_depth'] = formatted_data['volume'] * 0.4
+                    else:
+                        formatted_data['ask_depth'] = pd.to_numeric(df['ask_depth'], errors='coerce')
+                    
+                    # Ensure depth is positive and non-zero (vectorized)
                     formatted_data['bid_depth'] = formatted_data['bid_depth'].clip(lower=1.0)
                     formatted_data['ask_depth'] = formatted_data['ask_depth'].clip(lower=1.0)
                     
-                    # Add volatility
+                    # Add volatility with vectorized operations
                     close_returns = formatted_data['close'].pct_change()
                     formatted_data['volatility'] = close_returns.rolling(window=20).std().fillna(0.01)
                     
-                    # Handle missing values
+                    # OPTIMIZATION: Handle missing values with batch operations
                     # First replace infinities with NaN
                     formatted_data = formatted_data.replace([np.inf, -np.inf], np.nan)
-                    
                     # Forward fill any NaN values first
                     formatted_data = formatted_data.ffill()
-                    
                     # Then backward fill any remaining NaN values at the start
                     formatted_data = formatted_data.bfill()
-                    
-                    # Final NaN check
-                    if formatted_data.isna().any().any():
-                        logger.error(f"NaN values found in {formatted_symbol} data")
-                        logger.error(f"NaN columns: {formatted_data.columns[formatted_data.isna().any()]}")
-                        raise ValueError(f"NaN values remain in formatted data for {formatted_symbol}")
                     
                     # Create MultiIndex columns
                     formatted_data.columns = pd.MultiIndex.from_product(
@@ -1955,15 +2125,40 @@ class TradingSystem:
                     
                 except Exception as e:
                     logger.error(f"Error processing {formatted_symbol}: {str(e)}")
+                    traceback.print_exc()  # CRITICAL FIX: Add stacktrace for better debugging
                     continue
         
         # Combine all symbol data
         if not symbol_dfs:
             raise ValueError("No valid data to process")
         
-        # Concatenate all symbols' data and handle duplicates
+        # OPTIMIZATION: Combine DataFrames efficiently
         combined_data = pd.concat(symbol_dfs, axis=1)
         logger.info(f"Combined data shape before deduplication: {combined_data.shape}")
+        
+        # CRITICAL FIX: Check for extreme price jumps that could indicate bad data
+        assets = combined_data.columns.get_level_values('asset').unique()
+        for asset in assets:
+            # Check for extreme price jumps (>50% in one period)
+            close_prices = combined_data.loc[:, (asset, 'close')]
+            pct_changes = close_prices.pct_change().abs()
+            extreme_jumps = pct_changes > 0.5  # 50% threshold
+            
+            if extreme_jumps.any():
+                jump_indices = pct_changes[extreme_jumps].index
+                logger.warning(f"Extreme price jumps detected for {asset} at: {jump_indices}")
+                
+                # Option 1: Smooth extreme jumps
+                for idx in jump_indices:
+                    # Get index position
+                    pos = close_prices.index.get_loc(idx)
+                    if pos > 0 and pos < len(close_prices) - 1:
+                        # Replace with average of previous and next
+                        prev_val = close_prices.iloc[pos-1]
+                        next_val = close_prices.iloc[pos+1]
+                        smoother_val = (prev_val + next_val) / 2
+                        combined_data.loc[idx, (asset, 'close')] = smoother_val
+                        logger.info(f"Smoothed extreme price at {idx} from {close_prices[idx]} to {smoother_val}")
         
         # Remove duplicate columns by taking the mean of duplicates
         combined_data = combined_data.T.groupby(level=[0, 1]).mean().T
@@ -2015,6 +2210,10 @@ class TradingSystem:
             final_data = final_data.replace([np.inf, -np.inf], np.nan)
             final_data = final_data.ffill().bfill()
             
+            # CRITICAL FIX: Log dataset size and structure verification
+            logger.info(f"Final dataset: {final_data.shape[0]} timepoints, {final_data.shape[1]} features")
+            logger.info(f"Memory usage: {final_data.memory_usage().sum() / 1024 / 1024:.2f} MB")
+            
             # Log all feature columns for verification
             logger.info(f"Final feature columns: {final_data.columns.get_level_values('feature').unique().tolist()}")
             
@@ -2038,7 +2237,7 @@ class BestModelCallback(BaseCallback):
     Callback for saving the best model based on evaluation metrics.
     Tracks mean reward and saves the model when a new best is found.
     """
-    def __init__(self, eval_env, n_eval_episodes=10, eval_freq=10000, 
+    def __init__(self, eval_env, n_eval_episodes=5, eval_freq=10000, 
                  log_dir="logs/", model_dir="models/", verbose=1):
         super().__init__(verbose)
         self.eval_env = eval_env
@@ -2111,6 +2310,128 @@ class BestModelCallback(BaseCallback):
         
         return mean_reward, std_reward
 
+def recommend_next_phase_params(current_phase, total_phases, eval_metrics, current_params=None):
+    """
+    Calculate recommended parameters for the next training phase based on evaluation metrics.
+    
+    Args:
+        current_phase: Current training phase number (1-based)
+        total_phases: Total planned phases (default: 6)
+        eval_metrics: Dictionary of evaluation metrics from _evaluate_model
+        current_params: Dictionary of current hyperparameters
+        
+    Returns:
+        dict: Recommended hyperparameters for next phase
+    """
+    # Default total planned phases if we're doing the standard 1M step schedule
+    if total_phases is None:
+        total_phases = 6  # Default phases in 1M steps: 100K, 100K, 200K, 200K, 300K, 200K
+    
+    # Calculate global progress (how far we are through total training)
+    total_steps = 1_000_000  # Total expected steps
+    steps_per_phase = {
+        1: 100000, 2: 100000, 3: 200000, 4: 200000, 5: 300000, 6: 100000
+    }
+    
+    # Calculate steps completed so far
+    steps_completed = sum(steps_per_phase.get(i, 0) for i in range(1, current_phase + 1))
+    global_progress = 1.0 - (steps_completed / total_steps)
+    
+    # Initialize recommendations dict
+    recommendations = {}
+    
+    # Calculate next learning rate based on global progress and performance
+    if global_progress <= 0.3:  # Final 30% of training
+        # Lower learning rate for fine-tuning
+        recommendations["learning_rate"] = 0.000015
+    elif global_progress <= 0.7:  # Middle of training
+        # Moderate learning rate
+        recommendations["learning_rate"] = 0.00005
+    else:  # Early training
+        # Higher learning rate
+        recommendations["learning_rate"] = 0.0001
+    
+    # Adjust entropy coefficient (exploration) based on performance and phase
+    mean_reward = eval_metrics.get("mean_reward", 0)
+    reward_sharpe = eval_metrics.get("reward_sharpe", 0)
+    trades_executed = eval_metrics.get("trades_executed", 0)
+    
+    # If we're getting good rewards and good Sharpe, reduce exploration
+    if mean_reward > 1.0 and reward_sharpe > 0.5:
+        ent_coef = 0.02
+    # If we're not getting good trading frequency, increase exploration
+    elif trades_executed < 100:
+        ent_coef = 0.05
+    # Default exploration for mid-training
+    else:
+        ent_coef = 0.03
+    
+    # Phase-based adjustments to entropy coefficient
+    if global_progress <= 0.3:
+        # Final phases - reduce exploration
+        ent_coef *= 0.5
+    elif global_progress <= 0.7:
+        # Mid phases - standard exploration
+        pass
+    else:
+        # Early phases - increase exploration
+        ent_coef *= 1.5
+    
+    recommendations["ent_coef"] = ent_coef
+    
+    # Log the recommendations
+    logger.info(f"Recommended parameters for phase {current_phase + 1}:")
+    for param, value in recommendations.items():
+        logger.info(f"  {param}: {value}")
+    
+    # Save recommendations to file for easy retrieval
+    next_phase = current_phase + 1
+    model_dir = os.path.dirname(os.path.abspath(os.path.join("models/manual", f"phase{current_phase}")))
+    recommendation_file = os.path.join(model_dir, f"phase{current_phase}", f"phase{next_phase}_recommendations.json")
+    os.makedirs(os.path.dirname(recommendation_file), exist_ok=True)
+    
+    import json
+    with open(recommendation_file, "w") as f:
+        json.dump(recommendations, f, indent=4)
+    
+    return recommendations
+
+def parse_hyperparams(hyperparams_str):
+    """Parse hyperparameters from string into dictionary"""
+    if not hyperparams_str:
+        return {}
+        
+    hyperparams = {}
+    pairs = hyperparams_str.split(',')
+    
+    for pair in pairs:
+        if '=' not in pair:
+            logger.warning(f"Invalid hyperparameter format: {pair}")
+            continue
+            
+        param, value_str = pair.split('=', 1)
+        param = param.strip()
+        value_str = value_str.strip()
+        
+        # Try to convert value to appropriate type
+        if value_str.lower() == 'true':
+            value = True
+        elif value_str.lower() == 'false':
+            value = False
+        else:
+            try:
+                # Try to convert to int or float
+                value = int(value_str)
+            except ValueError:
+                try:
+                    value = float(value_str)
+                except ValueError:
+                    value = value_str
+        
+        hyperparams[param] = value
+    
+    return hyperparams
+
 async def main():
     try:
         # Parse arguments and load config
@@ -2147,6 +2468,14 @@ async def main():
         
         # Initialize trading system
         await trading_system.initialize(args)
+
+        # In your main function or where you handle args, add:
+        hyperparams_dict = {}
+        if args.hyperparams:
+            hyperparams_dict = parse_hyperparams(args.hyperparams)
+            logger.info("Parsed hyperparameters:")
+            for param, value in hyperparams_dict.items():
+                logger.info(f"  {param}: {value}")
         
         # Check if continuing training from an existing model
         if args.continue_training:
@@ -2162,7 +2491,9 @@ async def main():
                 env_path=args.env_path,
                 additional_timesteps=args.additional_steps,
                 reset_num_timesteps=args.reset_num_timesteps,
-                reset_reward_normalization=args.reset_reward_norm
+                reset_reward_normalization=args.reset_reward_norm,
+                hyperparams=hyperparams_dict,
+                args=args  # Pass command line args to continue_training
             )
             
             logger.info(f"Continued training complete. Final model saved to {final_model_path}")

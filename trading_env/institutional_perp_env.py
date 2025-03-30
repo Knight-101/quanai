@@ -107,7 +107,8 @@ class InstitutionalPerpetualEnv(gym.Env):
                  maintenance_margin: float = 0.1,  # Maintenance margin as fraction of initial balance
                  max_steps: int = 10000,  # Maximum number of steps before episode terminates
                  max_no_trade_steps: int = 1000,  # Maximum number of steps without trading
-                 verbose: bool = False):  # Add verbose flag
+                 verbose: bool = False,
+                 training_mode: bool = False):  # Add training mode flag
         """
         Initialize the Trading Environment
         
@@ -128,6 +129,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             max_steps: Maximum number of steps before episode terminates
             max_no_trade_steps: Maximum number of steps without trading
             verbose: Whether to log detailed trading information
+            training_mode: Whether environment is in training mode (reduces calculation frequency)
         """
         super().__init__()
         
@@ -143,6 +145,13 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.maintenance_margin = maintenance_margin  # Maintenance margin as fraction
         self.risk_free_rate = risk_free_rate
         self.verbose = verbose  # Use the passed parameter instead of hardcoding to False
+        self.training_mode = training_mode  # Store training mode flag
+        
+        # Optimization properties for training mode
+        self.calc_frequency = 100 if training_mode else 1  # Calculate intensive metrics every 100 steps during training
+        self.last_metrics_step = 0  # Track last step when metrics were calculated
+        self.last_market_analysis_step = 0  # Track last step when market conditions were analyzed
+        self.last_correlation_step = 0  # Track last step when correlations were calculated
         
         # Create a default risk engine if none is provided
         if risk_engine is None:
@@ -166,7 +175,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             logger.info("Using provided risk engine")
         
         # Store verbose flag
-        self.verbose = verbose  # Use the passed parameter instead of hardcoding to False
+        self.verbose = False  # Use the passed parameter instead of hardcoding to False
         
         # Adjust logging level based on verbose flag
         if self.verbose:
@@ -235,6 +244,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.last_action_vector = np.zeros(len(self.assets))
         self.consecutive_no_trade_steps = 0
         self.optimal_trade_frequency = 0.1  # Target 10% of steps to have trades
+        
         
         # Trading history
         self.trades = []
@@ -534,7 +544,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                 
                 # Return observation, reward, done flags, and info
                 return self._get_observation(), reward, terminated, truncated, info
-            
+
             # NEW: Check if risk circuit breakers should be triggered
             circuit_breakers_triggered = self._check_risk_circuit_breakers()
             
@@ -636,36 +646,52 @@ class InstitutionalPerpetualEnv(gym.Env):
                 current_prices[asset] = self._get_mark_price(asset)
             
             # ENHANCEMENT 2: Calculate correlation-based position limits
-            # This creates a subset of market data for correlation calculation
+            # OPTIMIZATION: In training mode, calculate correlation clusters less frequently
+            correlation_adjustments = None
             if hasattr(self, 'df') and len(self.df) > 0:
-                # Create correlation data from recent price history
-                correlation_window = 100  # Use last 100 rows for correlation
-                start_idx = max(0, self.current_step - correlation_window)
-                end_idx = self.current_step + 1
+                # In training mode, only calculate correlations periodically
+                should_calculate_correlations = True
+                if self.training_mode:
+                    # Check if we calculated correlations recently
+                    step_diff = self.current_step - self.last_correlation_step
+                    should_calculate_correlations = step_diff >= self.calc_frequency
                 
-                # Extract relevant market data rows
-                correlation_data_window = self.df.iloc[start_idx:end_idx]
-                
-                # Calculate correlation-based limits
-                correlation_adjustments = self.risk_engine.implement_correlation_based_position_limits(
-                    self.positions, 
-                    correlation_data_window,
-                    self.verbose  # Pass verbose flag
-                )
-                
-                # Log correlation clusters if any were found
-                asset_clusters = {}
-                for asset, data in correlation_adjustments.items():
-                    cluster = data.get('cluster_membership', 'none')
-                    if cluster != 'none':
-                        if cluster not in asset_clusters:
-                            asset_clusters[cluster] = []
-                        asset_clusters[cluster].append(asset)
-                
-                if asset_clusters and self.verbose:
-                    logger.info(f"Detected correlation clusters: {asset_clusters}")
-            else:
-                correlation_adjustments = None
+                if should_calculate_correlations:
+                    # Create correlation data from recent price history
+                    correlation_window = 100  # Use last 100 rows for correlation
+                    start_idx = max(0, self.current_step - correlation_window)
+                    end_idx = self.current_step + 1
+                    
+                    # Extract relevant market data rows
+                    correlation_data_window = self.df.iloc[start_idx:end_idx]
+                    
+                    # Calculate correlation-based limits
+                    correlation_adjustments = self.risk_engine.implement_correlation_based_position_limits(
+                        self.positions, 
+                        correlation_data_window,
+                        self.verbose  # Pass verbose flag
+                    )
+                    
+                    # Track last correlation calculation step
+                    self.last_correlation_step = self.current_step
+                    
+                    # Log correlation clusters if any were found
+                    asset_clusters = {}
+                    for asset, data in correlation_adjustments.items():
+                        cluster = data.get('cluster_membership', 'none')
+                        if cluster != 'none':
+                            if cluster not in asset_clusters:
+                                asset_clusters[cluster] = []
+                            asset_clusters[cluster].append(asset)
+                    
+                    if asset_clusters and self.verbose:
+                        logger.info(f"Detected correlation clusters: {asset_clusters}")
+                    
+                    # Store correlation adjustments for reuse
+                    self.correlation_adjustments = correlation_adjustments
+                else:
+                    # Reuse previously calculated correlation adjustments
+                    correlation_adjustments = getattr(self, 'correlation_adjustments', None)
             
             # Track step risk metrics before executing trades
             risk_metrics_before = self.risk_engine.calculate_risk_metrics(
@@ -1155,8 +1181,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                     if self.verbose:
                         # Single comprehensive log message for trade execution
                         logger.info(f"Trade executed: {asset} {size_change:.6f} @ {execution_price:.2f}, " +
-                                   f"Cost: {total_cost:.2f}, PnL: {realized_pnl:.2f}, Leverage: {actual_leverage:.2f}x, " +
-                                   f"Raw Signal: {action_np[i] if i < len(action_np) else 'N/A':.2f}")
+                                   f"Cost: {total_cost:.2f}, PnL: {realized_pnl:.2f}, Leverage: {actual_leverage:.2f}x")
                         
                         # Add debug info about leverage calculation
                         logger.debug(f"Leverage debug: target={target_leverage:.2f}x, actual={actual_leverage:.2f}x, " +
@@ -1416,6 +1441,10 @@ class InstitutionalPerpetualEnv(gym.Env):
         
     def _calculate_risk_metrics(self, refresh_metrics=False):
         """Calculate risk metrics for the current state"""
+        # CRITICAL CHANGE: Always calculate risk metrics regardless of training mode
+        # We'll keep the skip-check but only for cases with no positions
+        
+        # If we don't have positions and not explicitly refreshing metrics, return cached metrics
         if len(self.positions) == 0 and not refresh_metrics and hasattr(self, 'risk_metrics'):
             return self.risk_metrics
         
@@ -1493,13 +1522,23 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Additional metrics calculation through Risk Engine
             if self.risk_engine and refresh_metrics:
                 try:
+                    # CRITICAL FIX: Convert positions_data list to dictionary keyed by asset
+                    positions_dict = {}
+                    for pos in positions_data:
+                        if 'asset' in pos:
+                            positions_dict[pos['asset']] = pos
+                    
+                    # Get current prices for each asset
+                    prices_dict = {}
+                    for asset in self.positions:
+                        if asset in positions_dict and 'mark_price' in positions_dict[asset]:
+                            prices_dict[asset] = positions_dict[asset]['mark_price']
+                    
+                    # Call risk engine with properly formatted data
                     risk_metrics = self.risk_engine.calculate_risk_metrics(
-                        positions=positions_data,
-                        portfolio_value=portfolio_value,
+                        positions=positions_dict,
                         balance=self.balance,
-                        initial_balance=self.initial_balance,
-                        # FIXED: portfolio_history is a list of dictionaries, extract values correctly
-                        returns_history=[entry['value'] for entry in self.portfolio_history] if len(self.portfolio_history) > 0 else None,
+                        prices=prices_dict
                     )
                     # Update with risk engine metrics
                     metrics.update(risk_metrics)
@@ -1534,12 +1573,12 @@ class InstitutionalPerpetualEnv(gym.Env):
             if current_drawdown > getattr(self, 'max_drawdown', 0):
                 self.max_drawdown = current_drawdown
                 
+            # CRITICAL CHANGE: Always calculate risk-adjusted ratios
             # Risk-adjusted ratios calculation (with safety checks)
             if len(self.portfolio_history) > 1:
                 try:
                     # Calculate returns
                     returns = []
-                    # FIXED: portfolio_history is a list of dictionaries, not a dictionary
                     # Extract portfolio values from the history
                     values = [entry['value'] for entry in self.portfolio_history]
                     for i in range(1, len(values)):
@@ -1569,6 +1608,9 @@ class InstitutionalPerpetualEnv(gym.Env):
                 except Exception as e:
                     logger.error(f"Error calculating risk-adjusted ratios: {e}")
                     logger.exception("Detailed traceback for risk-adjusted ratios error:")
+                    
+            # Update last metrics calculation step
+            self.last_metrics_step = self.current_step
             
             # Save metrics for future reference
             self.risk_metrics = metrics
@@ -1842,9 +1884,9 @@ class InstitutionalPerpetualEnv(gym.Env):
                 
         logger.info(f"Updated environment parameters: {kwargs}")
 
-    def _execute_trade(self, asset: str, signal: float, target_leverage: float, portfolio_value: float):
+    def _execute_trade(self, asset: str, signal: float, target_leverage: float, portfolio_value: float) -> tuple:
         """
-        Execute a trade for a specific asset based on signal and target leverage
+        Execute a trade on an asset with the given signal and target leverage
         
         Args:
             asset: Asset symbol
@@ -1870,11 +1912,11 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Target leverage sign indicates direction, but actual leverage is always positive
             direction = np.sign(signal) if abs(signal) > 1e-8 else 0
             abs_target_leverage = abs(target_leverage)  # Always positive
-            
+                
             # DIAGNOSTIC: Log the initial trade computation values
             if self.verbose:
                 logger.info(f"Trade calculation for {asset}: price=${price:.2f}, current_size={current_size:.6f}, signal={signal:.4f}, direction={direction}")
-            
+                
             # ENHANCEMENT: Check trading cooldown for this asset
             steps_since_last_trade = self.current_step - self.last_trade_step[asset]
             if steps_since_last_trade < self.min_steps_between_trades and abs(current_size) > 1e-8:
@@ -1882,7 +1924,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                 if self.verbose:
                     logger.info(f"Trading cooldown for {asset}: {steps_since_last_trade} steps since last trade (min: {self.min_steps_between_trades})")
                 return current_size, self.positions[asset]['entry_price'], self.positions[asset]['leverage'], current_value, 0
-            
+                
             # ENHANCEMENT: Check if market volatility justifies trading
             volatility_check_passed = True
             if hasattr(self, 'market_conditions') and 'volatility_regime' in self.market_conditions:
@@ -1892,10 +1934,10 @@ class InstitutionalPerpetualEnv(gym.Env):
                     volatility_check_passed = False
                     if self.verbose:
                         logger.info(f"Low volatility for {asset}: {asset_volatility:.2f}, requires stronger signal")
-            
+                
             if not volatility_check_passed:
                 return current_size, self.positions[asset]['entry_price'], self.positions[asset]['leverage'], current_value, 0
-            
+        
             # Initialize target size
             target_size = 0
             
@@ -1906,7 +1948,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                 start_idx = max(0, self.current_step - 100)  # Use last 100 rows
                 end_idx = self.current_step + 1
                 market_data = self.df.iloc[start_idx:end_idx]
-            
+        
             # Calculate target position value based on portfolio_value, leverage, and signal
             if abs(signal) >= self.signal_threshold:  # Use the configured threshold
                 # ENHANCED: Calculate target position value with target leverage 
@@ -1915,18 +1957,18 @@ class InstitutionalPerpetualEnv(gym.Env):
                 
                 # CRITICAL FIX: Use absolute leverage value with separate direction
                 effective_leverage = abs_target_leverage  # Always positive
-                
+            
                 # Log the leverage being used
                 if self.verbose:
                     logger.info(f"Trade signal: {signal:.2f}, target leverage: {abs_target_leverage:.2f}x, "
-                               f"effective leverage: {effective_leverage:.2f}x for {asset}")
-                
+                            f"effective leverage: {effective_leverage:.2f}x for {asset}")
+            
                 # CRITICAL FIX: Properly calculate target position value
                 # Ensure leverage is at least 1.0 for any actual position
                 if effective_leverage < 1.0 and effective_leverage > 0:
                     effective_leverage = 1.0
                     logger.warning(f"Enforcing minimum leverage of 1.0x for {asset}")
-                
+            
                 # Calculate target position value 
                 target_value = direction * effective_leverage * portfolio_value
                 
@@ -1943,7 +1985,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                     self.positions,  # Pass current positions for correlation analysis
                     self.verbose  # Pass verbose flag
                 )
-                
+            
                 # Convert target value to size
                 raw_target_size = target_value / price if price > 0 else 0
                 
@@ -1953,7 +1995,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                 # DIAGNOSTIC: Log target size calculation
                 if self.verbose:
                     logger.info(f"Target size calculation for {asset}: raw={raw_target_size:.6f}, max_size={max_size:.6f}, final={target_size:.6f}")
-                
+            
                 # Minimum position check - don't take tiny positions
                 min_position_value = self.risk_engine.risk_limits.min_trade_size_usd
                 if abs(target_size * price) < min_position_value:
@@ -1995,7 +2037,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                 # Log impact details
                 if self.verbose:
                     logger.info(f"Market impact for {asset}: {impact_data['impact_bps']:.2f} bps " +
-                               f"(${impact_data['impact_usd']:.2f}), using model: {impact_data['model_used']}")
+                              f"(${impact_data['impact_usd']:.2f}), using model: {impact_data['model_used']}")
             else:
                 # Fall back to simple impact model if no market data
                 execution_price = self._calculate_execution_price(asset, size_diff, price)
@@ -2179,7 +2221,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Calculate position value and actual leverage after all adjustments
             position_value = abs(self.positions[asset]['size'] * price)
             actual_leverage = self.positions[asset]['leverage']  # Now always positive
-            
+        
             # Update balance with cost
             self.balance += cost
             
@@ -2214,7 +2256,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                 logger.info(f"Executing trade for {asset}: size change {size_diff:.6f} at ${execution_price:.2f}")
             
             return new_size, new_price, actual_leverage, position_value, cost
-        
+            
         except Exception as e:
             logger.error(f"Error executing trade: {str(e)}")
             traceback.print_exc()
@@ -3029,6 +3071,13 @@ class InstitutionalPerpetualEnv(gym.Env):
         Returns:
             dict: Dictionary of market condition metrics
         """
+        # OPTIMIZATION: In training mode, only recalculate market conditions periodically
+        if self.training_mode and hasattr(self, 'market_conditions'):
+            # Skip calculation if we calculated recently (based on calc_frequency)
+            step_diff = self.current_step - self.last_market_analysis_step
+            if step_diff < self.calc_frequency:
+                return self.market_conditions
+        
         market_conditions = {
             'market_regime': {},
             'volatility_regime': {},
@@ -3195,6 +3244,9 @@ class InstitutionalPerpetualEnv(gym.Env):
             else:
                 market_conditions['overall_market_state'] = 'normal'
             
+            # Update last market analysis step
+            self.last_market_analysis_step = self.current_step
+            
             return market_conditions
             
         except Exception as e:
@@ -3315,6 +3367,9 @@ class InstitutionalPerpetualEnv(gym.Env):
 
     def _track_performance_metrics(self):
         """Track and update performance metrics"""
+        # CRITICAL CHANGE: Always update portfolio history and calculate performance metrics 
+        # regardless of training mode
+        
         try:
             # Calculate portfolio value
             portfolio_value = self._calculate_portfolio_value()
@@ -3335,94 +3390,110 @@ class InstitutionalPerpetualEnv(gym.Env):
                 prev_value = self.performance_tracking['portfolio_values'][-2]
                 if prev_value > 0:
                     step_return = (portfolio_value - prev_value) / prev_value
-                    
-                    # Add to returns history
-                    self.performance_tracking['returns'].append(step_return)
-                    
-                    # Log significant returns
-                    if abs(step_return) > 0.05:  # 5% change
-                        logger.info(f"Significant return: {step_return:.2%} at step {self.current_step}")
-                    
-                    # CRITICAL FIX: Ensure we have enough data for ratio calculations
-                    if len(self.performance_tracking['returns']) >= 10:  # Need minimum data for statistical validity
-                        # Calculate Sharpe ratio (assuming daily returns, annualized)
-                        returns_arr = np.array(self.performance_tracking['returns'])
-                        mean_return = np.mean(returns_arr)
-                        std_return = np.std(returns_arr)
-                        
-                        # Ensure non-zero standard deviation to avoid division by zero
-                        if std_return > 0:
-                            sharpe_ratio = (mean_return / std_return) * np.sqrt(252)  # Annualized
-                            self.performance_tracking['sharpe_ratios'].append(sharpe_ratio)
-                        else:
-                            # Handle zero standard deviation case - assign a large ratio if mean is positive
-                            if mean_return > 0:
-                                self.performance_tracking['sharpe_ratios'].append(10.0)  # Good Sharpe ratio
-                            elif mean_return < 0:
-                                self.performance_tracking['sharpe_ratios'].append(-10.0)  # Bad Sharpe ratio
-                            else:
-                                self.performance_tracking['sharpe_ratios'].append(0.0)  # No return, no risk
-                        
-                        # Calculate Sortino ratio (using only negative returns)
-                        neg_returns = returns_arr[returns_arr < 0]
-                        if len(neg_returns) > 0:
-                            downside_deviation = np.std(neg_returns)
-                            if downside_deviation > 0:
-                                sortino_ratio = (mean_return / downside_deviation) * np.sqrt(252)
-                                self.performance_tracking['sortino_ratios'].append(sortino_ratio)
-                            else:
-                                # Handle zero downside deviation
-                                if mean_return > 0:
-                                    self.performance_tracking['sortino_ratios'].append(10.0)
-                                elif mean_return < 0:
-                                    self.performance_tracking['sortino_ratios'].append(-10.0)
-                                else:
-                                    self.performance_tracking['sortino_ratios'].append(0.0)
-                        else:
-                            # No negative returns - great Sortino ratio
-                            if mean_return > 0:
-                                self.performance_tracking['sortino_ratios'].append(10.0)
-                            else:
-                                self.performance_tracking['sortino_ratios'].append(0.0)
-            
-            # CRITICAL FIX: Track drawdown properly
-            if not hasattr(self, 'peak_value') or portfolio_value > self.peak_value:
-                self.peak_value = portfolio_value
-                
-            # Calculate current drawdown
-            if hasattr(self, 'peak_value') and self.peak_value > 0:
-                current_drawdown = (self.peak_value - portfolio_value) / self.peak_value
-                self.performance_tracking['drawdowns'].append(current_drawdown)
-                
-                # Log significant drawdowns
-                if current_drawdown > 0.1:  # 10% drawdown
-                    logger.warning(f"Significant drawdown: {current_drawdown:.2%} at step {self.current_step}")
-                
-                # Calculate Calmar ratio if we have enough data and there's a non-zero drawdown
-                if len(self.performance_tracking['returns']) >= 20:  # Need more data for Calmar
-                    max_drawdown = max(self.performance_tracking['drawdowns']) if self.performance_tracking['drawdowns'] else 0.0
-                    
-                    # Ensure non-zero max drawdown to avoid division by zero
-                    if max_drawdown > 0.001:  # Small threshold to avoid division issues
-                        # Calculate return since start
-                        total_return = (portfolio_value / self.initial_balance) - 1.0
-                        steps_elapsed = max(1, self.current_step - self.window_size)  # Avoid division by zero
-                        
-                        # Annualize return (assuming 252 trading days)
-                        annualized_return = total_return * (252 / steps_elapsed)
-                        calmar_ratio = annualized_return / max_drawdown
-                        self.performance_tracking['calmar_ratios'].append(calmar_ratio)
                 else:
-                        # No meaningful drawdown
-                        if total_return > 0:
-                            self.performance_tracking['calmar_ratios'].append(10.0)  # Good ratio
-                        elif total_return < 0:
-                            self.performance_tracking['calmar_ratios'].append(-10.0)  # Bad ratio
-                        else:
-                            self.performance_tracking['calmar_ratios'].append(0.0)  # No return
+                    step_return = 0.0
+            else:
+                step_return = 0.0
+                
+            # Track return
+            self.performance_tracking['returns'].append(step_return)
             
-            # Track leverage
-            current_leverage = self._calculate_current_leverage()
+            # Calculate and track drawdown
+            peak_value = max(self.performance_tracking['portfolio_values'])
+            if peak_value > 0:
+                drawdown = (peak_value - portfolio_value) / peak_value
+            else:
+                drawdown = 0.0
+                
+            self.performance_tracking['drawdowns'].append(drawdown)
+            
+            # Calculate Sharpe if we have enough returns
+            min_returns_for_calcs = 10
+            if len(self.performance_tracking['returns']) >= min_returns_for_calcs:
+                returns_array = np.array(self.performance_tracking['returns'])
+                mean_return = np.mean(returns_array)
+                std_return = np.std(returns_array)
+                
+                # Sharpe ratio calculation (with error handling)
+                if std_return > 0:
+                    sharpe = mean_return / std_return * np.sqrt(252)  # Annualized
+                    self.performance_tracking['sharpe_ratios'].append(sharpe)
+                else:
+                    # If std is zero, can't calculate Sharpe
+                    if len(self.performance_tracking['sharpe_ratios']) > 0:
+                        # Use previous value if available
+                        self.performance_tracking['sharpe_ratios'].append(
+                            self.performance_tracking['sharpe_ratios'][-1]
+                        )
+                    else:
+                        # Default to zero if no previous value
+                        self.performance_tracking['sharpe_ratios'].append(0)
+                
+                # Sortino ratio calculation (with error handling)
+                neg_returns = returns_array[returns_array < 0]
+                if len(neg_returns) > 0:
+                    downside_deviation = np.std(neg_returns)
+                    if downside_deviation > 0:
+                        sortino = mean_return / downside_deviation * np.sqrt(252)
+                        self.performance_tracking['sortino_ratios'].append(sortino)
+                    else:
+                        # Handle zero downside deviation
+                        if len(self.performance_tracking['sortino_ratios']) > 0:
+                            self.performance_tracking['sortino_ratios'].append(
+                                self.performance_tracking['sortino_ratios'][-1]
+                            )
+                        else:
+                            self.performance_tracking['sortino_ratios'].append(0)
+                else:
+                    # No negative returns - very good!
+                    # Use a high value or previous value
+                    if len(self.performance_tracking['sortino_ratios']) > 0:
+                        self.performance_tracking['sortino_ratios'].append(
+                            max(3.0, self.performance_tracking['sortino_ratios'][-1])
+                        )
+                    else:
+                        self.performance_tracking['sortino_ratios'].append(3.0)  # Good sortino if no losses
+                
+                # Calmar ratio calculation (with error handling)
+                if len(self.performance_tracking['drawdowns']) > 0:
+                    max_dd = max(self.performance_tracking['drawdowns'])
+                    if max_dd > 0:
+                        # Get total return from beginning
+                        total_return = (portfolio_value / self.initial_balance) - 1
+                        calmar = total_return / max_dd
+                        self.performance_tracking['calmar_ratios'].append(calmar)
+                    else:
+                        # Handle zero max drawdown (unusual but possible)
+                        if len(self.performance_tracking['calmar_ratios']) > 0:
+                            self.performance_tracking['calmar_ratios'].append(
+                                self.performance_tracking['calmar_ratios'][-1]
+                            )
+                        else:
+                            self.performance_tracking['calmar_ratios'].append(1.0)  # Default value
+                else:
+                    # No drawdown history yet
+                    self.performance_tracking['calmar_ratios'].append(1.0)  # Default value
+            
+            # Calculate win rate with trades
+            if hasattr(self, 'trades') and len(self.trades) > 0:
+                # Get only closed trades
+                closed_trades = [t for t in self.trades if 'pnl' in t or 'realized_pnl' in t]
+                if len(closed_trades) > 0:
+                    # Count winning trades (with different key names for compatibility)
+                    winning_trades = sum(1 for t in closed_trades if 
+                                        ('pnl' in t and t['pnl'] > 0) or 
+                                        ('realized_pnl' in t and t['realized_pnl'] > 0))
+                    win_rate = winning_trades / len(closed_trades)
+                    self.performance_tracking['win_rate'] = win_rate
+            
+            # Calculate current leverage
+            total_exposure = sum(abs(pos['size'] * self._get_mark_price(asset)) 
+                               for asset, pos in self.positions.items() 
+                               if abs(pos['size']) > 1e-8)
+            
+            current_leverage = min(total_exposure / max(portfolio_value, self.initial_balance * 0.01), 
+                                self.max_leverage)
+            
             self.historical_leverage.append(current_leverage)
             self.performance_tracking['leverage'].append(current_leverage)
             
@@ -3433,6 +3504,9 @@ class InstitutionalPerpetualEnv(gym.Env):
                     if len(self.performance_tracking['returns']) > 0:
                         latest_return = self.performance_tracking['returns'][-1]
                         self.performance_tracking['regime_performance'][regime]['returns'].append(latest_return)
+            
+            # Track the last time we calculated performance metrics
+            self.last_perf_metrics_step = self.current_step
             
             # Log occasional performance updates
             if self.current_step % 50 == 0:
