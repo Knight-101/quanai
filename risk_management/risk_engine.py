@@ -1920,10 +1920,10 @@ class InstitutionalRiskEngine:
             }
             
             # Log significant impacts
-            if impact_bps > 10:
-                logger.warning(f"High market impact for {asset}: {impact_bps:.2f} bps " +
-                             f"({impact_usd:.2f} USD) for order size {order_size:.6f} " +
-                             f"({adv_ratio:.2%} of ADV)")
+            # if impact_bps > 10:
+            #     logger.warning(f"High market impact for {asset}: {impact_bps:.2f} bps " +
+            #                  f"({impact_usd:.2f} USD) for order size {order_size:.6f} " +
+            #                  f"({adv_ratio:.2%} of ADV)")
             
             return result
             
