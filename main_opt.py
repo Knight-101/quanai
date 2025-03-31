@@ -1766,15 +1766,16 @@ class TradingSystem:
         )
         callbacks.append(checkpoint_callback)
         
-        eval_callback = EvalCallback(
+        # Best model callback - track and save the best model based on evaluation metrics
+        best_model_callback = BestModelCallback(
             eval_env=self.env,
-            n_eval_episodes=5,
-            eval_freq=10000, 
-            log_path=self.config['logging']['log_dir'],
-            deterministic=True,
-            render=False
+            n_eval_episodes=3,
+            eval_freq=20000,
+            log_dir=self.config['logging']['log_dir'],
+            model_dir=self.config['model']['checkpoint_dir'],
+            verbose=1
         )
-        callbacks.append(eval_callback)
+        callbacks.append(best_model_callback)
         
         # Train the model with optimized parameters
         # Get training steps from args if provided, otherwise use default
@@ -1806,6 +1807,10 @@ class TradingSystem:
             logger.info(f"Mean return: {eval_metrics.get('mean_reward', 'N/A'):.4f}")
             logger.info(f"Sharpe ratio: {eval_metrics.get('reward_sharpe', 'N/A'):.4f}")
             logger.info(f"Max drawdown: {eval_metrics.get('max_drawdown', 'N/A'):.4f}")
+            
+            # Compare with best model
+            logger.info(f"Best model mean reward: {best_model_callback.best_mean_reward:.4f}")
+            logger.info(f"Best model saved at step: {best_model_callback.last_eval_step}")
 
             # Generate recommendations for next phase
             current_phase = int(args.model_dir.rstrip('/').split('phase')[-1])
@@ -1913,15 +1918,16 @@ class TradingSystem:
         )
         callbacks.append(checkpoint_callback)
         
-        eval_callback = EvalCallback(
+        # Best model callback
+        best_model_callback = BestModelCallback(
             eval_env=self.env,
-            n_eval_episodes=5,
-            eval_freq=10000, 
-            log_path=self.config['logging']['log_dir'],
-            deterministic=True,
-            render=False
+            n_eval_episodes=3,
+            eval_freq=20000,
+            log_dir=self.config['logging']['log_dir'],
+            model_dir=self.config['model']['checkpoint_dir'],
+            verbose=1
         )
-        callbacks.append(eval_callback)
+        callbacks.append(best_model_callback)
         
         # Continue training
         logger.info(f"Continuing training for {additional_timesteps} additional timesteps")
@@ -1955,6 +1961,10 @@ class TradingSystem:
             logger.info(f"Mean return: {eval_metrics.get('mean_reward', 'N/A'):.4f}")
             logger.info(f"Sharpe ratio: {eval_metrics.get('reward_sharpe', 'N/A'):.4f}")
             logger.info(f"Max drawdown: {eval_metrics.get('max_drawdown', 'N/A'):.4f}")
+            
+            # Compare with best model from continuation
+            logger.info(f"Best model during continuation mean reward: {best_model_callback.best_mean_reward:.4f}")
+            logger.info(f"Best model during continuation saved at step: {best_model_callback.last_eval_step}")
             
             # Generate recommendations for next phase
             current_phase = int(args.model_dir.rstrip('/').split('phase')[-1])
@@ -2221,6 +2231,84 @@ class TradingSystem:
                 self.env.close()
             except Exception as e:
                 logger.warning(f"Error during environment cleanup: {e}")
+
+class BestModelCallback(BaseCallback):
+    """
+    Callback for saving the best model based on evaluation metrics.
+    Tracks mean reward and saves the model when a new best is found.
+    """
+    def __init__(self, eval_env, n_eval_episodes=5, eval_freq=10000, 
+                 log_dir="logs/", model_dir="models/", verbose=1):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.n_eval_episodes = n_eval_episodes
+        self.eval_freq = eval_freq
+        self.log_dir = log_dir
+        self.model_dir = model_dir
+        self.best_mean_reward = -np.inf
+        self.last_eval_step = 0
+        
+    def _init_callback(self):
+        # Create folders if needed
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.model_dir, exist_ok=True)
+        
+    def _on_step(self):
+        if self.n_calls - self.last_eval_step >= self.eval_freq:
+            self.last_eval_step = self.n_calls
+            
+            # Evaluate the model
+            mean_reward, std_reward = self._evaluate_model()
+            
+            # Log evaluation metrics to wandb
+            wandb.log({
+                "eval/mean_reward": mean_reward,
+                "eval/std_reward": std_reward,
+                "global_step": self.n_calls
+            })
+            
+            # Save best performing model
+            if mean_reward > self.best_mean_reward:
+                self.best_mean_reward = mean_reward
+                # Save model
+                best_model_path = os.path.join(self.model_dir, "best_model")
+                self.model.save(best_model_path)
+                self.eval_env.save(os.path.join(self.model_dir, "best_env.pkl"))
+                
+                # Log to wandb
+                wandb.log({
+                    "eval/best_mean_reward": self.best_mean_reward,
+                    "eval/best_model_step": self.n_calls
+                })
+                
+                if self.verbose > 0:
+                    logger.info(f"New best model with reward: {mean_reward:.4f} saved to {best_model_path}")
+                    
+        return True
+    
+    def _evaluate_model(self):
+        """Evaluate the current model and return mean and std reward"""
+        episode_rewards = []
+        
+        for i in range(self.n_eval_episodes):
+            # Reset the environment
+            obs = self.eval_env.reset()
+            done = False
+            episode_reward = 0.0
+            
+            while not done:
+                # Get action from model
+                action, _ = self.model.predict(obs, deterministic=True)
+                # Execute step
+                obs, reward, done, info = self.eval_env.step(action)
+                episode_reward += reward
+                
+            episode_rewards.append(episode_reward)
+            
+        mean_reward = np.mean(episode_rewards)
+        std_reward = np.std(episode_rewards)
+        
+        return mean_reward, std_reward
 
 def recommend_next_phase_params(current_phase, total_phases, eval_metrics, current_params=None):
     """
