@@ -36,7 +36,6 @@ import traceback
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.running_mean_std import RunningMeanStd
 import json
-from stable_baselines3.common.monitor import Monitor
 
 # Configuration flags
 ENABLE_DETAILED_LEVERAGE_MONITORING = True  # Set to True for more detailed leverage logging
@@ -752,12 +751,7 @@ class TradingSystem:
             training_mode=training_mode  # Set training_mode based on args or default
         )
         
-        # First wrap with Monitor for proper reward tracking
-        # Use a unique filename based on current time if this is for evaluation
-        monitor_filename = None if train else f"eval_{int(time.time())}"
-        env = Monitor(env, filename=monitor_filename)
-        
-        # Then wrap with vectorization layers
+        # Wrap with normalization layers
         env = DummyVecEnv([lambda: env])
         env = VecNormalize(env, norm_obs=True, norm_reward=True)
         
@@ -1271,7 +1265,7 @@ class TradingSystem:
                 # Evaluation with error handling
                 try:
                     # IMPORTANT FIX: Increase evaluation episodes for more reliable results
-                    eval_metrics = self._evaluate_model(model, n_eval_episodes=3, verbose=False)
+                    eval_metrics = self._evaluate_model(model, n_eval_episodes=5, verbose=False)
                     
                     # Check if any trades were executed
                     if eval_metrics.get("trades_executed", 0) == 0:
@@ -1339,7 +1333,7 @@ class TradingSystem:
             
             return -1.0
         
-    def _evaluate_model(self, model, n_eval_episodes=3, verbose=False):
+    def _evaluate_model(self, model, n_eval_episodes=5, verbose=False):
         """Evaluate model performance"""
         rewards = []
         portfolio_values = []
@@ -1773,13 +1767,11 @@ class TradingSystem:
 
         eval_callback = EvalCallback(
             eval_env=self.env,
-            n_eval_episodes=3,  # Reduced from 5 for better performance
+            n_eval_episodes=5,
             eval_freq=10000, 
             log_path=self.config['logging']['log_dir'],
-            best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], "best"),
             deterministic=True,
-            render=False,
-            verbose=0  # Reduce logging overhead
+            render=False
         )
         callbacks.append(eval_callback)
         
@@ -1814,9 +1806,6 @@ class TradingSystem:
             logger.info(f"Sharpe ratio: {eval_metrics.get('reward_sharpe', 'N/A'):.4f}")
             logger.info(f"Max drawdown: {eval_metrics.get('max_drawdown', 'N/A'):.4f}")
             
-            # Compare with best model
-            logger.info(f"Best model mean reward: {eval_callback.best_mean_reward if hasattr(eval_callback, 'best_mean_reward') else 'N/A'}")
-            logger.info(f"Best model saved at step: {eval_callback.best_model_step if hasattr(eval_callback, 'best_model_step') else 'N/A'}")
 
             # Generate recommendations for next phase
             current_phase = int(args.model_dir.rstrip('/').split('phase')[-1])
@@ -1927,13 +1916,11 @@ class TradingSystem:
         # Best model callback
         eval_callback = EvalCallback(
             eval_env=self.env,
-            n_eval_episodes=3,  # Reduced from 5 for better performance
+            n_eval_episodes=5,
             eval_freq=10000, 
             log_path=self.config['logging']['log_dir'],
-            best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], "best"),
             deterministic=True,
-            render=False,
-            verbose=0  # Reduce logging overhead
+            render=False
         )
         callbacks.append(eval_callback)
         
@@ -1970,9 +1957,6 @@ class TradingSystem:
             logger.info(f"Sharpe ratio: {eval_metrics.get('reward_sharpe', 'N/A'):.4f}")
             logger.info(f"Max drawdown: {eval_metrics.get('max_drawdown', 'N/A'):.4f}")
             
-            # Compare with best model from continuation
-            logger.info(f"Best model during continuation mean reward: {eval_callback.best_mean_reward if hasattr(eval_callback, 'best_mean_reward') else 'N/A'}")
-            logger.info(f"Best model during continuation saved at step: {eval_callback.best_model_step if hasattr(eval_callback, 'best_model_step') else 'N/A'}")
             
             # Generate recommendations for next phase
             current_phase = int(args.model_dir.rstrip('/').split('phase')[-1])
