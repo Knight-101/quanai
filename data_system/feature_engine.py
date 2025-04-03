@@ -640,15 +640,19 @@ class DerivativesFeatureEngine:
             # Determine number of components based on available data
             n_samples, n_features = returns_df.shape
             n_components = min(self.n_components, min(n_samples, n_features) - 1)
-            
+
             if n_components > 0:
                 try:
-                    # Fill any remaining NaN values with 0 before PCA
-                    returns_df_filled = returns_df.fillna(0)
-                    
-                    # PCA decomposition
+                    # Modify before PCA application:
+                    # Add volatility-normalized features
+                    volatility = full_df.groupby(level='asset').std().rolling(100).std()
+                    normalized_df = full_df.groupby(level='asset').apply(
+                        lambda x: x / volatility.loc[x.name].replace(0, 1e-6)
+                    )
+
+                    # Then apply PCA to normalized features
                     pca = PCA(n_components=n_components)
-                    pca_features = pca.fit_transform(self.scaler.fit_transform(returns_df_filled))
+                    pca.fit(normalized_df)
                     
                     # Factor loadings
                     loadings = pca.components_[:, list(returns_dict.keys()).index(current_asset)]
@@ -656,6 +660,9 @@ class DerivativesFeatureEngine:
                         features[f'factor_{i+1}_loading'] = pd.Series(loading, index=returns_df.index)
                 except Exception as e:
                     logger.warning(f"Error in PCA calculation: {str(e)}")
+                    # Fill with zeros if PCA fails
+                    for i in range(n_components):
+                        features[f'factor_{i+1}_loading'] = pd.Series(0, index=returns_df.index)
             
             # Cross-sectional momentum
             try:

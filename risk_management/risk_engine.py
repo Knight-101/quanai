@@ -424,41 +424,30 @@ class InstitutionalRiskEngine:
                 market_data[(asset, 'high')] = price
                 market_data[(asset, 'low')] = price
                 market_data[(asset, 'volume')] = 1000000  # Default volume
-                
-                # Also create flat format for compatibility
-                market_data[f"{asset}_close"] = price
-                market_data[f"{asset}_open"] = price
-                market_data[f"{asset}_high"] = price
-                market_data[f"{asset}_low"] = price
-                market_data[f"{asset}_volume"] = 1000000  # Default volume
             elif isinstance(price, dict):
                 # Dict format with multiple price fields
                 for field, value in price.items():
-                    market_data[(asset, field)] = value 
-                    market_data[f"{asset}_{field}"] = value
+                    market_data[(asset, field)] = value
         
-        # Make sure the market data has proper MultiIndex columns
-        # This ensures compatibility with the calculate_portfolio_risk method
-        try:
-            # Try to convert columns to MultiIndex if they're not already
-            if not isinstance(market_data.columns, pd.MultiIndex):
-                # Create a list of tuples for MultiIndex
-                tuples = []
-                for col in market_data.columns:
-                    if '_' in col:
-                        # Split column names like "BTC_close" into ("BTC", "close")
-                        asset, field = col.split('_', 1)
-                        tuples.append((asset, field))
-                    else:
-                        # Default for columns without underscore
-                        tuples.append((col, 'value'))
-                
-                # Create MultiIndex
-                market_data.columns = pd.MultiIndex.from_tuples(tuples, names=['asset', 'field'])
-        except Exception as e:
-            logger.warning(f"Could not convert columns to MultiIndex: {str(e)}")
-            # Continue with the format we have
+        # Ensure the market data has proper MultiIndex columns
+        if not isinstance(market_data.columns, pd.MultiIndex):
+            # Convert columns to MultiIndex
+            tuples = []
+            for col in market_data.columns:
+                if isinstance(col, tuple):
+                    tuples.append(col)
+                elif '_' in col:
+                    # Split column names like "BTC_close" into ("BTC", "close")
+                    asset, field = col.split('_', 1)
+                    tuples.append((asset, field))
+                else:
+                    # Default for columns without underscore
+                    tuples.append((col, 'value'))
+            
+            # Create MultiIndex
+            market_data.columns = pd.MultiIndex.from_tuples(tuples, names=['asset', 'field'])
         
+        # Calculate comprehensive risk metrics
         return self.calculate_portfolio_risk(positions, market_data, balance)
         
     def _calculate_position_metrics(

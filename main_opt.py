@@ -1423,34 +1423,33 @@ class TradingSystem:
                     # Check trades_executed flag
                     if info.get('trades_executed', False):
                         trade_detected = True
-                        # logger.info(f"Trade executed at step {step_count} (via trades_executed flag)")
                     
                     # Check positions directly
+                    if 'positions' in info:
+                        positions = info['positions']
+                        active_count = 0
+                        for asset, pos in positions.items():
+                            if isinstance(pos, dict) and abs(pos.get('size', 0)) > 1e-8:
+                                active_count += 1
+                        if active_count > 0:
+                            trade_detected = True
+                            
+                    # Also check active_positions if available
                     if 'active_positions' in info:
                         active_positions = info['active_positions']
                         if active_positions:
-                            position_str = []
-                            for asset, size in active_positions.items():
-                                if isinstance(size, (int, float)) and abs(size) > 1e-8:
-                                    position_str.append(f"{asset}: {size:.4f}")
-                            
-                            if position_str:
-                                logger.info(f"Active positions: {', '.join(position_str)}")
-                                trade_detected = True
+                            trade_detected = True
                     
                     # Check recent trades count
                     if info.get('recent_trades_count', 0) > 0:
-                        logger.info(f"Recent trades: {info.get('recent_trades_count')}")
                         trade_detected = True
                     
                     # Check has_positions flag
                     if info.get('has_positions', False):
-                        logger.info("Has positions flag is True")
                         trade_detected = True
                     
-                    # Check total_trades_count
+                    # Check total_trades count
                     if info.get('total_trades', 0) > 0:
-                        logger.info(f"Total trades count: {info.get('total_trades')}")
                         trade_detected = True
                 
                 if trade_detected:
@@ -1769,8 +1768,8 @@ class TradingSystem:
         # Best model callback - track and save the best model based on evaluation metrics
         best_model_callback = BestModelCallback(
             eval_env=self.env,
-            n_eval_episodes=3,
-            eval_freq=20000,
+            n_eval_episodes=5,
+            eval_freq=10000,
             log_dir=self.config['logging']['log_dir'],
             model_dir=self.config['model']['checkpoint_dir'],
             verbose=1
@@ -1921,8 +1920,8 @@ class TradingSystem:
         # Best model callback
         best_model_callback = BestModelCallback(
             eval_env=self.env,
-            n_eval_episodes=3,
-            eval_freq=20000,
+            n_eval_episodes=5,
+            eval_freq=10000,
             log_dir=self.config['logging']['log_dir'],
             model_dir=self.config['model']['checkpoint_dir'],
             verbose=1
@@ -2257,23 +2256,36 @@ class BestModelCallback(BaseCallback):
         if self.n_calls - self.last_eval_step >= self.eval_freq:
             self.last_eval_step = self.n_calls
             
+            # Add timing information for diagnostics
+            start_time = time.time()
+            logger.info(f"Starting evaluation at step {self.n_calls}...")
+            
             # Evaluate the model
             mean_reward, std_reward = self._evaluate_model()
+            
+            # Log evaluation duration
+            eval_duration = time.time() - start_time
+            logger.info(f"Evaluation completed in {eval_duration:.2f} seconds")
             
             # Log evaluation metrics to wandb
             wandb.log({
                 "eval/mean_reward": mean_reward,
                 "eval/std_reward": std_reward,
+                "eval/duration_seconds": eval_duration,
                 "global_step": self.n_calls
             })
             
             # Save best performing model
             if mean_reward > self.best_mean_reward:
                 self.best_mean_reward = mean_reward
+                
+                # Add timing for model saving
+                save_start_time = time.time()
+                logger.info(f"Saving new best model (reward: {mean_reward:.4f})...")
+                
                 # Save model
                 best_model_path = os.path.join(self.model_dir, "best_model")
                 self.model.save(best_model_path)
-                self.eval_env.save(os.path.join(self.model_dir, "best_env.pkl"))
                 
                 # Log to wandb
                 wandb.log({
@@ -2291,22 +2303,51 @@ class BestModelCallback(BaseCallback):
         episode_rewards = []
         
         for i in range(self.n_eval_episodes):
-            # Reset the environment
-            obs = self.eval_env.reset()
+            # Reset the environment - handle different return formats
+            reset_result = self.eval_env.reset()
+            if isinstance(reset_result, tuple):
+                if len(reset_result) == 2:  # (obs, info) - Gymnasium format
+                    obs, _ = reset_result
+                else:  # Older format
+                    obs = reset_result[0]
+            else:
+                obs = reset_result
+            
             done = False
             episode_reward = 0.0
             
             while not done:
                 # Get action from model
                 action, _ = self.model.predict(obs, deterministic=True)
-                # Execute step
-                obs, reward, done, info = self.eval_env.step(action)
+                
+                # Execute step in environment - handle different return formats
+                step_result = self.eval_env.step(action)
+                
+                # Handle different return formats from env.step()
+                if isinstance(step_result, tuple):
+                    if len(step_result) == 5:  # Gymnasium format (obs, reward, terminated, truncated, info)
+                        obs, reward, terminated, truncated, info = step_result
+                        done = terminated or truncated
+                    elif len(step_result) == 4:  # Older gym format (obs, reward, done, info)
+                        obs, reward, done, info = step_result
+                    else:
+                        logger.error(f"Unexpected step_result length: {len(step_result)}")
+                        break
+                else:
+                    # Unlikely, but handle in case step returns a non-tuple
+                    logger.error(f"Unexpected step_result type: {type(step_result)}")
+                    break
+                
+                # Add reward to episode total
                 episode_reward += reward
                 
             episode_rewards.append(episode_reward)
             
         mean_reward = np.mean(episode_rewards)
         std_reward = np.std(episode_rewards)
+        
+        if self.verbose > 0:
+            logger.info(f"Evaluation: {self.n_eval_episodes} episodes, mean reward: {mean_reward:.4f}, std: {std_reward:.4f}")
         
         return mean_reward, std_reward
 

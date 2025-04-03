@@ -107,6 +107,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                  maintenance_margin: float = 0.1,  # Maintenance margin as fraction of initial balance
                  max_steps: int = 10000,  # Maximum number of steps before episode terminates
                  max_no_trade_steps: int = 1000,  # Maximum number of steps without trading
+                 enforce_min_leverage: bool = False,  # Flag to enforce minimum leverage of 1.0
                  verbose: bool = False,
                  training_mode: bool = False):  # Add training mode flag
         """
@@ -128,6 +129,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             maintenance_margin: Maintenance margin requirement as fraction of position
             max_steps: Maximum number of steps before episode terminates
             max_no_trade_steps: Maximum number of steps without trading
+            enforce_min_leverage: Flag to enforce minimum leverage of 1.0
             verbose: Whether to log detailed trading information
             training_mode: Whether environment is in training mode (reduces calculation frequency)
         """
@@ -175,7 +177,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             logger.info("Using provided risk engine")
         
         # Store verbose flag
-        self.verbose = False  # Use the passed parameter instead of hardcoding to False
+        self.verbose = verbose  # Use the passed parameter instead of hardcoding to False
         
         # Adjust logging level based on verbose flag
         if self.verbose:
@@ -201,6 +203,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.max_drawdown = max_drawdown  # Use the passed parameter
         self.risk_free_rate = risk_free_rate
         self.maintenance_margin = maintenance_margin  # Store maintenance margin
+        self.enforce_min_leverage = enforce_min_leverage  # Store flag for minimum leverage enforcement
         self.slippage = 0.0002  # Default slippage of 0.02%
         
         # Extract unique assets from MultiIndex
@@ -234,6 +237,9 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.position_duration = {asset: 0 for asset in self.assets}
         self.position_profits = {asset: [] for asset in self.assets}
         self.profitable_holding_bonus = 0.0  # Will accumulate bonuses for holding profitable positions
+        
+        # Set signal threshold for trade triggering
+        self.signal_threshold = 0.1  # Default signal threshold (action must exceed this to trigger trade)
         
         # Initialize funding rates and accrued funding
         self.funding_rates = {asset: 0.0 for asset in self.assets}
@@ -299,9 +305,29 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.max_no_trade_steps = max_no_trade_steps
         
         # ENHANCEMENT: Add trading cooldown tracker to prevent excessive trading
-        self.last_trade_step = {asset: -100 for asset in assets}  # Initialize with negative value to allow initial trades
-        self.min_steps_between_trades = 5  # Minimum steps between trades for the same asset
+        self.last_trade_step = {asset: 0 for asset in self.assets}  # Initialize with 0 steps
+        self.min_steps_between_trades = 1  # Minimum steps between trades for the same asset
         self.signal_threshold = 0.15  # Minimum signal strength required for trading (increased from 0.1)
+        
+        # Initialize price history
+        self.price_history = {asset: deque(maxlen=1000) for asset in self.assets}
+        
+        # Initialize historical metrics tracking
+        self.historical_metrics = {
+            'returns': deque(maxlen=100),
+            'volatility': deque(maxlen=100),
+            'sharpe': deque(maxlen=100),
+            'drawdown': deque(maxlen=100)
+        }
+        
+        # Initialize market conditions dictionary
+        self.market_conditions = {
+            'volatility_regime': {asset: 0.5 for asset in self.assets},
+            'trend_strength': {asset: 0.0 for asset in self.assets},
+            'market_regime': 'normal',
+            'overall_market_state': 'normal',  # FIXED: Add missing overall_market_state key
+            'liquidity_conditions': {}  # FIXED: Add missing liquidity_conditions to avoid errors
+        }
         
         self.reset()
 
@@ -429,11 +455,11 @@ class InstitutionalPerpetualEnv(gym.Env):
             
         # Reset market conditions
         self.market_conditions = {
-            'market_regime': {asset: 0.5 for asset in self.assets},
             'volatility_regime': {asset: 0.5 for asset in self.assets},
-            'liquidity_conditions': {asset: 0.5 for asset in self.assets},
-            'abnormal_price_movements': {asset: False for asset in self.assets},
-            'overall_market_state': 'normal'
+            'trend_strength': {asset: 0.0 for asset in self.assets},
+            'market_regime': 'normal',
+            'overall_market_state': 'normal',  # FIXED: Add missing overall_market_state key
+            'liquidity_conditions': {}  # FIXED: Add missing liquidity_conditions to avoid errors
         }
         
         # Reset market regime
@@ -561,10 +587,15 @@ class InstitutionalPerpetualEnv(gym.Env):
             self.market_regime = 0.5  # Default neutral
             
             # Calculate average market regime across assets
-            if self.market_conditions and 'market_regime' in self.market_conditions:
+            if self.market_conditions and isinstance(self.market_conditions, dict) and 'market_regime' in self.market_conditions:
                 regimes = self.market_conditions['market_regime']
-                if regimes:
+                # FIXED: Check if regimes is a dictionary before trying to call values() on it
+                if isinstance(regimes, dict) and regimes:
                     self.market_regime = np.mean(list(regimes.values()))
+                elif isinstance(regimes, str):
+                    # Handle case where market_regime is a string
+                    regime_value_map = {'volatile': 0.8, 'range_bound': 0.2, 'normal': 0.5, 'trending': 0.7, 'crisis': 0.9}
+                    self.market_regime = regime_value_map.get(regimes, 0.5)
             
             # ENHANCED: Update environment parameters based on market conditions
             self._update_adaptive_parameters()
@@ -586,7 +617,8 @@ class InstitutionalPerpetualEnv(gym.Env):
             
             # ENHANCEMENT: Add an adaptive filter based on market conditions
             # In stable or low-volatility market conditions, apply higher threshold
-            if hasattr(self, 'market_conditions') and 'overall_market_state' in self.market_conditions:
+            # FIXED: Safely check if market_conditions is a dictionary and contains 'overall_market_state'
+            if hasattr(self, 'market_conditions') and isinstance(self.market_conditions, dict) and 'overall_market_state' in self.market_conditions:
                 market_state = self.market_conditions.get('overall_market_state', 'normal')
                 
                 # Determine action threshold based on market state
@@ -863,6 +895,107 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Check if we've reached the maximum allowed steps
             truncated = self.current_step >= len(self.df) - 1 or self.current_step >= self.max_steps
             
+            # Add at the end of the step method, before returning the observation, reward, etc.
+            # Log portfolio summary at the end of the step
+            if self.verbose:
+                # Calculate total portfolio statistics
+                total_notional_value = 0
+                total_margin_used = 0
+                total_unrealized_pnl = 0
+                active_positions_count = 0
+                
+                # Calculate current portfolio value
+                portfolio_value = self._calculate_portfolio_value()
+                
+                # Format header as a table
+                logger.info(f"\n{'='*70}")
+                logger.info(f"|| PORTFOLIO SUMMARY - STEP {self.current_step} {' '*(44-len(str(self.current_step)))}||")
+                logger.info(f"||{'-'*68}||")
+                logger.info(f"|| Balance: ${self.balance:.2f} | Portfolio Value: ${portfolio_value:.2f} {' '*(21-len(f'{portfolio_value:.2f}'))}||")
+                logger.info(f"||{'-'*68}||")
+                
+                # Table header for positions if any exist
+                has_active_positions = any(abs(p['size']) > 1e-8 for p in self.positions.values())
+                if has_active_positions:
+                    logger.info(f"|| {'ASSET':<8} | {'DIRECTION':<8} | {'SIZE':<10} | {'ENTRY':<8} | {'CURRENT':<8} | {'PNL':<12} ||")
+                    logger.info(f"||{'-'*68}||")
+                
+                # Log each position
+                for asset, position in self.positions.items():
+                    position_size = position['size']
+                    
+                    if abs(position_size) > 1e-8:  # Only log active positions
+                        active_positions_count += 1
+                        current_price = position.get('mark_price', self._get_mark_price(asset))
+                        entry_price = position['entry_price']
+                        leverage = position.get('leverage', 1.0)
+                        
+                        # Calculate position metrics
+                        notional_value = abs(position_size * current_price)
+                        
+                        # Get actual position leverage, using a default of max_leverage if not set
+                        leverage = min(position.get('leverage', self.max_leverage), self.max_leverage)
+                        leverage = max(1.0, leverage)  # Ensure leverage is at least 1.0
+                        
+                        # Calculate margin used correctly based on leverage
+                        margin_used = notional_value / leverage if leverage > 0 else notional_value
+                        
+                        # Ensure margin used doesn't exceed notional value for leverage < 1
+                        margin_used = min(margin_used, notional_value)
+                        
+                        # Calculate PnL
+                        if position_size > 0:  # Long
+                            unrealized_pnl = position_size * (current_price - entry_price)
+                            direction = "LONG"
+                        else:  # Short
+                            unrealized_pnl = abs(position_size) * (entry_price - current_price)
+                            direction = "SHORT"
+                        
+                        # Add to totals
+                        total_notional_value += notional_value
+                        total_margin_used += margin_used
+                        total_unrealized_pnl += unrealized_pnl
+                        
+                        # Calculate PnL percentage
+                        pnl_pct = (unrealized_pnl / margin_used) * 100 if margin_used > 0 else 0
+                        
+                        # Format position row
+                        pnl_str = f"${unrealized_pnl:.2f} ({pnl_pct:+.2f}%)"
+                        logger.info(f"|| {asset:<8} | {direction:<8} | {position_size:<10.6f} | ${entry_price:<7.2f} | ${current_price:<7.2f} | {pnl_str:<12} ||")
+                
+                # Print summary footer
+                logger.info(f"||{'-'*68}||")
+                logger.info(f"|| ACCOUNT METRICS {' '*51}||")
+                logger.info(f"||{'-'*68}||")
+                
+                # Calculate account metrics
+                available_balance = portfolio_value - total_margin_used
+                
+                # Check if margin used exceeds portfolio value, which shouldn't be possible
+                if total_margin_used > portfolio_value:
+                    logger.warning(f"Margin used (${total_margin_used:.2f}) exceeds portfolio value (${portfolio_value:.2f}). Capping at portfolio value.")
+                    total_margin_used = portfolio_value
+                    available_balance = 0
+                
+                # Calculate margin ratio based on portfolio value, not just balance
+                margin_ratio = (total_margin_used / portfolio_value) * 100 if portfolio_value > 0 else 0
+                
+                # Calculate leverage based on notional value and portfolio value
+                total_leverage = total_notional_value / portfolio_value if portfolio_value > 0 else 0
+                
+                # Check if leverage exceeds max leverage
+                if total_leverage > self.max_leverage:
+                    logger.warning(f"Current leverage ({total_leverage:.2f}x) exceeds max leverage ({self.max_leverage:.2f}x)")
+                
+                # Log account summary
+                logger.info(f"|| Available Balance:     ${available_balance:<10.2f} {' '*36}||")
+                logger.info(f"|| Total Notional Value:  ${total_notional_value:<10.2f} {' '*36}||")
+                logger.info(f"|| Total Margin Used:     ${total_margin_used:<10.2f} ({margin_ratio:.2f}% of portfolio) {' '*10}||")
+                logger.info(f"|| Total Unrealized PnL:  ${total_unrealized_pnl:<10.2f} {' '*36}||")
+                logger.info(f"|| Account Leverage:      {total_leverage:<10.2f}x {' '*36}||")
+                logger.info(f"|| Active Positions:      {active_positions_count}/{len(self.assets)} {' '*36}||")
+                logger.info(f"{'='*70}\n")
+            
             # Return the observation, reward, done flag, and info
             return self._get_observation(), reward, terminated, truncated, info
             
@@ -875,6 +1008,19 @@ class InstitutionalPerpetualEnv(gym.Env):
     def _simulate_trades(self, trades: List[Dict]) -> Dict:
         """Simulate trades to check risk limits"""
         try:
+            # PERFORMANCE OPTIMIZATION: Cache all mark prices 
+            mark_prices = {}
+            
+            # First identify all assets we'll need prices for
+            assets_to_check = set(self.positions.keys())
+            for trade in trades:
+                if 'asset' in trade:
+                    assets_to_check.add(trade['asset'])
+            
+            # Cache all prices in one go
+            for asset in assets_to_check:
+                mark_prices[asset] = self._get_mark_price(asset)
+            
             simulated_positions = copy.deepcopy(self.positions)
             
             for trade in trades:
@@ -889,11 +1035,10 @@ class InstitutionalPerpetualEnv(gym.Env):
                         simulated_positions[asset]['size'] += size_change
                     else:
                         # Initialize if missing
-                        mark_price = self._get_mark_price(asset)
                         simulated_positions[asset] = {
                             'size': size_change,
-                            'entry_price': mark_price,
-                            'last_price': mark_price
+                            'entry_price': mark_prices[asset],
+                            'last_price': mark_prices[asset]
                         }
             
             # Calculate simulated risk metrics
@@ -901,42 +1046,84 @@ class InstitutionalPerpetualEnv(gym.Env):
             gross_exposure = 0  # Total absolute exposure (for risk limits)
             net_exposure = 0    # Net directional exposure (for leverage direction)
             asset_values = {}
+            total_unrealized_pnl = 0
             
+            # OPTIMIZATION: Calculate unrealized PnL and exposures in a single loop
             for asset, position in simulated_positions.items():
                 # Skip assets with no position
-                if abs(position['size']) < 1e-8:
+                position_size = position['size']
+                if abs(position_size) < 1e-8:
                     continue
                     
-                # Get current price
-                price = self._get_mark_price(asset)
+                # Use cached price
+                price = mark_prices[asset]
                 
-                # CRITICAL FIX: Calculate unrealized PnL correctly for both long and short positions
-                unrealized_pnl = position['size'] * (price - position['entry_price'])
-                portfolio_value += unrealized_pnl
+                # Calculate unrealized PnL for both long and short positions
+                entry_price = position['entry_price']
+                unrealized_pnl = position_size * (price - entry_price)
+                total_unrealized_pnl += unrealized_pnl
                 
-                # Calculate both gross and net exposure
-                position_value = position['size'] * price  # With sign (negative for shorts)
-                position_exposure = abs(position_value)    # Absolute value (for risk)
+                # Calculate exposures
+                position_value = position_size * price  # Signed value (negative for shorts)
+                position_exposure = abs(position_value)  # Absolute value (for risk limits)
                 
-                gross_exposure += position_exposure  # Always positive (for risk limits)
-                net_exposure += position_value       # Can be negative (for directional leverage)
+                gross_exposure += position_exposure
+                net_exposure += position_value
                 asset_values[asset] = position_exposure
             
-            # Ensure we don't divide by zero and portfolio value isn't extremely negative
+            # Update portfolio value with unrealized PnL
+            portfolio_value += total_unrealized_pnl
+            
+            # Ensure portfolio value isn't extremely negative
             portfolio_value = max(portfolio_value, self.initial_balance * 0.01)
             
-            # Calculate leverage - now with proper sign for direction
-            # For risk purposes, we use gross leverage (always positive)
-            gross_leverage = gross_exposure / portfolio_value
+            # OPTIMIZATION: Calculate margin and leverage in a single loop
+            total_margin = 0
             
-            # For tracking directional exposure, we use net leverage (can be negative)
-            net_leverage = net_exposure / portfolio_value
+            for asset, position in simulated_positions.items():
+                position_size = position['size']
+                if abs(position_size) < 1e-8:
+                    continue
+                    
+                # Get leverage with limits
+                leverage = min(position.get('leverage', self.max_leverage), self.max_leverage)
+                leverage = max(1.0, leverage)  # Ensure minimum leverage
+                
+                # Calculate margin using cached price
+                notional = abs(position_size * mark_prices[asset])
+                position_margin = notional / leverage if leverage > 0 else notional
+                total_margin += position_margin
             
-            # CRITICAL FIX: Enforce maximum leverage limit on gross leverage
-            # This ensures risk limits are enforced regardless of direction
-            max_allowed_leverage = self.max_leverage  # Use configured max_leverage without hardcoding
+            # Calculate leverage ratios
+            gross_leverage = gross_exposure / portfolio_value if portfolio_value > 0 else 0
+            net_leverage = net_exposure / portfolio_value if portfolio_value > 0 else 0
             
+            # Check for risk limit violations
+            risk_limit_exceeded = False
+            exceeded_limits = []
+            
+            # Check margin limit
+            if total_margin > portfolio_value:
+                risk_limit_exceeded = True
+                exceeded_limits.append(f"Margin (${total_margin:.2f}) exceeds portfolio value (${portfolio_value:.2f})")
+                
+                # Return immediately with no scaled trades
+                return {
+                    'portfolio_value': portfolio_value,
+                    'gross_leverage': gross_leverage,
+                    'net_leverage': net_leverage,
+                    'max_concentration': max(asset_values.values()) / portfolio_value if asset_values else 0,
+                    'risk_limit_exceeded': True,
+                    'exceeded_limits': exceeded_limits,
+                    'scaled_trades': []  # No trades will be executed
+                }
+            
+            # Check leverage limit
+            max_allowed_leverage = self.max_leverage
             if gross_leverage > max_allowed_leverage:
+                risk_limit_exceeded = True
+                exceeded_limits.append(f"Leverage {gross_leverage:.2f}x > {max_allowed_leverage:.2f}x")
+                
                 # Scale down positions to achieve target leverage
                 scale_factor = max_allowed_leverage / gross_leverage
                 
@@ -949,23 +1136,20 @@ class InstitutionalPerpetualEnv(gym.Env):
                         if abs(scaled_trade['size_change']) > 1e-8:  # Only include non-zero trades
                             scaled_trades.append(scaled_trade)
                 
-                # Recalculate leverage with scaled trades
-                gross_leverage = max_allowed_leverage
-                
                 # Log leverage scaling
                 logger.warning(f"Scaling down trades to maintain leverage below {max_allowed_leverage:.2f}x (was {gross_leverage:.2f}x)")
                 
                 return {
                     'portfolio_value': portfolio_value,
-                    'gross_leverage': gross_leverage,
-                    'net_leverage': net_leverage * scale_factor,  # Scale net leverage too
+                    'gross_leverage': max_allowed_leverage,  # Use the limit as the new leverage
+                    'net_leverage': net_leverage * scale_factor,
                     'max_concentration': max(asset_values.values()) / portfolio_value if asset_values else 0,
                     'risk_limit_exceeded': True,
-                    'exceeded_limits': [f"Leverage {gross_leverage:.2f}x > {max_allowed_leverage:.2f}x"],
+                    'exceeded_limits': exceeded_limits,
                     'scaled_trades': scaled_trades
                 }
             
-            # Calculate position concentration
+            # Check concentration limit
             max_concentration = 0
             max_asset = ""
             for asset, value in asset_values.items():
@@ -974,17 +1158,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                     max_concentration = concentration
                     max_asset = asset
             
-            # CRITICAL FIX: Check if we exceed risk limits
-            risk_limit_exceeded = False
-            exceeded_limits = []
-            
-            # Check leverage limit
-            if gross_leverage > self.max_leverage:
-                risk_limit_exceeded = True
-                exceeded_limits.append(f"Leverage {gross_leverage:.2f}x > {self.max_leverage:.2f}x")
-            
-            # Check concentration limit
-            concentration_limit = 0.4  # Default, can be overridden by risk engine
+            concentration_limit = 0.4  # Default
             if self.risk_engine:
                 concentration_limit = self.risk_engine.risk_limits.position_concentration
                 
@@ -992,21 +1166,17 @@ class InstitutionalPerpetualEnv(gym.Env):
                 risk_limit_exceeded = True
                 exceeded_limits.append(f"Concentration {max_concentration:.2%} > {concentration_limit:.2%} for {max_asset}")
             
-            # CRITICAL FIX: Scale down trades if they would exceed risk limits
+            # Scale down trades if any risk limits exceeded
             scaled_trades = []
             if risk_limit_exceeded and len(trades) > 0:
-                # logger.warning(f"Risk limits would be exceeded: {', '.join(exceeded_limits)}")
-                
                 # Calculate scaling factor
                 scale_factor = 0.8  # Default scale down by 20%
                 
                 if gross_leverage > self.max_leverage:
-                    # Scale to get within leverage limit
                     leverage_scale = (self.max_leverage * 0.9) / gross_leverage
                     scale_factor = min(scale_factor, leverage_scale)
                 
                 if max_concentration > concentration_limit:
-                    # Scale to get within concentration limit
                     concentration_scale = (concentration_limit * 0.9) / max_concentration
                     scale_factor = min(scale_factor, concentration_scale)
                 
@@ -1015,7 +1185,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                     if 'size_change' in trade:
                         scaled_trade = trade.copy()
                         scaled_trade['size_change'] = trade['size_change'] * scale_factor
-                        if abs(scaled_trade['size_change']) > 1e-8:  # Only include non-zero trades
+                        if abs(scaled_trade['size_change']) > 1e-8:
                             scaled_trades.append(scaled_trade)
                 
                 logger.info(f"Scaling trades by factor {scale_factor:.4f} to comply with risk limits")
@@ -1053,150 +1223,291 @@ class InstitutionalPerpetualEnv(gym.Env):
             }
         
     def _execute_trades(self, trades: List[Dict]):
-        """Smart order execution with transaction cost model"""
+        """
+        Execute a list of trades and update positions
+        
+        Args:
+            trades: List of trade dictionaries
+        """
         try:
-            # CRITICAL FIX: Calculate portfolio value at the beginning of trade execution
-            portfolio_value = self._calculate_portfolio_value()
+            if not trades:
+                return
+                
+            # Get current portfolio value before execution
+            current_portfolio_value = self._calculate_portfolio_value()
             
+            # PERFORMANCE OPTIMIZATION: Cache all mark prices once
+            mark_prices = {asset: self._get_mark_price(asset) for asset in self.positions.keys()}
+            # Also cache mark prices for any assets in trades that might not be in positions yet
+            for trade in trades:
+                if 'asset' in trade and trade['asset'] not in mark_prices:
+                    mark_prices[trade['asset']] = self._get_mark_price(trade['asset'])
+            
+            # First pass: estimate margin for each position after proposed trades
+            simulated_positions = copy.deepcopy(self.positions)
+            
+            # Update simulated positions with the proposed trades
             for trade in trades:
                 asset = trade['asset']
                 
-                # Safely extract trade parameters with defaults
-                direction = trade.get('direction', 1 if trade.get('size_change', 0) > 0 else -1)
-                leverage = trade.get('leverage', 1.0)
-                risk_limits = trade.get('risk_limits', {'max_slippage': 0.001, 'max_impact': 0.002})
-                
-                # Get execution parameters (default to full execution)
-                execution_params = trade.get('execution_params', [1.0])
-                
-                # CRITICAL FIX: Capture original position for proper PnL calculation
-                original_position = self.positions[asset]['size']
-                original_entry_price = self.positions[asset]['entry_price']
-                
-                # If we have size_change, use that directly
-                if 'size_change' in trade and trade['size_change'] != 0:
-                    # Get current price
-                    mark_price = self._get_mark_price(asset)
+                if 'size_change' in trade:
                     size_change = trade['size_change']
                     
-                    # CRITICAL FIX: Calculate monetary value of the position change
-                    position_change_value = size_change * mark_price
+                    if asset in simulated_positions:
+                        # Update existing position
+                        simulated_positions[asset]['size'] += size_change
+                    else:
+                        # Create new position
+                        leverage = trade.get('leverage', 1.0)
+                        simulated_positions[asset] = {
+                            'size': size_change,
+                            'entry_price': mark_prices[asset],
+                            'mark_price': mark_prices[asset],
+                            'leverage': leverage
+                        }
+            
+            # Calculate total margin that would be used after these trades
+            estimated_total_margin = 0
+            total_notional_after_trade = 0
+            
+            # PERFORMANCE OPTIMIZATION: Calculate margin and notional in a single loop
+            for asset, position in simulated_positions.items():
+                position_size = position['size']
                 
-                    # Apply transaction costs
-                    # Apply slippage model - implementation shortfall
-                    price_impact = self._estimate_price_impact(asset, position_change_value)
-                    execution_price = mark_price * (1 + price_impact * direction)
+                # Skip if position would be effectively closed
+                if abs(position_size) < 1e-8:
+                    continue
                     
-                    # Apply transaction costs
-                    total_cost = abs(position_change_value) * (
-                        self.commission + 
-                        price_impact + 
-                        self._get_spread_cost(asset)
-                    )
+                # Get leverage for this position
+                leverage = min(position.get('leverage', self.max_leverage), self.max_leverage)
+                leverage = max(1.0, leverage)  # Ensure leverage is at least 1.0
                 
-                    # CRITICAL FIX: If closing a position, calculate realized PnL
-                    realized_pnl = 0.0
-                    if original_position != 0 and ((original_position > 0 and size_change < 0) or 
-                                                  (original_position < 0 and size_change > 0)):
-                        # We're reducing or closing position, calculate PnL on closed portion
-                        if abs(size_change) >= abs(original_position):
-                            # Fully closing or flipping
-                            if original_position > 0:  # Long position
-                                realized_pnl = original_position * (execution_price - original_entry_price)
-                            else:  # Short position
-                                realized_pnl = original_position * (original_entry_price - execution_price)
-                        else:
-                            # Partial close
-                            closed_size = min(abs(original_position), abs(size_change))
-                            if original_position > 0:  # Long position
-                                realized_pnl = closed_size * (execution_price - original_entry_price)
-                            else:  # Short position
-                                realized_pnl = closed_size * (original_entry_price - execution_price)
-                            
-                    # Adjust realized PnL by commission costs
-                    realized_pnl -= abs(size_change) * execution_price * self.commission
+                # Calculate position metrics using cached price
+                notional_value = abs(position_size * mark_prices[asset])
+                position_margin = notional_value / leverage if leverage > 0 else notional_value
+                
+                # Add to totals
+                estimated_total_margin += position_margin
+                total_notional_after_trade += notional_value
+            
+            # Check if margin would exceed portfolio value
+            if estimated_total_margin > current_portfolio_value:
+                logger.warning(f"Trade rejected: Estimated margin (${estimated_total_margin:.2f}) would exceed portfolio value (${current_portfolio_value:.2f})")
+                return
+            
+            # Check if leverage would exceed max account leverage
+            estimated_leverage = total_notional_after_trade / current_portfolio_value if current_portfolio_value > 0 else 0
+            if estimated_leverage > self.max_leverage:
+                logger.warning(f"Trade rejected: Estimated leverage ({estimated_leverage:.2f}x) would exceed max account leverage ({self.max_leverage:.2f}x)")
+                return
+            
+            # Execute each trade
+            for trade in trades:
+                asset = trade['asset']
+                
+                # Handle different trade dictionary structures
+                if 'size_change' in trade:
+                    size_change = trade['size_change']
+                    execution_price = trade.get('execution_price', mark_prices[asset])
+                    target_leverage = trade.get('leverage', 1.0)  # Default to 1.0x leverage
                     
-                    # CRITICAL FIX: Update balance with realized PnL and costs
-                    self.balance += realized_pnl - total_cost
+                    # Skip trades with negligible size
+                    if abs(size_change) < 1e-8:
+                        continue
                     
-                    # Update position size
-                    self.positions[asset]['size'] += size_change
+                    # Calculate trade value for cost calculation
+                    trade_value = abs(size_change * execution_price)
                     
-                    # CRITICAL FIX: Update entry price properly using weighted average
-                    if self.positions[asset]['size'] != 0:
-                        if abs(size_change) > abs(original_position) and np.sign(size_change) != np.sign(original_position):
-                            # Direction flipped, use new price
-                            self.positions[asset]['entry_price'] = execution_price
-                        elif original_position != 0 and np.sign(size_change) == np.sign(original_position):
-                            # Adding to position, calculate weighted average
-                            total_size = abs(self.positions[asset]['size'])
-                            original_value = abs(original_position) * original_entry_price
-                            new_value = abs(size_change) * execution_price
-                            self.positions[asset]['entry_price'] = (original_value + new_value) / total_size
-                        elif original_position == 0:
-                            # New position
-                            self.positions[asset]['entry_price'] = execution_price
+                    # Calculate transaction cost
+                    cost = self._calculate_transaction_cost(trade_value)
                     
-                    self.total_costs += total_cost
+                    # Log the trade
+                    if self.verbose:
+                        direction = "buy" if size_change > 0 else "sell"
+                        leverage_str = f", leverage={target_leverage:.2f}x" if target_leverage != 1.0 else ""
+                        logger.info(f"Executing trade for {asset}: size change {size_change} at ${execution_price:.2f}{leverage_str}")
                     
-                    # INDUSTRY-LEVEL FIX: Properly handle leverage for DEX-style trading
-                    position_size = self.positions[asset]['size']  # Current position size after update
-                    
-                    # Use target leverage when establishing/modifying position
-                    if abs(position_size) > 1e-8:  # Only for non-zero positions
-                        # Get the target leverage from the stored value during signal processing
-                        target_leverage = self.positions[asset].get('target_leverage', 0.0)
+                    # Update position
+                    if asset in self.positions:
+                        # Get existing position details
+                        current_size = self.positions[asset]['size']
+                        current_entry = self.positions[asset]['entry_price']
                         
-                        # FIXED: Don't force minimum 1.0x leverage, allow the actual target leverage 
-                        # For new positions or when adding to position, use the target leverage
-                        if original_position == 0 or (np.sign(original_position) == np.sign(size_change)):
-                            # When opening or increasing position, use the target leverage as is
+                        # CRITICAL FIX: Calculate new entry price based on direction
+                        # If adding to position, calculate weighted average
+                        if (current_size > 0 and size_change > 0) or (current_size < 0 and size_change < 0):
+                            # Adding to existing position (same direction)
+                            new_size = current_size + size_change
+                            if abs(new_size) > 1e-8:  # Avoid division by zero
+                                new_entry = (current_size * current_entry + size_change * execution_price) / new_size
+                            else:
+                                new_entry = current_entry  # Position being closed, entry doesn't matter
+                        else:
+                            # Reducing or reversing position
+                            if abs(current_size) <= abs(size_change):
+                                # Position is being closed and possibly reversed
+                                if abs(current_size + size_change) < 1e-8:
+                                    # Position closed completely
+                                    new_entry = 0  # Will be reset if needed
+                                    if self.verbose:
+                                        logger.info(f"Position closed for {asset}")
+                                else:
+                                    # Position reversed, use execution price as new entry
+                                    new_entry = execution_price
+                            else:
+                                # Position reduced but not closed or reversed, keep same entry
+                                new_entry = current_entry
+                        
+                        # Update position
+                        if abs(current_size + size_change) < 1e-8:
+                            # Position effectively closed
+                            self.positions[asset]['size'] = 0
+                            self.positions[asset]['entry_price'] = 0
+                            # Preserve other fields like funding_accrued
+                        else:
+                            # Update position size and entry price
+                            self.positions[asset]['size'] = current_size + size_change
+                            self.positions[asset]['entry_price'] = new_entry
                             self.positions[asset]['leverage'] = target_leverage
                         
-                        # For existing positions being reduced, keep the existing leverage
-                        # This maintains the leverage when taking partial profits
+                        # Add trade to history with updated position details
+                        trade_info = {
+                            'asset': asset,
+                            'timestamp': self.current_step,
+                            'size_change': size_change,
+                            'price': execution_price,
+                            'value': trade_value,
+                            'cost': cost,
+                            'type': 'add' if (current_size > 0 and size_change > 0) or (current_size < 0 and size_change < 0) else 'reduce'
+                        }
                         
-                        # Ensure leverage is capped at max_leverage but no minimum constraint
-                        self.positions[asset]['leverage'] = min(self.positions[asset]['leverage'], self.max_leverage)
+                        # ENHANCED TRACKING: Record the reason for the trade and its PnL
+                        if 'reason' in trade:
+                            trade_info['reason'] = trade['reason']
                         
-                        # Use the position's leverage for reporting
-                        actual_leverage = self.positions[asset]['leverage']
+                        # Add to trades history
+                        self.trades_history.append(trade_info)
+                        
                     else:
-                        # Zero position has zero leverage
-                        self.positions[asset]['leverage'] = 0.0
-                        actual_leverage = 0.0
-                    
-                    # Add trade to history
-                    self.trades.append({
-                        'timestamp': self.current_step,
-                        'asset': asset,
-                        'size': size_change,
-                        'price': execution_price,
-                        'cost': total_cost,
-                        'realized_pnl': realized_pnl,  # CRITICAL FIX: Change 'pnl' to 'realized_pnl' for consistency
-                        'leverage': actual_leverage  # Use the calculated actual leverage
-                    })
-                    
-                    # Add leverage information to logging
-                    if self.verbose:
-                        # Single comprehensive log message for trade execution
-                        logger.info(f"Trade executed: {asset} {size_change:.6f} @ {execution_price:.2f}, " +
-                                   f"Cost: {total_cost:.2f}, PnL: {realized_pnl:.2f}, Leverage: {actual_leverage:.2f}x")
+                        # New position
+                        self.positions[asset] = {
+                            'size': size_change,
+                            'entry_price': execution_price,
+                            'leverage': target_leverage,
+                            'last_size_change': self.current_step,
+                            'stop_loss': None,
+                            'take_profit': None,
+                            'trailing_stop': None,
+                            'funding_accrued': 0.0
+                        }
                         
-                        # Add debug info about leverage calculation
-                        logger.debug(f"Leverage debug: target={target_leverage:.2f}x, actual={actual_leverage:.2f}x, " +
-                                   f"max configured={self.max_leverage:.2f}x")
-                else:
-                    # Here we would handle the old trade format, but this branch is deprecated
-                    # and shouldn't be called with our new trading logic
-                    logger.warning("Deprecated trade format used without size_change")
-        except Exception as e:
-            logger.error(f"Error in _execute_trades: {str(e)}")
-            traceback.print_exc()
+                        # Add to trades history
+                        trade_info = {
+                            'asset': asset,
+                            'timestamp': self.current_step,
+                            'size_change': size_change,
+                            'price': execution_price,
+                            'value': trade_value,
+                            'cost': cost,
+                            'type': 'new'
+                        }
+                        
+                        # ENHANCED TRACKING: Record the reason for the trade
+                        if 'reason' in trade:
+                            trade_info['reason'] = trade['reason']
+                            
+                        self.trades_history.append(trade_info)
                     
+                    # Update last trade step
+                    self.last_trade_step[asset] = self.current_step
+                    
+                    # Deduct cost from balance
+                    self.balance -= cost
+                    
+                    # Get updated position after trade
+                    position = self.positions[asset]
+                    position_size = position['size']
+                    
+                    # Log updated position
+                    if self.verbose and abs(position_size) > 1e-8:
+                        # Calculate position details for logging
+                        notional_value = abs(position_size * execution_price)
+                        current_leverage = position.get('leverage', 1.0)
+                        margin_used = notional_value / current_leverage if current_leverage > 0 else notional_value
+                        
+                        # Calculate unrealized PnL and PnL percentage
+                        if position_size > 0:  # Long
+                            unrealized_pnl = position_size * (execution_price - position['entry_price'])
+                            direction_str = "LONG"
+                        else:  # Short
+                            unrealized_pnl = abs(position_size) * (position['entry_price'] - execution_price)
+                            direction_str = "SHORT"
+                        
+                        pnl_pct = (unrealized_pnl / margin_used) * 100 if margin_used > 0 else 0
+                        
+                        # Format position details as a table
+                        old_size = position_size - size_change
+                        if old_size > 0 and position_size > 0:
+                            action = "Increased long"
+                        elif old_size < 0 and position_size < 0:
+                            action = "Increased short"
+                        elif old_size > 0 and position_size < 0:
+                            action = "Reversed to short"
+                        elif old_size < 0 and position_size > 0:
+                            action = "Reversed to long"
+                        elif old_size > 0 and position_size < old_size:
+                            action = "Reduced long"
+                        elif old_size < 0 and position_size > old_size:
+                            action = "Reduced short"
+                        else:
+                            action = "Updated"
+                            
+                        logger.info(f"{action} position: {position_size} {asset} (was: {old_size}), new entry: {position['entry_price']:.2f}, leverage: {current_leverage:.2f}x")
+                        
+                        # Format position details as a table
+                        logger.info(f"\n{'-'*70}")
+                        logger.info(f"| UPDATED POSITION: {asset} {direction_str} {' '*(49-len(asset)-len(direction_str))}|")
+                        logger.info(f"|{'-'*68}|")
+                        logger.info(f"| Asset             | {asset:<20} {' '*30}|")
+                        logger.info(f"| Position Size     | {position_size:<20.6f} {' '*30}|")
+                        logger.info(f"| Entry Price       | ${position['entry_price']:<19.2f} {' '*30}|")
+                        logger.info(f"| Execution Price   | ${execution_price:<19.2f} {' '*30}|")
+                        logger.info(f"| Notional Value    | ${notional_value:<19.2f} {' '*30}|")
+                        logger.info(f"| Leverage          | {current_leverage:<19.2f}x {' '*30}|")
+                        logger.info(f"| Margin Used       | ${margin_used:<19.2f} {' '*30}|")
+                        logger.info(f"| Unrealized PnL    | ${unrealized_pnl:<19.2f} ({pnl_pct:+.2f}%) {' '*19}|")
+                        
+                        # Add risk parameters if available
+                        if 'stop_loss' in position and position['stop_loss'] is not None:
+                            logger.info(f"| Stop Loss         | ${position['stop_loss']:<19.2f} {' '*30}|")
+                        if 'take_profit' in position and position['take_profit'] is not None:
+                            logger.info(f"| Take Profit       | ${position['take_profit']:<19.2f} {' '*30}|")
+                        if 'funding_accrued' in position:
+                            logger.info(f"| Funding Accrued   | ${position['funding_accrued']:<19.2f} {' '*30}|")
+                        
+                        logger.info(f"{'-'*70}\n")
+                        
+                        # If position was closed, log it
+                        if abs(position_size) < 1e-8:
+                            logger.info(f"Position closed for {asset}")
+                
+                # Handle other trade dictionary structures...
+                
+                # Track this trade execution
+                self.performance_tracking['last_trade_step'] = self.current_step
+            
+            # Update position status
+            self._update_positions()
+            
+        except Exception as e:
+            logger.error(f"Error executing trades: {str(e)}")
+            traceback.print_exc()
+
     def _update_positions(self):
         """Update positions with current market prices and unrealized PnL"""
         portfolio_value = 0.0
+        total_unrealized_pnl = 0.0
+        
         for asset in self.assets:
             # Get current mark price for the asset
             mark_price = self._get_mark_price(asset)
@@ -1220,19 +1531,20 @@ class InstitutionalPerpetualEnv(gym.Env):
                 if size > 0:  # Long position
                     unrealized_pnl = size * (mark_price - entry_price)
                 else:  # Short position
-                    unrealized_pnl = size * (mark_price - entry_price)
+                    unrealized_pnl = size * (entry_price - mark_price)
                 
                 # Update position data
                 self.positions[asset]['unrealized_pnl'] = unrealized_pnl
+                total_unrealized_pnl += unrealized_pnl
                 
-                # Add to portfolio value 
+                # Add to portfolio value (position notional value)
                 position_value = size * mark_price
                 portfolio_value += position_value
-            
-        # Update portfolio value
-        self.portfolio_value = portfolio_value + self.balance
         
-        return portfolio_value
+        # Update portfolio value including balance and unrealized PnL
+        self.portfolio_value = self.balance + total_unrealized_pnl
+        
+        return total_unrealized_pnl
     
     def _update_market(self):
         """
@@ -1299,6 +1611,9 @@ class InstitutionalPerpetualEnv(gym.Env):
                 
         # Updated current total unrealized PnL
         self.total_unrealized_pnl = total_unrealized_pnl
+        
+        # Update portfolio value
+        self.portfolio_value = self.balance + total_unrealized_pnl
         
         # Reset funding rate flag
         if hasattr(self, 'funding_rate_updated'):
@@ -1415,6 +1730,9 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Log detailed breakdown
             logger.debug(f"Portfolio value: ${final_value:.2f} = Cash (${self.balance:.2f}) + Unrealized PnL (${total_unrealized_pnl:.2f})")
             logger.debug(f"Total position exposure: ${total_position_value:.2f}")
+            
+            # Also set self.portfolio_value for other methods to access
+            self.portfolio_value = final_value
             
             return final_value
             
@@ -1898,8 +2216,58 @@ class InstitutionalPerpetualEnv(gym.Env):
             tuple: (position_size, entry_price, actual_leverage, position_value, cost)
         """
         try:
-            # Get current price
-            price = self._get_mark_price(asset)
+            # PERFORMANCE OPTIMIZATION: Cache mark prices for all assets upfront
+            current_price = self._get_mark_price(asset)
+            
+            # Log existing position details before executing a new trade
+            current_position = self.positions[asset]
+            current_size = current_position['size']
+            
+            if abs(current_size) > 1e-8:
+                # Calculate position details for logging
+                notional_value = abs(current_size * current_price)
+                current_leverage = current_position.get('leverage', 0)
+                # Margin used = notional value / leverage (if leverage is non-zero)
+                margin_used = notional_value / current_leverage if current_leverage > 0 else notional_value
+                
+                # Calculate unrealized PnL
+                entry_price = current_position['entry_price']
+                if current_size > 0:  # Long position
+                    unrealized_pnl = current_size * (current_price - entry_price)
+                else:  # Short position
+                    unrealized_pnl = abs(current_size) * (entry_price - current_price)
+                
+                # Calculate PnL percentage based on margin used
+                pnl_pct = (unrealized_pnl / margin_used) * 100 if margin_used > 0 else 0
+                
+                direction_str = "LONG" if current_size > 0 else "SHORT"
+                
+                # Format position details as a table
+                logger.info(f"\n{'-'*60}")
+                logger.info(f"| EXISTING POSITION DETAILS: {asset} {direction_str} {' '*(34-len(asset)-len(direction_str))}|")
+                logger.info(f"|{'-'*58}|")
+                logger.info(f"| Position Size     | {current_size:<11.6f} {' '*29}|")
+                logger.info(f"| Entry Price       | ${entry_price:<10.2f} {' '*30}|")
+                logger.info(f"| Current Price     | ${current_price:<10.2f} {' '*30}|")
+                logger.info(f"| Notional Value    | ${notional_value:<10.2f} {' '*30}|")
+                logger.info(f"| Leverage          | {current_leverage:<10.2f}x {' '*29}|")
+                logger.info(f"| Margin Used       | ${margin_used:<10.2f} {' '*30}|")
+                logger.info(f"| Unrealized PnL    | ${unrealized_pnl:<10.2f} ({pnl_pct:+.2f}%) {' '*17}|")
+                
+                # Add risk parameters if available
+                if 'stop_loss' in current_position and current_position['stop_loss'] is not None:
+                    logger.info(f"| Stop Loss         | ${current_position['stop_loss']:<10.2f} {' '*30}|")
+                if 'take_profit' in current_position and current_position['take_profit'] is not None:
+                    logger.info(f"| Take Profit       | ${current_position['take_profit']:<10.2f} {' '*30}|")
+                if 'funding_accrued' in current_position:
+                    logger.info(f"| Funding Accrued   | ${current_position['funding_accrued']:<10.2f} {' '*30}|")
+                
+                logger.info(f"{'-'*60}\n")
+            else:
+                logger.info(f"No existing position for {asset}")
+            
+            # Get current price is already cached above
+            price = current_price
             if price <= 0:
                 logger.warning(f"Invalid price for {asset}: {price}")
                 return 0, 0, 0, 0, 0
@@ -1927,7 +2295,7 @@ class InstitutionalPerpetualEnv(gym.Env):
                 
             # ENHANCEMENT: Check if market volatility justifies trading
             volatility_check_passed = True
-            if hasattr(self, 'market_conditions') and 'volatility_regime' in self.market_conditions:
+            if hasattr(self, 'market_conditions') and isinstance(self.market_conditions, dict) and 'volatility_regime' in self.market_conditions:
                 asset_volatility = self.market_conditions['volatility_regime'].get(asset, 0.5)
                 # If volatility is very low, require a stronger signal
                 if asset_volatility < 0.3 and abs(signal) < self.signal_threshold * 1.5:
@@ -1953,7 +2321,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             if abs(signal) >= self.signal_threshold:  # Use the configured threshold
                 # ENHANCED: Calculate target position value with target leverage 
                 # Scale by signal strength for more precise position sizing
-                signal_strength = min(1.0, abs(signal))  # 0.1 to 1.0 range
+                signal_strength = min(1.0, abs(signal) / self.signal_threshold)  # Normalized signal strength
                 
                 # CRITICAL FIX: Use absolute leverage value with separate direction
                 effective_leverage = abs_target_leverage  # Always positive
@@ -1964,13 +2332,13 @@ class InstitutionalPerpetualEnv(gym.Env):
                             f"effective leverage: {effective_leverage:.2f}x for {asset}")
             
                 # CRITICAL FIX: Properly calculate target position value
-                # Ensure leverage is at least 1.0 for any actual position
-                if effective_leverage < 1.0 and effective_leverage > 0:
+                # Only enforce minimum leverage of 1.0 if specifically requested
+                if effective_leverage > 0 and effective_leverage < 1.0 and self.enforce_min_leverage:
                     effective_leverage = 1.0
                     logger.warning(f"Enforcing minimum leverage of 1.0x for {asset}")
             
-                # Calculate target position value 
-                target_value = direction * effective_leverage * portfolio_value
+                # Calculate target position value based on direction, leverage, and notional amount
+                target_value = direction * effective_leverage * portfolio_value * signal_strength
                 
                 # DIAGNOSTIC: Log target position value
                 if self.verbose:
@@ -1995,6 +2363,57 @@ class InstitutionalPerpetualEnv(gym.Env):
                 # DIAGNOSTIC: Log target size calculation
                 if self.verbose:
                     logger.info(f"Target size calculation for {asset}: raw={raw_target_size:.6f}, max_size={max_size:.6f}, final={target_size:.6f}")
+                
+                # Check if this trade would cause margin to exceed portfolio value
+                # First, calculate what total margin would be after this trade
+                total_margin_after_trade = 0
+                
+                # PERFORMANCE OPTIMIZATION: Cache all mark prices for positions
+                all_mark_prices = {asset: price}  # We already know the current asset price
+                for pos_asset in self.positions.keys():
+                    if pos_asset != asset:  # Skip the current asset, we already have its price
+                        all_mark_prices[pos_asset] = self._get_mark_price(pos_asset)
+                
+                # Create a copy of positions to simulate the trade
+                simulated_positions = copy.deepcopy(self.positions)
+                simulated_positions[asset]['size'] = target_size  # Set to target size, not just size_diff
+                simulated_positions[asset]['leverage'] = effective_leverage
+                
+                # Calculate total margin and notional in a single loop with cached prices
+                total_notional_after_trade = 0
+                
+                # Calculate total margin that would be used after this trade
+                for pos_asset, position in simulated_positions.items():
+                    position_size = position['size']
+                    
+                    # Skip if position would be effectively closed
+                    if abs(position_size) < 1e-8:
+                        continue
+                        
+                    # Get leverage for this position
+                    pos_leverage = min(position.get('leverage', self.max_leverage), self.max_leverage)
+                    pos_leverage = max(1.0, pos_leverage)  # Ensure leverage is at least 1.0
+                    
+                    # Calculate position metrics using cached price
+                    pos_price = all_mark_prices[pos_asset]
+                    notional_value = abs(position_size * pos_price)
+                    position_margin = notional_value / pos_leverage if pos_leverage > 0 else notional_value
+                    
+                    # Add to totals
+                    total_margin_after_trade += position_margin
+                    total_notional_after_trade += notional_value
+                
+                # Check if margin would exceed portfolio value
+                if total_margin_after_trade > portfolio_value:
+                    logger.warning(f"Trade rejected for {asset}: Margin after trade (${total_margin_after_trade:.2f}) would exceed portfolio value (${portfolio_value:.2f})")
+                    return current_size, self.positions[asset]['entry_price'], self.positions[asset]['leverage'], current_value, 0
+                
+                # Check if total leverage would exceed account-wide leverage limit
+                total_leverage_after_trade = total_notional_after_trade / portfolio_value if portfolio_value > 0 else 0
+                
+                if total_leverage_after_trade > self.max_leverage:
+                    logger.warning(f"Trade rejected for {asset}: Total leverage after trade ({total_leverage_after_trade:.2f}x) would exceed max account leverage ({self.max_leverage:.2f}x)")
+                    return current_size, self.positions[asset]['entry_price'], self.positions[asset]['leverage'], current_value, 0
             
                 # Minimum position check - don't take tiny positions
                 min_position_value = self.risk_engine.risk_limits.min_trade_size_usd
@@ -3058,209 +3477,83 @@ class InstitutionalPerpetualEnv(gym.Env):
         return action_vector
 
     def _analyze_market_conditions(self):
-        """
-        Analyze current market conditions to better inform trading decisions
-        
-        This method detects:
-        1. Market regimes (trending vs. range-bound)
-        2. Volatility regimes (low, medium, high)
-        3. Liquidity conditions
-        4. Correlation across assets
-        5. Abnormal price movements
-        
-        Returns:
-            dict: Dictionary of market condition metrics
-        """
-        # OPTIMIZATION: In training mode, only recalculate market conditions periodically
-        if self.training_mode and hasattr(self, 'market_conditions'):
-            # Skip calculation if we calculated recently (based on calc_frequency)
-            step_diff = self.current_step - self.last_market_analysis_step
-            if step_diff < self.calc_frequency:
-                return self.market_conditions
-        
-        market_conditions = {
-            'market_regime': {},
-            'volatility_regime': {},
-            'liquidity_conditions': {},
-            'correlation_matrix': None,
-            'abnormal_price_movements': {},
-            'overall_market_state': 'normal',  # normal, volatile, trending, crisis
-        }
-        
+        """Analyze market conditions and regime detection"""
         try:
-            # We need sufficient history to analyze
-            min_history_required = 30
-            
-            # Check if we have enough data
-            if self.current_step < min_history_required:
-                # Default values for early steps
-                default_regime = 0.5  # Neutral between range (0) and trend (1)
-                default_vol = 0.5     # Medium volatility
+            # Skip if we're not due for an update yet
+            if self.current_step - self.last_market_analysis_step < self.calc_frequency:
+                # FIXED: Return existing market conditions instead of None
+                return self.market_conditions
                 
-                for asset in self.assets:
-                    market_conditions['market_regime'][asset] = default_regime
-                    market_conditions['volatility_regime'][asset] = default_vol
-                    market_conditions['liquidity_conditions'][asset] = 0.5  # Medium liquidity
-                    market_conditions['abnormal_price_movements'][asset] = False
-                
-                return market_conditions
-            
-            # Get recent price data for all assets
-            asset_prices = {}
-            asset_volumes = {}
-            
-            for asset in self.assets:
-                # Get the last 30 steps of price data
-                start_idx = max(0, self.current_step - 30)
-                end_idx = self.current_step + 1  # +1 because slicing is exclusive of end index
-                
-                try:
-                    # Extract price data
-                    asset_data = self.df.iloc[start_idx:end_idx].xs(asset, level=0, axis=1)
-                    
-                    # Store price and volume data
-                    if 'close' in asset_data.columns:
-                        asset_prices[asset] = asset_data['close'].values
-                    
-                    # Store volume data if available
-                    if 'volume' in asset_data.columns:
-                        asset_volumes[asset] = asset_data['volume'].values
-                except Exception as e:
-                    logger.error(f"Error extracting data for {asset}: {e}")
-                    continue
-            
-            # Calculate correlation matrix if we have multiple assets
-            if len(asset_prices) > 1:
-                # Create returns dataframe
-                returns_data = {}
-                for asset, prices in asset_prices.items():
-                    if len(prices) > 1:
-                        returns_data[asset] = np.diff(np.log(prices))
-                
-                if returns_data:
-                    returns_df = pd.DataFrame(returns_data)
-                    correlation_matrix = returns_df.corr()
-                    market_conditions['correlation_matrix'] = correlation_matrix.to_dict()
-            
-            # Analyze each asset's market conditions
-            for asset, prices in asset_prices.items():
-                if len(prices) < 5:
-                    continue
-                    
-                # Calculate returns
-                log_returns = np.diff(np.log(prices))
-                
-                # 1. Market Regime Detection - trending vs range-bound
-                # Calculate directional strength
-                abs_returns_sum = np.sum(np.abs(log_returns))
-                if abs_returns_sum > 0:
-                    directional_strength = np.abs(np.sum(log_returns)) / abs_returns_sum
-                else:
-                    directional_strength = 0.5
-                
-                # Calculate recent high-low range
-                recent_high = np.max(prices[-10:])
-                recent_low = np.min(prices[-10:])
-                price_range_pct = (recent_high - recent_low) / np.mean(prices[-10:])
-                
-                # Adjust regime calculation based on both directional strength and price range
-                if price_range_pct < 0.01:  # Very tight range
-                    regime_score = 0.1  # Strong range-bound
-                elif price_range_pct > 0.05:  # Wide range
-                    if directional_strength > 0.6:
-                        regime_score = 0.9  # Strong trend
-                    else:
-                        regime_score = 0.6  # Volatile but not strongly trending
-                else:
-                    # Mixed signals - use directional strength with some scaling
-                    regime_score = directional_strength
-                
-                market_conditions['market_regime'][asset] = regime_score
-                
-                # 2. Volatility Regime
-                # Calculate annualized volatility
-                vol_annualized = np.std(log_returns) * np.sqrt(252)
-                
-                # Compare to historical volatility if available
-                asset_vol = self.risk_engine.asset_volatilities.get(asset, vol_annualized)
-                
-                # Normalize volatility to a 0-1 scale (0=low, 1=high)
-                # We use a nonlinear transformation to accentuate high volatility
-                vol_score = min(1.0, vol_annualized / 0.8)  # Normalize assuming 80% annual vol is extreme
-                vol_score = np.power(vol_score, 0.7)  # Apply power transformation
-                
-                market_conditions['volatility_regime'][asset] = vol_score
-                
-                # 3. Liquidity Conditions
-                if asset in asset_volumes and len(asset_volumes[asset]) > 5:
-                    # Calculate relative volume 
-                    current_volume = asset_volumes[asset][-1]
-                    avg_volume = np.mean(asset_volumes[asset][:-1])
-                    
-                    if avg_volume > 0:
-                        relative_volume = current_volume / avg_volume
-                        # Normalize to 0-1 scale (0=low liquidity, 1=high liquidity)
-                        liquidity_score = min(1.0, relative_volume / 2.0)  # 2x average volume is considered high liquidity
-                    else:
-                        liquidity_score = 0.5  # Default
-                else:
-                    liquidity_score = 0.5  # Default
-                
-                market_conditions['liquidity_conditions'][asset] = liquidity_score
-                
-                # 4. Detect abnormal price movements
-                # Calculate z-score of latest return
-                if len(log_returns) > 5:
-                    mean_return = np.mean(log_returns[:-1])
-                    std_return = np.std(log_returns[:-1])
-                    
-                    if std_return > 0:
-                        latest_return = log_returns[-1]
-                        z_score = (latest_return - mean_return) / std_return
-                        
-                        # Absolute z-score > 3 is considered abnormal
-                        is_abnormal = abs(z_score) > 3.0
-                    else:
-                        is_abnormal = False
-                else:
-                    is_abnormal = False
-                
-                market_conditions['abnormal_price_movements'][asset] = is_abnormal
-            
-            # Determine overall market state
-            avg_vol = np.mean([v for v in market_conditions['volatility_regime'].values()])
-            avg_regime = np.mean([r for r in market_conditions['market_regime'].values()])
-            abnormal_count = sum(1 for v in market_conditions['abnormal_price_movements'].values() if v)
-            
-            # Set overall market state
-            if avg_vol > 0.8 and abnormal_count > 0:
-                market_conditions['overall_market_state'] = 'crisis'
-            elif avg_vol > 0.7:
-                market_conditions['overall_market_state'] = 'volatile'
-            elif avg_regime > 0.7:
-                market_conditions['overall_market_state'] = 'trending'
-            elif avg_regime < 0.3:
-                market_conditions['overall_market_state'] = 'range_bound'
-            else:
-                market_conditions['overall_market_state'] = 'normal'
-            
-            # Update last market analysis step
             self.last_market_analysis_step = self.current_step
             
-            return market_conditions
+            # Detect market regimes for each asset
+            regimes = {}
+            for asset in self.assets:
+                # Get asset price history
+                if asset in self.price_history and len(self.price_history[asset]) > 20:
+                    prices = self.price_history[asset]
+                    
+                    # Calculate returns
+                    returns = np.diff(prices) / prices[:-1]
+                    
+                    # Volatility
+                    vol = np.std(returns[-20:]) if len(returns) >= 20 else 0.01
+                    
+                    # Categorize regime
+                    if vol > 0.03:  # High volatility
+                        self.market_conditions['volatility_regime'][asset] = 0.8
+                        regimes[asset] = 'volatile'
+                    elif vol < 0.01:  # Low volatility
+                        self.market_conditions['volatility_regime'][asset] = 0.2
+                        regimes[asset] = 'range_bound'
+                    else:  # Medium volatility
+                        self.market_conditions['volatility_regime'][asset] = 0.5
+                        regimes[asset] = 'normal'
+            
+            # Update overall market regime
+            # FIXED: Handle the case where market_regime is a string or dictionary
+            if isinstance(self.market_conditions['market_regime'], dict):
+                # Update the dictionary version
+                for asset, regime in regimes.items():
+                    self.market_conditions['market_regime'][asset] = regime
+                # Calculate average regime value
+                regime_values = [0.8 if r == 'volatile' else (0.2 if r == 'range_bound' else 0.5) 
+                               for r in regimes.values()]
+                self.market_regime = np.mean(regime_values) if regime_values else 0.5
+                
+                # FIXED: Set the overall_market_state based on average regime value
+                if self.market_regime > 0.7:
+                    self.market_conditions['overall_market_state'] = 'volatile'
+                elif self.market_regime < 0.3:
+                    self.market_conditions['overall_market_state'] = 'range_bound'
+                else:
+                    self.market_conditions['overall_market_state'] = 'normal'
+            else:
+                # Use the most common regime as the overall market regime
+                if regimes:
+                    regime_counts = {}
+                    for regime in regimes.values():
+                        regime_counts[regime] = regime_counts.get(regime, 0) + 1
+                    
+                    most_common_regime = max(regime_counts.items(), key=lambda x: x[1])[0]
+                    self.market_conditions['market_regime'] = most_common_regime
+                    
+                    # FIXED: Also set the overall_market_state to the most common regime
+                    self.market_conditions['overall_market_state'] = most_common_regime
+                    
+                    # Set numerical market regime value
+                    regime_value_map = {'volatile': 0.8, 'range_bound': 0.2, 'normal': 0.5, 'trending': 0.7, 'crisis': 0.9}
+                    self.market_regime = regime_value_map.get(most_common_regime, 0.5)
+            
+            return self.market_conditions
             
         except Exception as e:
-            logger.error(f"Error in market conditions analysis: {e}")
-            traceback.print_exc()
-            
-            # Return default values
-            for asset in self.assets:
-                market_conditions['market_regime'][asset] = 0.5
-                market_conditions['volatility_regime'][asset] = 0.5
-                market_conditions['liquidity_conditions'][asset] = 0.5
-                market_conditions['abnormal_price_movements'][asset] = False
-            
-            return market_conditions
+            logger.error(f"Error in market analysis: {str(e)}")
+            self.market_conditions['market_regime'] = 'normal'
+            self.market_regime = 0.5
+            # FIXED: Set a safe value for overall_market_state
+            self.market_conditions['overall_market_state'] = 'normal'
+            return self.market_conditions
 
     def _update_adaptive_parameters(self):
         """
@@ -3274,7 +3567,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         """
         try:
             # Only update if we have market conditions data
-            if not hasattr(self, 'market_conditions'):
+            if not hasattr(self, 'market_conditions') or not isinstance(self.market_conditions, dict):
                 return
                 
             # Get key market condition metrics
@@ -3283,14 +3576,15 @@ class InstitutionalPerpetualEnv(gym.Env):
             liquidity_conditions = self.market_conditions.get('liquidity_conditions', {})
             
             # Get average metrics across assets
-            avg_volatility = np.mean(list(volatility_regimes.values())) if volatility_regimes else 0.5
-            avg_liquidity = np.mean(list(liquidity_conditions.values())) if liquidity_conditions else 0.5
+            # FIXED: Ensure these are dictionaries before trying to call values()
+            avg_volatility = np.mean(list(volatility_regimes.values())) if isinstance(volatility_regimes, dict) and volatility_regimes else 0.5
+            avg_liquidity = np.mean(list(liquidity_conditions.values())) if isinstance(liquidity_conditions, dict) and liquidity_conditions else 0.5
             
             # Store base parameters if not stored yet (only once)
             if not hasattr(self, 'base_parameters'):
                 self.base_parameters = {
                     'commission': self.commission,
-                    'slippage': self.slippage,
+                    'slippage': getattr(self, 'slippage', 0.0002),  # Default slippage of 0.02%
                     'uncertainty_scaling_factor': getattr(self, 'uncertainty_scaling_factor', 1.0),
                     'risk_limits': {
                         'account_max_leverage': self.risk_engine.risk_limits.account_max_leverage,
@@ -3314,7 +3608,10 @@ class InstitutionalPerpetualEnv(gym.Env):
             # 2. Adjust slippage based on similar factors, but with higher weight
             # Slippage is more affected by market conditions than fixed fees
             slippage_adjustment = volatility_factor * liquidity_factor * 1.5  # Up to 2.25x
-            self.slippage = self.base_parameters['slippage'] * slippage_adjustment
+            if hasattr(self, 'slippage'):
+                self.slippage = self.base_parameters['slippage'] * slippage_adjustment
+            else:
+                self.slippage = 0.0002 * slippage_adjustment  # Default if not already set
             
             # 3. Adjust risk limits based on market state
             risk_scale = 1.0
@@ -3340,18 +3637,19 @@ class InstitutionalPerpetualEnv(gym.Env):
                 self.risk_engine.risk_limits.position_concentration = self.base_parameters['risk_limits']['position_concentration']
             
             # 4. Adjust uncertainty scaling based on market state
-            if overall_state == 'range_bound':
-                # Encourage more exploration in range-bound markets
-                self.uncertainty_scaling_factor = self.base_parameters['uncertainty_scaling_factor'] * 0.8
-            elif overall_state == 'trending':
-                # Less exploration in trending markets
-                self.uncertainty_scaling_factor = self.base_parameters['uncertainty_scaling_factor'] * 1.2
-            elif overall_state == 'crisis':
-                # Much less exploration in crisis
-                self.uncertainty_scaling_factor = self.base_parameters['uncertainty_scaling_factor'] * 1.5
-            else:
-                # Reset to base value
-                self.uncertainty_scaling_factor = self.base_parameters['uncertainty_scaling_factor']
+            if hasattr(self, 'uncertainty_scaling_factor'):
+                if overall_state == 'range_bound':
+                    # Encourage more exploration in range-bound markets
+                    self.uncertainty_scaling_factor = self.base_parameters['uncertainty_scaling_factor'] * 0.8
+                elif overall_state == 'trending':
+                    # Less exploration in trending markets
+                    self.uncertainty_scaling_factor = self.base_parameters['uncertainty_scaling_factor'] * 1.2
+                elif overall_state == 'crisis':
+                    # Much less exploration in crisis
+                    self.uncertainty_scaling_factor = self.base_parameters['uncertainty_scaling_factor'] * 1.5
+                else:
+                    # Reset to base value
+                    self.uncertainty_scaling_factor = self.base_parameters['uncertainty_scaling_factor']
                 
             # Log the adaptive parameter updates if they've changed significantly
             if abs(cost_adjustment - 1.0) > 0.1 or abs(slippage_adjustment - 1.0) > 0.2 or abs(risk_scale - 1.0) > 0.1:
@@ -3498,7 +3796,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             self.performance_tracking['leverage'].append(current_leverage)
             
             # CRITICAL FIX: Track performance by market regime
-            if hasattr(self, 'market_conditions') and 'overall_market_state' in self.market_conditions:
+            if hasattr(self, 'market_conditions') and isinstance(self.market_conditions, dict) and 'overall_market_state' in self.market_conditions:
                 regime = self.market_conditions['overall_market_state']
                 if regime in self.performance_tracking['regime_performance']:
                     if len(self.performance_tracking['returns']) > 0:
@@ -3564,7 +3862,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         Returns:
             Dict: Performance metrics summary
         """
-        if not hasattr(self, 'performance_tracking'):
+        if not hasattr(self, 'performance_tracking') or not isinstance(self.performance_tracking, dict):
             return {'error': 'No performance tracking data available'}
             
         try:
@@ -3579,35 +3877,39 @@ class InstitutionalPerpetualEnv(gym.Env):
             trading_days = max(1, self.current_step - self.window_size)  # Avoid division by zero
             annualized_return = ((1 + total_return) ** (252 / trading_days)) - 1 if trading_days > 0 else 0
                 
-            # CRITICAL FIX: Get proper metrics from tracking
+            # CRITICAL FIX: Get proper metrics from tracking with safety checks
                 
             # Get max drawdown
-            max_drawdown = max(self.performance_tracking['drawdowns']) if self.performance_tracking['drawdowns'] else 0
+            drawdowns = self.performance_tracking.get('drawdowns', [])
+            max_drawdown = max(drawdowns) if drawdowns else 0
             
             # Get most recent risk-adjusted metrics with proper error handling
-            if self.performance_tracking['sharpe_ratios']:
-                sharpe = self.performance_tracking['sharpe_ratios'][-1]
+            sharpe_ratios = self.performance_tracking.get('sharpe_ratios', [])
+            if sharpe_ratios:
+                sharpe = sharpe_ratios[-1]
                 # Average Sharpe - using only recent data for more relevance
-                recent_window = min(len(self.performance_tracking['sharpe_ratios']), 20)
-                avg_sharpe = np.mean(self.performance_tracking['sharpe_ratios'][-recent_window:])
+                recent_window = min(len(sharpe_ratios), 20)
+                avg_sharpe = np.mean(sharpe_ratios[-recent_window:])
             else:
                 sharpe = 0
                 avg_sharpe = 0
                 
-            if self.performance_tracking['sortino_ratios']:
-                sortino = self.performance_tracking['sortino_ratios'][-1]
+            sortino_ratios = self.performance_tracking.get('sortino_ratios', [])
+            if sortino_ratios:
+                sortino = sortino_ratios[-1]
                 # Average Sortino - using only recent data for more relevance
-                recent_window = min(len(self.performance_tracking['sortino_ratios']), 20)
-                avg_sortino = np.mean(self.performance_tracking['sortino_ratios'][-recent_window:])
+                recent_window = min(len(sortino_ratios), 20)
+                avg_sortino = np.mean(sortino_ratios[-recent_window:])
             else:
                 sortino = 0
                 avg_sortino = 0
                 
-            if self.performance_tracking['calmar_ratios']:
-                calmar = self.performance_tracking['calmar_ratios'][-1]
+            calmar_ratios = self.performance_tracking.get('calmar_ratios', [])
+            if calmar_ratios:
+                calmar = calmar_ratios[-1]
                 # Average Calmar - using only recent data for more relevance
-                recent_window = min(len(self.performance_tracking['calmar_ratios']), 20)
-                avg_calmar = np.mean(self.performance_tracking['calmar_ratios'][-recent_window:])
+                recent_window = min(len(calmar_ratios), 20)
+                avg_calmar = np.mean(calmar_ratios[-recent_window:])
             else:
                 calmar = 0
                 avg_calmar = 0
@@ -3621,21 +3923,23 @@ class InstitutionalPerpetualEnv(gym.Env):
             
             if 'trades' in self.performance_tracking:
                 trades = self.performance_tracking['trades']
-                profitable_trades = trades.get('profitable', 0)
-                unprofitable_trades = trades.get('unprofitable', 0)
-                total_trades = profitable_trades + unprofitable_trades
-                win_rate = profitable_trades / total_trades if total_trades > 0 else 0
-                
-                total_profit = trades.get('total_profit', 0)
-                total_loss = abs(trades.get('total_loss', 0)) if trades.get('total_loss', 0) < 0 else 1
-                profit_factor = total_profit / total_loss if total_loss > 0 else 0
-                
-                avg_profit_per_trade = trades.get('avg_profit_per_trade', 0)
-                avg_loss_per_trade = trades.get('avg_loss_per_trade', 0)
+                if isinstance(trades, dict):
+                    profitable_trades = trades.get('profitable', 0)
+                    unprofitable_trades = trades.get('unprofitable', 0)
+                    total_trades = profitable_trades + unprofitable_trades
+                    win_rate = profitable_trades / total_trades if total_trades > 0 else 0
+                    
+                    total_profit = trades.get('total_profit', 0)
+                    total_loss = abs(trades.get('total_loss', 0)) if trades.get('total_loss', 0) < 0 else 1
+                    profit_factor = total_profit / total_loss if total_loss > 0 else 0
+                    
+                    avg_profit_per_trade = trades.get('avg_profit_per_trade', 0)
+                    avg_loss_per_trade = trades.get('avg_loss_per_trade', 0)
             
-            # CRITICAL FIX: Calculate average returns and volatility
-            avg_return = np.mean(self.performance_tracking['returns']) if self.performance_tracking['returns'] else 0
-            volatility = np.std(self.performance_tracking['returns']) * np.sqrt(252) if self.performance_tracking['returns'] else 0
+            # CRITICAL FIX: Calculate average returns and volatility with safety checks
+            returns = self.performance_tracking.get('returns', [])
+            avg_return = np.mean(returns) if returns else 0
+            volatility = np.std(returns) * np.sqrt(252) if returns else 0
             
             # Log detailed summary occasionally
             if self.current_step % 50 == 0:
@@ -3670,20 +3974,22 @@ class InstitutionalPerpetualEnv(gym.Env):
             }
             
             # Add regime performance if data exists
-            if 'regime_performance' in self.performance_tracking:
+            if 'regime_performance' in self.performance_tracking and isinstance(self.performance_tracking['regime_performance'], dict):
                 regime_summary = {}
                 for regime, data in self.performance_tracking['regime_performance'].items():
-                    if data.get('returns', []):
-                        regime_summary[regime] = {
-                            'avg_return': np.mean(data['returns']),
-                            'win_rate': data.get('win_rate', 0),
-                            'num_trades': len(data.get('trades', []))
-                        }
+                    if isinstance(data, dict) and data.get('returns', []):
+                        returns = data.get('returns', [])
+                        if returns:  # Only calculate if returns list is not empty
+                            regime_summary[regime] = {
+                                'avg_return': np.mean(returns),
+                                'win_rate': data.get('win_rate', 0),
+                                'num_trades': len(data.get('trades', []))
+                            }
                 if regime_summary:
                     summary['regime_performance'] = regime_summary
                 
             # Add risk management data if available
-            if 'risk_management' in self.performance_tracking:
+            if 'risk_management' in self.performance_tracking and isinstance(self.performance_tracking['risk_management'], dict):
                 rm_data = self.performance_tracking['risk_management']
                 risk_management = {
                     'stop_loss_executions': rm_data.get('stop_loss_executions', 0),
