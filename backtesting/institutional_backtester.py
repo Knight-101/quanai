@@ -295,10 +295,9 @@ class InstitutionalBacktester:
         # Store regime periods
         self.regime_periods = regime_periods_by_asset.get('MARKET', [])
         
-        # Log identified regimes
-        for period in self.regime_periods:
-            logger.info(f"Regime: {period.regime.value} from {period.start_date.date()} to {period.end_date.date()}")
-            
+        # Log identified regimes - removing individual period logging
+        logger.info(f"Identified {len(self.regime_periods)} market regime periods")
+        
         # Save regime info to file
         regime_info = [
             {
@@ -313,8 +312,6 @@ class InstitutionalBacktester:
         with open(os.path.join(self.output_dir, 'market_regimes.json'), 'w') as f:
             json.dump(regime_info, f, indent=2)
             
-        logger.info(f"Identified {len(self.regime_periods)} market regime periods")
-        
     def run_backtest(self):
         """Run full backtest with the trained model"""
         # Make sure data is loaded

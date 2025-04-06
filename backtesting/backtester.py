@@ -10,17 +10,28 @@ import sys
 import json
 import time
 import logging
+import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 from typing import Dict, List, Tuple, Optional, Union, Any
 from datetime import datetime, timedelta
 from pathlib import Path
-import pickle
 from tqdm import tqdm
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+import traceback
+from gymnasium import spaces
+from backtesting.adapters import ObservationAdapter
+
+# Add parent directory to path to allow imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import environment and risk engine
+from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
+from risk_management.risk_engine import InstitutionalRiskEngine, RiskLimits
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -123,6 +134,8 @@ class InstitutionalBacktester:
     
     def load_data(self):
         """Load and preprocess market data"""
+        # Note: self.data_df is the input DataFrame parameter
+        # self.data is the processed DataFrame used throughout the class
         if self.data is not None:
             logger.info("Data already loaded")
             return self.data
@@ -184,49 +197,144 @@ class InstitutionalBacktester:
             raise
     
     def _create_environment(self):
-        """Create a backtesting environment similar to the training environment"""
+        """Create the environment for backtesting"""
         try:
-            # Import locally to avoid circular imports
-            sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-            from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
-
-            # Check if data is loaded
+            # Use exactly the same features as in training
+            base_features = ['open', 'high', 'low', 'close', 'volume']
+            tech_features = [
+                'returns_1d', 'returns_5d', 'returns_10d',
+                'volatility_5d', 'volatility_10d', 'volatility_20d',
+                'rsi_14', 'macd', 'bb_upper', 'bb_lower', 'bb_middle',
+                'atr_14', 'adx_14', 'cci_14',
+                'market_regime', 'hurst_exponent', 'volatility_regime'
+            ]
+            
+            # Fixed window size from config (100)
+            window_size = self.window_size
+            logger.info(f"Using window_size={window_size} from configuration")
+            
+            # Extract model's observation space before creating environment
+            model_obs_shape = None
+            if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'observation_space'):
+                model_obs_shape = self.model.policy.observation_space.shape
+                logger.info(f"MODEL EXPECTS observation shape: {model_obs_shape}")
+                
+                # If the model uses a feature extractor, check that too
+                if hasattr(self.model.policy, 'features_extractor'):
+                    if hasattr(self.model.policy.features_extractor, 'features_dim'):
+                        logger.info(f"MODEL features_dim: {self.model.policy.features_extractor.features_dim}")
+            
+            # Load data if not already loaded
             if self.data is None:
                 self.load_data()
             
-            # Create environment with evaluation settings
-            logger.info("Creating backtesting environment")
+            # Log information about the data and available features
+            if isinstance(self.data.columns, pd.MultiIndex):
+                # Get available features from the data
+                available_features = set(self.data.columns.levels[1])
+                logger.info(f"AVAILABLE FEATURES IN DATA: {sorted(list(available_features))}")
+                
+                # Check base features
+                missing_base = [f for f in base_features if f not in available_features]
+                if missing_base:
+                    logger.warning(f"MISSING BASE FEATURES: {missing_base}")
+                
+                # Check tech features
+                missing_tech = [f for f in tech_features if f not in available_features]
+                if missing_tech:
+                    logger.warning(f"MISSING TECHNICAL FEATURES: {missing_tech}")
+                
+                # Calculate how many features we have
+                actual_base = [f for f in base_features if f in available_features]
+                actual_tech = [f for f in tech_features if f in available_features]
+                total_features_per_asset = len(actual_base) + len(actual_tech)
+                
+                num_assets = len(self.assets)
+                expected_obs_dim = num_assets * total_features_per_asset * 1  # window_size=1 for simplicity
+                
+                logger.info(f"Number of assets: {num_assets}")
+                logger.info(f"Features per asset: {total_features_per_asset} ({len(actual_base)} base + {len(actual_tech)} tech)")
+                logger.info(f"Calculated observation dimension with window_size=1: {expected_obs_dim}")
+                
+                if model_obs_shape:
+                    logger.info(f"Model expects observation dimension: {model_obs_shape[0]}")
+                    
+                    # Try to understand the structure of the model's observation space
+                    # If model expects 78 dimensions and we have 3 assets, then:
+                    # 78 ÷ 3 = 26 features per asset with window_size=1
+                    expected_features_per_asset = model_obs_shape[0] // num_assets
+                    logger.info(f"Model expects approximately {expected_features_per_asset} features per asset (with window_size=1)")
+            
+            # Create risk engine with the same parameters as training
+            risk_engine = InstitutionalRiskEngine(
+                risk_limits=RiskLimits(
+                    max_leverage=self.max_leverage,
+                    max_drawdown=0.3,
+                    var_limit=0.05,
+                    position_concentration=0.4,
+                    correlation_limit=0.7,
+                    liquidity_ratio=0.1,
+                    vol_scaling_enabled=True
+                )
+            )
+            
+            # Create the environment
             env = InstitutionalPerpetualEnv(
                 df=self.data,
                 assets=self.assets,
-                window_size=self.window_size,
+                window_size=window_size,
                 max_leverage=self.max_leverage,
                 commission=self.commission,
-                initial_balance=self.initial_capital,
                 risk_free_rate=self.risk_free_rate,
-                verbose=False  # Disable verbose mode for backtesting
+                base_features=base_features,
+                tech_features=tech_features,
+                risk_engine=risk_engine,
+                initial_balance=self.initial_capital,
+                verbose=self.verbose,
+                training_mode=False  # Evaluation mode for backtesting
             )
             
-            # Wrap in DummyVecEnv as required by stable-baselines3
-            vec_env = DummyVecEnv([lambda: env])
+            # Check the actual observation space of the created environment
+            actual_obs_shape = env.observation_space.shape
+            logger.info(f"ENVIRONMENT PROVIDES observation shape: {actual_obs_shape}")
             
-            # If we have a normalization file, load it
-            norm_path = os.path.join(os.path.dirname(self.model_path), "vec_normalize.pkl")
-            if os.path.exists(norm_path):
-                logger.info(f"Loading normalization from {norm_path}")
-                vec_env = VecNormalize.load(norm_path, vec_env)
+            # Create a wrapper to adapt the observation space if necessary
+            if model_obs_shape and actual_obs_shape[0] != model_obs_shape[0]:
+                logger.warning(f"OBSERVATION SHAPE MISMATCH: Environment provides {actual_obs_shape}, but model expects {model_obs_shape}")
                 
-                # Disable training-time features
-                vec_env.norm_reward = False  # Do not normalize rewards during evaluation
-                vec_env.training = False     # Do not update normalization statistics
+                # Wrap the environment with our adapter
+                env = ObservationAdapter(env, model_obs_shape, verbose=True)
+                logger.info(f"Successfully wrapped environment with ObservationAdapter")
             
-            self.env = vec_env
-            return vec_env
-        except ImportError:
-            logger.error("Could not import InstitutionalPerpetualEnv. Make sure trading_env module is available.")
-            raise
+            # Wrap environment for Stable Baselines
+            env = DummyVecEnv([lambda: env])
+            
+            # Try to load normalization statistics from the model
+            norm_path = os.path.join(os.path.dirname(self.model_path), "vec_normalize.pkl")
+            
+            if os.path.exists(norm_path):
+                logger.info(f"Loading environment normalization from {norm_path}")
+                try:
+                    env = VecNormalize.load(norm_path, env)
+                    # Disable reward normalization during evaluation
+                    env.norm_reward = False
+                    logger.info("Disabled reward normalization for evaluation")
+                except Exception as e:
+                    logger.warning(f"Could not load environment normalization: {str(e)}")
+                    logger.warning("Creating new VecNormalize wrapper")
+                    # Create a VecNormalize wrapper with observation normalization but without reward normalization
+                    env = VecNormalize(env, norm_obs=True, norm_reward=False)
+            else:
+                logger.warning(f"Normalization file not found at {norm_path}, creating new VecNormalize wrapper")
+                env = VecNormalize(env, norm_obs=True, norm_reward=False)
+            
+            logger.info("Environment created successfully")
+            self.env = env
+            return env
+            
         except Exception as e:
             logger.error(f"Error creating environment: {str(e)}")
+            traceback.print_exc()
             raise
     
     def analyze_market_regimes(self):
@@ -266,10 +374,7 @@ class InstitutionalBacktester:
         if self.regimes:
             for asset, regime_periods in self.regimes.items():
                 logger.info(f"Identified {len(regime_periods)} regime periods for {asset}")
-                for i, period in enumerate(regime_periods[:3]):  # Log first 3 periods
-                    logger.info(f"  Regime {i+1}: {period.regime.value} from {period.start_date.date()} to {period.end_date.date()}")
-                if len(regime_periods) > 3:
-                    logger.info(f"  ... and {len(regime_periods) - 3} more periods")
+                # Only log a summary, not each period
         
         return self.regimes
     
@@ -323,7 +428,16 @@ class InstitutionalBacktester:
         logger.info("Running backtest simulation")
         
         # Reset the environment and get initial observation
-        obs = self.env.reset()
+        obs, info = self.env.reset()
+        
+        # Debug initial observation
+        if isinstance(obs, np.ndarray):
+            logger.info(f"Initial observation shape: {obs.shape}")
+            if len(obs.shape) > 1:
+                # Might be wrapped in an extra dimension from VecEnv
+                # Unwrap the vector environment observation to match model expectations
+                obs = obs[0]
+                logger.info(f"Unwrapped observation shape: {obs.shape}")
         
         # Initialize result tracking
         timestamps = []
@@ -352,71 +466,103 @@ class InstitutionalBacktester:
                 regime_periods = self.regimes[self.assets[0]]
         
         # Run simulation
-        done = False
+        terminated = False
+        truncated = False
         total_steps = len(self.data) - self.window_size if hasattr(self.data, '__len__') else 1000
         
         with tqdm(total=total_steps, disable=not self.verbose) as pbar:
-            while not done:
-                # Predict action using the model
-                action, _ = self.model.predict(obs, deterministic=True)
-                
-                # Execute the action
-                next_obs, reward, done, info = self.env.step(action)
-                
-                # Get step info from the base environment
-                step_info = info[0] if isinstance(info, list) else info
-                
-                # Track results
-                if hasattr(base_env, 'current_time'):
-                    timestamps.append(base_env.current_time)
-                elif hasattr(base_env, 'current_step'):
-                    timestamps.append(base_env.current_step)
-                else:
-                    timestamps.append(len(portfolio_values))
-                
-                # Track portfolio value
-                if 'portfolio_value' in step_info:
-                    portfolio_values.append(step_info['portfolio_value'])
+            step_count = 0
+            while not (terminated or truncated):
+                try:
+                    # Debug observation shape periodically
+                    if step_count % 1000 == 0:
+                        if isinstance(obs, np.ndarray):
+                            logger.info(f"Step {step_count} - Observation shape: {obs.shape}")
+                        else:
+                            logger.info(f"Step {step_count} - Observation type: {type(obs)}")
                     
-                    # Calculate returns
-                    if len(portfolio_values) > 1:
-                        ret = portfolio_values[-1] / portfolio_values[-2] - 1
-                        returns.append(ret)
+                    # Predict action using the model - ensure correct observation format
+                    if isinstance(obs, np.ndarray) and len(obs.shape) == 2 and obs.shape[0] == 1:
+                        # If obs is wrapped in an extra dimension from VecEnv (shape: (1, X))
+                        action, _ = self.model.predict(obs, deterministic=True)
                     else:
-                        returns.append(0.0)
-                
-                # Track positions
-                if 'positions' in step_info:
-                    positions.append(step_info['positions'])
-                
-                # Track leverage
-                if 'leverage' in step_info:
-                    leverages.append(step_info['leverage'])
-                elif 'current_leverage' in step_info:
-                    leverages.append(step_info['current_leverage'])
-                
-                # Track trades
-                if 'trades' in step_info and step_info['trades']:
-                    for trade in step_info['trades']:
-                        trade_info = trade.copy()
-                        trade_info['step'] = len(portfolio_values) - 1
-                        trade_info['timestamp'] = timestamps[-1]
-                        trades.append(trade_info)
-                
-                # Track actions, observations, and rewards
-                actions.append(action)
-                observations.append(obs)
-                rewards.append(reward)
-                
-                # Update observation
-                obs = next_obs
-                
-                # Update progress bar
-                pbar.update(1)
-                pbar.set_description(f"Portfolio: ${portfolio_values[-1]:.2f}")
-                
-                # Break if done
-                if done:
+                        # If obs needs to be wrapped for the model (expected shape: (1, X))
+                        action, _ = self.model.predict(np.array([obs]) if len(obs.shape) == 1 else obs, deterministic=True)
+                    
+                    # Execute the action
+                    next_obs, reward, terminated, truncated, info = self.env.step(action)
+                    
+                    # Unwrap next_obs from VecEnv if needed for tracking
+                    if isinstance(next_obs, np.ndarray) and len(next_obs.shape) > 1 and next_obs.shape[0] == 1:
+                        next_obs_unwrapped = next_obs[0]
+                    else:
+                        next_obs_unwrapped = next_obs
+                    
+                    # Get step info from the base environment
+                    step_info = info[0] if isinstance(info, list) else info
+                    
+                    # Track results
+                    if hasattr(base_env, 'current_time'):
+                        timestamps.append(base_env.current_time)
+                    elif hasattr(base_env, 'current_step'):
+                        timestamps.append(base_env.current_step)
+                    else:
+                        timestamps.append(len(portfolio_values))
+                    
+                    # Track portfolio value
+                    if 'portfolio_value' in step_info:
+                        portfolio_values.append(step_info['portfolio_value'])
+                        
+                        # Calculate returns
+                        if len(portfolio_values) > 1:
+                            ret = portfolio_values[-1] / portfolio_values[-2] - 1
+                            returns.append(ret)
+                        else:
+                            returns.append(0.0)
+                    
+                    # Track positions
+                    if 'positions' in step_info:
+                        positions.append(step_info['positions'])
+                    
+                    # Track leverage
+                    if 'leverage' in step_info:
+                        leverages.append(step_info['leverage'])
+                    elif 'current_leverage' in step_info:
+                        leverages.append(step_info['current_leverage'])
+                    
+                    # Track trades
+                    if 'trades' in step_info and step_info['trades']:
+                        for trade in step_info['trades']:
+                            trade_info = trade.copy()
+                            trade_info['step'] = len(portfolio_values) - 1
+                            trade_info['timestamp'] = timestamps[-1]
+                            trades.append(trade_info)
+                    
+                    # Track actions, observations, and rewards
+                    actions.append(action)
+                    observations.append(next_obs_unwrapped)  # Store unwrapped for analysis
+                    rewards.append(reward)
+                    
+                    # Update observation for next step
+                    obs = next_obs
+                    
+                    # Increment step counter
+                    step_count += 1
+                    
+                    # Update progress bar
+                    pbar.update(1)
+                    if portfolio_values:
+                        pbar.set_description(f"Portfolio: ${portfolio_values[-1]:.2f}")
+                    
+                    # Break if done (either terminated or truncated)
+                    if terminated or truncated:
+                        logger.info(f"Episode {'terminated' if terminated else 'truncated'} after {len(portfolio_values)} steps")
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"Error during simulation step {step_count}: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    terminated = True
                     break
         
         # Process drawdowns

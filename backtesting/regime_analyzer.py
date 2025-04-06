@@ -234,7 +234,8 @@ class RegimeAnalyzer:
             
             mean_corr = pd.Series(daily_corr, index=returns_df.index[self.volatility_window:])
             # Backfill for the initial window
-            mean_corr = pd.Series(mean_corr.iloc[0], index=returns_df.index[:self.volatility_window]).append(mean_corr)
+            initial_corr = pd.Series(mean_corr.iloc[0], index=returns_df.index[:self.volatility_window])
+            mean_corr = pd.concat([initial_corr, mean_corr])
         else:
             # For single asset, use autocorrelation
             mean_corr = returns_df.iloc[:,0].rolling(window=self.volatility_window).apply(
