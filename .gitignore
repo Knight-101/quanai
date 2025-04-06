@@ -5,8 +5,6 @@ data/
 wandb/
 *.log
 
-checkpoints/
-
 test_results/
 
 # Logs and training data

@@ -5928,4 +5928,34 @@ self.stress_test_scenarios = stress_test_scenarios or self.\_default_stress_scen
             }
         }
 
-these are old files above
+## Institutional Backtesting Module
+
+A new institutional-grade backtesting module has been added to the repository. This module provides comprehensive backtesting capabilities with a focus on eliminating bias, analyzing market regimes, and providing detailed performance metrics.
+
+### Features
+
+- **Robust Backtesting**: Evaluate trading models with proper observation and reward normalization
+- **Market Regime Analysis**: Identify and analyze performance across different market regimes
+- **Walk-Forward Validation**: Test model robustness across multiple time windows
+- **Comprehensive Metrics**: Calculate performance metrics, risk metrics, and trade statistics
+- **Visualization Tools**: Create visualizations of performance, drawdowns, returns distribution, and more
+- **Bias Reduction**: Techniques to minimize look-ahead bias and data leakage
+
+### Usage
+
+The simplest way to run a backtest is using the command-line interface:
+
+```bash
+# Basic backtest
+python backtesting/run_backtest.py --model-path models/best_model --data-path data/market_data.parquet --output-dir results/backtest
+
+# Comprehensive backtest with regime analysis and walk-forward validation
+python backtesting/run_backtest.py --model-path models/best_model --data-path data/market_data.parquet --output-dir results/full_backtest --walk-forward
+
+# Advanced parameters
+python backtesting/run_backtest.py --model-path models/best_model --data-path data/market_data.parquet \
+  --initial-capital 100000 --risk-free-rate 0.02 --commission 0.0004 --slippage 0.0002 \
+  --max-leverage 10.0 --benchmark "BTC-USD" --output-dir results/custom_backtest
+```
+
+For more details and advanced usage, see the [Backtesting README](backtesting/README.md).
