@@ -1265,7 +1265,7 @@ class TradingSystem:
                 # Evaluation with error handling
                 try:
                     # IMPORTANT FIX: Increase evaluation episodes for more reliable results
-                    eval_metrics = self._evaluate_model(model, n_eval_episodes=5, verbose=False)
+                    eval_metrics = self._evaluate_model(model, n_eval_episodes=3, verbose=False)
                     
                     # Check if any trades were executed
                     if eval_metrics.get("trades_executed", 0) == 0:
@@ -1333,7 +1333,7 @@ class TradingSystem:
             
             return -1.0
         
-    def _evaluate_model(self, model, n_eval_episodes=5, verbose=False):
+    def _evaluate_model(self, model, n_eval_episodes=3, verbose=False):
         """Evaluate model performance"""
         rewards = []
         portfolio_values = []
@@ -1765,13 +1765,15 @@ class TradingSystem:
         )
         callbacks.append(checkpoint_callback)
 
-        eval_callback = EvalCallback(
+        # Replace EvalCallback with our custom VecNormalizeEvalCallback
+        eval_callback = VecNormalizeEvalCallback(
             eval_env=self.env,
-            n_eval_episodes=5,
-            eval_freq=10000, 
+            n_eval_episodes=3,  # Reduced from 5 for better performance
+            eval_freq=20000, 
             log_path=self.config['logging']['log_dir'],
+            best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], "best"),
             deterministic=True,
-            render=False
+            verbose=1  # Enable verbose to see training mode changes
         )
         callbacks.append(eval_callback)
         
@@ -1913,14 +1915,15 @@ class TradingSystem:
         )
         callbacks.append(checkpoint_callback)
         
-        # Best model callback
-        eval_callback = EvalCallback(
+        # Use our custom VecNormalizeEvalCallback instead of standard EvalCallback
+        eval_callback = VecNormalizeEvalCallback(
             eval_env=self.env,
-            n_eval_episodes=5,
-            eval_freq=10000, 
+            n_eval_episodes=3,  # Reduced from 5 for better performance
+            eval_freq=20000, 
             log_path=self.config['logging']['log_dir'],
+            best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], "best_continued"),
             deterministic=True,
-            render=False
+            verbose=1  # Enable verbose to see training mode changes
         )
         callbacks.append(eval_callback)
         
@@ -2223,6 +2226,110 @@ class TradingSystem:
                 self.env.close()
             except Exception as e:
                 logger.warning(f"Error during environment cleanup: {e}")
+
+class VecNormalizeEvalCallback(BaseCallback):
+    """
+    Custom callback for evaluation with VecNormalize environments.
+    Ensures that VecNormalize.training is set to False during evaluation
+    and restored to its original state afterward.
+    
+    This solves the problem of progressively decreasing rewards during evaluation
+    due to reward normalization.
+    """
+    def __init__(self, eval_env, eval_freq=10000, n_eval_episodes=3, log_path=None,
+                 best_model_save_path=None, deterministic=True, verbose=0):
+        super().__init__(verbose)
+        self.eval_freq = eval_freq
+        self.last_eval_step = 0
+        # Create standard EvalCallback
+        self.eval_callback = EvalCallback(
+            eval_env=eval_env,
+            n_eval_episodes=n_eval_episodes,
+            eval_freq=1,  # Will always evaluate when called by this wrapper
+            log_path=log_path,
+            best_model_save_path=best_model_save_path,
+            deterministic=deterministic,
+            verbose=verbose
+        )
+        # Save original properties for easy access
+        self.best_mean_reward = -float('inf')
+        self.best_model_step = 0
+        self.n_eval_episodes = n_eval_episodes
+        self.eval_env = eval_env
+
+    def _init_callback(self):
+        # Initialize nested callback - only pass the model
+        self.eval_callback.init_callback(self.model)
+
+    def _on_step(self):
+        if self.n_calls - self.last_eval_step >= self.eval_freq:
+            self.last_eval_step = self.n_calls
+            
+            # Log that evaluation is starting
+            logger.info(f"Starting evaluation at step {self.n_calls} with {self.n_eval_episodes} episodes...")
+            start_time = time.time()
+            
+            # More explicitly check if eval_env is a VecNormalize wrapper
+            is_vec_normalize = False
+            original_training_state = None
+            
+            # Check for VecNormalize
+            if hasattr(self.eval_env, 'training'):
+                is_vec_normalize = True
+                original_training_state = self.eval_env.training
+                # Disable training mode to fix reward normalization
+                self.eval_env.training = False
+                if self.verbose > 0:
+                    logger.info("VecNormalize detected: Disabled training mode for proper reward normalization")
+                
+            # Also check for nested VecNormalize through common patterns
+            elif hasattr(self.eval_env, 'venv') and hasattr(self.eval_env.venv, 'training'):
+                is_vec_normalize = True
+                original_training_state = self.eval_env.venv.training
+                self.eval_env.venv.training = False
+                if self.verbose > 0:
+                    logger.info("Nested VecNormalize detected: Disabled training mode for proper reward normalization")
+            
+            # Call the standard evaluation callback
+            result = self.eval_callback._on_step()
+            
+            # Restore original training state if needed
+            if is_vec_normalize and original_training_state is not None:
+                if hasattr(self.eval_env, 'training'):
+                    self.eval_env.training = original_training_state
+                elif hasattr(self.eval_env, 'venv') and hasattr(self.eval_env.venv, 'training'):
+                    self.eval_env.venv.training = original_training_state
+                
+                if self.verbose > 0:
+                    logger.info(f"Restored VecNormalize training mode to {original_training_state}")
+            
+            # Store properties for easy access
+            if hasattr(self.eval_callback, 'best_mean_reward'):
+                self.best_mean_reward = self.eval_callback.best_mean_reward
+                
+            if hasattr(self.eval_callback, 'best_model_step'): 
+                self.best_model_step = self.eval_callback.best_model_step
+            elif hasattr(self.eval_callback, 'last_best_model_step'):
+                self.best_model_step = self.eval_callback.last_best_model_step
+            
+            # Log evaluation metrics and duration
+            evaluation_duration = time.time() - start_time
+            logger.info(f"Evaluation completed in {evaluation_duration:.2f} seconds with mean reward: {self.eval_callback.best_mean_reward}")
+            
+            # Log to wandb
+            try:
+                if 'wandb' in globals():
+                    wandb.log({
+                        "eval/duration_seconds": evaluation_duration,
+                        "global_step": self.n_calls
+                    })
+            except Exception:
+                pass
+            
+            return result
+        
+        return True
+
 
 def recommend_next_phase_params(current_phase, total_phases, eval_metrics, current_params=None):
     """
