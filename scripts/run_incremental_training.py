@@ -45,6 +45,8 @@ def parse_args():
                         help='WandB project name')
     parser.add_argument('--wandb-entity', type=str, default=None,
                         help='WandB entity name')
+    parser.add_argument('--drive-ids-file', type=str, default=None,
+                        help='Path to JSON file with Google Drive file IDs for market data')
     return parser.parse_args()
 
 def ensure_dirs(dirs):
@@ -137,6 +139,14 @@ def run_training_phase(phase, total_steps_so_far, next_increment, args, is_first
         ])
         if args.wandb_entity:
             cmd.extend(["--wandb-entity", args.wandb_entity])
+    
+    # Add Google Drive integration if specified
+    if args.drive_ids_file:
+        if os.path.exists(args.drive_ids_file):
+            cmd.extend(["--drive-ids-file", args.drive_ids_file])
+            logger.info(f"Using Google Drive data from: {args.drive_ids_file}")
+        else:
+            logger.warning(f"Drive IDs file not found: {args.drive_ids_file}")
     
     # Run the training phase
     success = run_command(cmd, f"Training Phase {phase}")

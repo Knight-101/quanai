@@ -9,6 +9,7 @@ MODEL_BASE_DIR="models/manual"
 LOG_BASE_DIR="logs/manual"
 ENABLE_LOGGING=false  # Set to true to redirect output to log files
 HYPERPARAMS=""  # Initialize empty hyperparams string
+DRIVE_IDS_FILE=""  # Initialize empty drive IDs file parameter
 
 # Create directories
 mkdir -p "$MODEL_BASE_DIR"
@@ -35,6 +36,7 @@ show_help() {
     echo "  --verbose                      - Enable verbose output (more detailed logging)"
     echo "  --training-mode                - Enable training optimizations for faster speed"
     echo "  --hyperparams 'param1=value1,param2=value2' - Override hyperparameters for this training phase"
+    echo "  --drive-ids-file FILE_PATH     - Path to JSON file with Google Drive file IDs for data"
     echo ""
     echo "COMMANDS:"
     echo "  init STEPS [--verbose] [--training-mode] - Start initial training phase"
@@ -50,7 +52,50 @@ show_help() {
     echo "  $0 continue 4 3 200000 --training-mode # Phase 4: +200K (total: 500K) with optimizations"
     echo "  $0 continue 5 4 300000 --training-mode # Phase 5: +300K (total: 800K) with optimizations"
     echo "  $0 continue 6 5 200000 --training-mode # Phase 6: +200K (total: 1M) with optimizations"
+    echo ""
+    echo "  # Using Google Drive data:"
+    echo "  $0 init 100000 --drive-ids-file drive_file_ids.json # Train using data from Google Drive"
 }
+
+# Process global arguments that apply to all commands
+for arg in "$@"; do
+    if [[ $arg == --hyperparams=* ]]; then
+        HYPERPARAMS="${arg#*=}"
+    elif [[ $arg == --hyperparams ]]; then
+        # Get the next argument
+        for ((i=1; i<=$#; i++)); do
+            if [[ "${!i}" == "--hyperparams" ]]; then
+                next=$((i+1))
+                if [[ $next -le $# ]]; then
+                    HYPERPARAMS="${!next}"
+                    break
+                fi
+            fi
+        done
+    elif [[ $arg == --drive-ids-file=* ]]; then
+        DRIVE_IDS_FILE="${arg#*=}"
+    elif [[ $arg == --drive-ids-file ]]; then
+        # Get the next argument
+        for ((i=1; i<=$#; i++)); do
+            if [[ "${!i}" == "--drive-ids-file" ]]; then
+                next=$((i+1))
+                if [[ $next -le $# ]]; then
+                    DRIVE_IDS_FILE="${!next}"
+                    break
+                fi
+            fi
+        done
+    fi
+done
+
+# If a drive IDs file is specified, check that it exists
+if [ -n "$DRIVE_IDS_FILE" ]; then
+    if [ ! -f "$DRIVE_IDS_FILE" ]; then
+        echo "❌ ERROR: Drive IDs file not found: $DRIVE_IDS_FILE"
+        exit 1
+    fi
+    echo "Using Google Drive integration with file IDs from: $DRIVE_IDS_FILE"
+fi
 
 # Function to run initial training
 run_initial_training() {
@@ -65,6 +110,9 @@ run_initial_training() {
     fi
     if [ "$verbose" = true ]; then
         echo "  WITH VERBOSE LOGGING ENABLED"
+    fi
+    if [ -n "$DRIVE_IDS_FILE" ]; then
+        echo "  USING GOOGLE DRIVE DATA FROM: $DRIVE_IDS_FILE"
     fi
     echo "===================================================================="
     echo ""
@@ -105,6 +153,11 @@ run_initial_training() {
     # Add hyperparams flag if requested
     if [ -n "$HYPERPARAMS" ]; then
         COMMAND="$COMMAND --hyperparams \"$HYPERPARAMS\""
+    fi
+    
+    # Add Google Drive integration if specified
+    if [ -n "$DRIVE_IDS_FILE" ]; then
+        COMMAND="$COMMAND --drive-ids-file \"$DRIVE_IDS_FILE\""
     fi
     
     # Actual training command
@@ -156,6 +209,9 @@ continue_training() {
     fi
     if [ "$verbose" = true ]; then
         echo "  WITH VERBOSE LOGGING ENABLED"
+    fi
+    if [ -n "$DRIVE_IDS_FILE" ]; then
+        echo "  USING GOOGLE DRIVE DATA FROM: $DRIVE_IDS_FILE"
     fi
     echo "===================================================================="
     echo ""
@@ -261,6 +317,11 @@ continue_training() {
         COMMAND="$COMMAND --hyperparams \"$HYPERPARAMS\""
     fi
     
+    # Add Google Drive integration if specified
+    if [ -n "$DRIVE_IDS_FILE" ]; then
+        COMMAND="$COMMAND --drive-ids-file \"$DRIVE_IDS_FILE\""
+    fi
+    
     # Actual training command
     if [ "$ENABLE_LOGGING" = true ]; then
         echo "Output will be logged to $LOG_BASE_DIR/phase$new_phase/training.log"
@@ -321,11 +382,18 @@ continue_training() {
     
     echo ""
     echo "📋 NEXT SUGGESTED COMMAND:"
+    suggestion_cmd="./scripts/manual_incremental.sh continue $next_phase $new_phase $next_steps"
+    
     if [ "$training_mode" = true ]; then
-        echo "./scripts/manual_incremental.sh continue $next_phase $new_phase $next_steps --training-mode"
-    else
-        echo "./scripts/manual_incremental.sh continue $next_phase $new_phase $next_steps"
+        suggestion_cmd="$suggestion_cmd --training-mode"
     fi
+    
+    if [ -n "$DRIVE_IDS_FILE" ]; then
+        suggestion_cmd="$suggestion_cmd --drive-ids-file \"$DRIVE_IDS_FILE\""
+    fi
+    
+    echo "$suggestion_cmd"
+    
     if [ "$verbose" = true ]; then
         echo "To enable verbose logging, add the --verbose flag."
     fi

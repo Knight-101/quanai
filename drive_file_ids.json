@@ -1,0 +1,8 @@
+{
+  "market_data/binance_BTCUSDT_5m.parquet": "1-xjib2AeyTIR4hBhQD9BDzK8fJbTcvWY",
+  "market_data/binance_ETHUSDT_5m.parquet": "1dJbtH9pMy9or0h64qp7wd4UKPwLqUh95",
+  "market_data/binance_SOLUSDT_5m.parquet": "1zMML23xtSdnFLolazviVP-ZY-dx49uCf",
+
+  "features/base_features.parquet": "1RfS1r-hWj012UkqgEi88LvnQo8U0wYrs",
+  "features/base_features.meta.json": "1p1MQOiK9NOv2JCe1MG869IFqDaW_ov8T"
+}

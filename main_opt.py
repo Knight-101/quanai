@@ -466,6 +466,10 @@ def parse_args():
                         help='Evaluation frequency in timesteps')
     parser.add_argument('--hyperparams', type=str, default=None,
                        help='Comma-separated list of hyperparameters to override (format: param1=value1,param2=value2)')
+    parser.add_argument('--drive-ids-file', type=str, default=None,
+                       help='Path to JSON file containing Google Drive file IDs for data files. This enables Google Drive integration.')
+    parser.add_argument('--config', type=str, default='config/prod_config.yaml',
+                       help='Path to configuration file')
     return parser.parse_args()
 
 def load_config(config_path: str = 'config/prod_config.yaml') -> dict:
@@ -527,10 +531,21 @@ class TradingSystem:
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Initialize data manager with just the base path
-        self.data_manager = DataManager(
-            base_path=config['data']['cache_dir']
-        )
+        # Initialize data manager with Google Drive support if specified
+        drive_ids_file = config.get('data', {}).get('drive_ids_file')
+        if drive_ids_file:
+            logger.info(f"Initializing DataManager with Google Drive support from {drive_ids_file}")
+            # Import here to avoid early import errors if Google APIs aren't installed
+            from data_system import DriveAdapter
+            self.data_manager = DriveAdapter(
+                base_path=config['data']['cache_dir'],
+                drive_ids_file=drive_ids_file
+            )
+        else:
+            # Standard DataManager initialization
+            self.data_manager = DataManager(
+                base_path=config['data']['cache_dir']
+            )
         
         # Initialize components
         self.data_fetcher = PerpetualDataFetcher(
@@ -606,18 +621,30 @@ class TradingSystem:
         """Consolidated method for data fetching and processing"""
         logger.info("Fetching and processing data...")
         
-        # Calculate date range
-        end_time = datetime.now()
-        lookback_days = self.config['data']['history_days']
-        start_time = end_time - pd.Timedelta(days=lookback_days)
+        # First, try to load existing feature data directly
+        feature_data = self.data_manager.load_feature_data(
+            feature_set='base_features',
+            start_time=None,
+            end_time=None
+        )
         
-        # Try to load existing data first
-        existing_data = self._load_cached_data(start_time, end_time)
-        if existing_data is not None and len(existing_data) >= self.config['data']['min_history_points']:
+        if feature_data is not None:
+            logger.info(f"Found pre-computed feature data with {len(feature_data)} rows. Using directly.")
+            # We can skip the market data loading and feature engineering
+            return feature_data
+            
+        # Calculate date range for fallback case only
+        lookback_days = self.config['data']['history_days']
+        
+        # Try to load existing data
+        existing_data = self._load_cached_data()
+        if existing_data is not None:
             logger.info("Using existing data from cache.")
             formatted_data = self._format_data_for_training(existing_data)
             logger.info(f"Formatted data shape: {formatted_data.shape}")
             logger.info(f"Columns: {formatted_data.columns}")
+            # Save feature data for future use
+            self._save_feature_data(formatted_data)
             return formatted_data
             
         # Fetch new data if needed
@@ -645,32 +672,53 @@ class TradingSystem:
         
         return formatted_data
         
-    def _load_cached_data(self, start_time, end_time):
-        """Helper method to load cached data"""
+    def _load_cached_data(self, start_time=None, end_time=None):
+        """
+        Helper method to load cached data.
+        """
         all_data = {exchange: {} for exchange in self.config['data']['exchanges']}
         has_all_data = True
         
+        logger.info(f"Attempting to load cached data, minimum required history points: {self.config['data']['min_history_points']}")
+        
         for exchange in self.config['data']['exchanges']:
+            logger.info(f"Checking exchange: {exchange}")
             for symbol in self.config['trading']['symbols']:
+                logger.info(f"Loading data for {exchange}_{symbol}_{self.config['data']['timeframe']}")
+                
+                # Load data without time constraints
                 data = self.data_manager.load_market_data(
                     exchange=exchange,
                     symbol=symbol,
                     timeframe=self.config['data']['timeframe'],
-                    start_time=start_time,
-                    end_time=end_time,
+                    start_time=None,
+                    end_time=None,
                     data_type='perpetual'
                 )
                 
-                if data is None or len(data) < self.config['data']['min_history_points']:
+                # Check if we have enough data
+                if data is None:
+                    logger.warning(f"No data found for {exchange}_{symbol}")
                     has_all_data = False
                     break
-                    
-                all_data[exchange][symbol] = data
+                elif len(data) < self.config['data']['min_history_points']:
+                    logger.warning(f"Insufficient data for {exchange}_{symbol}: found {len(data)} points, need {self.config['data']['min_history_points']}")
+                    has_all_data = False
+                    break
+                else:
+                    logger.info(f"Sufficient data found for {exchange}_{symbol}: {len(data)} points")
+                    all_data[exchange][symbol] = data
                 
             if not has_all_data:
+                logger.warning(f"Missing or insufficient data for exchange {exchange}, will fetch new data")
                 break
-                
-        return all_data if has_all_data else None
+        
+        if has_all_data:
+            logger.info("All required data found in cache, using existing data")
+            return all_data
+        else:
+            logger.info("Incomplete data in cache, will fetch fresh data")
+            return None
         
     def _save_market_data(self, raw_data):
         """Helper method to save market data"""
@@ -1987,6 +2035,11 @@ class TradingSystem:
         """Format data into the structure expected by the trading environment"""
         logger.info("Starting data formatting...")
         
+        # Check if input is already feature data (when loaded directly from feature files)
+        if isinstance(raw_data, pd.DataFrame) and isinstance(raw_data.columns, pd.MultiIndex):
+            logger.info("Data is already formatted feature data, returning directly")
+            return raw_data
+            
         # OPTIMIZATION: Check for cached processed data first
         cache_dir = Path("data/cache")
         cache_file = cache_dir / "processed_data_cache.pkl"
@@ -2458,6 +2511,14 @@ async def main():
         # Parse arguments and load config
         args = parse_args()
         config = load_config('config/prod_config.yaml')
+
+            # If drive-ids-file is provided, add it to the config
+        if args.drive_ids_file:
+            if not os.path.exists(args.drive_ids_file):
+                logger.error(f"Drive IDs file not found: {args.drive_ids_file}")
+                return
+            config['data']['drive_ids_file'] = args.drive_ids_file
+            logger.info(f"Using Google Drive integration with file IDs from: {args.drive_ids_file}")
         
         # Log GPU status at the start
         if torch.cuda.is_available():
