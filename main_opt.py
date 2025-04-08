@@ -793,7 +793,7 @@ class TradingSystem:
         
         return env
         
-    def create_adaptive_lr_schedule(self, phase, total_phases=6, performance_metrics=None):
+    def create_adaptive_lr_schedule(self, phase, total_phases=5, performance_metrics=None):
         """
         Create a learning rate schedule that considers:
         1. Current phase in overall training
@@ -804,7 +804,7 @@ class TradingSystem:
         # Calculate global progress
         total_steps = 1_000_000  # Total expected steps across all phases
         steps_per_phase = {
-            1: 100000, 2: 100000, 3: 200000, 4: 200000, 5: 300000, 6: 100000
+            1: 100000, 2: 200000, 3: 200000, 4: 300000, 5: 200000
         }
         
         # Calculate steps completed so far (excluding current phase)
@@ -899,7 +899,7 @@ class TradingSystem:
         # Create adaptive learning rate schedule
         learning_rate = self.create_adaptive_lr_schedule(
             phase=current_phase,
-            total_phases=6,
+            total_phases=5,
             performance_metrics=performance_metrics
         )
         policy_kwargs = {
