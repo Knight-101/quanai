@@ -620,18 +620,6 @@ class TradingSystem:
     async def _fetch_and_process_data(self):
         """Consolidated method for data fetching and processing"""
         logger.info("Fetching and processing data...")
-        
-        # First, try to load existing feature data directly
-        feature_data = self.data_manager.load_feature_data(
-            feature_set='base_features',
-            start_time=None,
-            end_time=None
-        )
-        
-        if feature_data is not None:
-            logger.info(f"Found pre-computed feature data with {len(feature_data)} rows. Using directly.")
-            # We can skip the market data loading and feature engineering
-            return feature_data
             
         # Calculate date range for fallback case only
         lookback_days = self.config['data']['history_days']
@@ -830,14 +818,14 @@ class TradingSystem:
         
         # Determine LR bounds based on where we are in training
         if global_progress < 0.3:  # Early training (first 30%)
-            initial_lr = 0.00012
-            final_lr = 0.00008
+            initial_lr = 0.00012  # Keep initial rate
+            final_lr = 0.00008   # Higher than before
         elif global_progress < 0.7:  # Middle training (40%)
             initial_lr = 0.00008
-            final_lr = 0.00003
+            final_lr = 0.00003   # Higher than before
         else:  # Late training (final 30%)
             initial_lr = 0.00003
-            final_lr = 0.000015
+            final_lr = 0.00003   # Keep higher final rate
         
         # Performance-based adjustments
         if performance_metrics:
@@ -864,6 +852,13 @@ class TradingSystem:
         # Return the schedule function
         def lr_schedule(progress_remaining):
             """Custom learning rate schedule for this specific phase"""
+            # Convert from progress_remaining to progress_completed
+            progress = 1.0 - progress_remaining
+            
+            # Add stabilization plateau at Phase 5 (800K steps)
+            if phase == 5 and 0.2 <= progress <= 0.3:  # Around 800K steps
+                return 0.00004  # Stabilization plateau
+            
             # Enhanced cosine annealing schedule
             if progress_remaining < 0.3:  # Final 30% of this phase
                 return final_lr
@@ -875,7 +870,7 @@ class TradingSystem:
                 cos_factor = 0.5 * (1 + np.cos(np.pi * (1 - phase_progress)))
                 return final_lr + (initial_lr - final_lr) * cos_factor
         
-        return lr_schedule   
+        return lr_schedule
             
     def _setup_model(self, args=None) -> PPO:
         """Consolidated model setup"""
@@ -2100,15 +2095,41 @@ class TradingSystem:
                     # Create formatted DataFrame
                     formatted_data = pd.DataFrame(index=df.index)
                     
-                    # OPTIMIZATION: Process all numeric columns in one batch operation
-                    for col in ['open', 'high', 'low', 'close', 'volume', 'funding_rate']:
-                        if col in df.columns:
-                            formatted_data[col] = pd.to_numeric(df[col], errors='coerce')
+                    # Check if df has MultiIndex columns (data loaded from Google Drive)
+                    if isinstance(df.columns, pd.MultiIndex):
+                        logger.info(f"Processing MultiIndex columns for {formatted_symbol}")
+                        # For each feature needed, get it from the MultiIndex columns
+                        for col in ['open', 'high', 'low', 'close', 'volume', 'funding_rate', 'bid_depth', 'ask_depth']:
+                            if (formatted_symbol, col) in df.columns:
+                                formatted_data[col] = pd.to_numeric(df[(formatted_symbol, col)], errors='coerce')
+                            else:
+                                logger.warning(f"Column ({formatted_symbol}, {col}) not found in MultiIndex data")
+                    else:
+                        # Original code for flat columns
+                        logger.info(f"Processing flat columns for {formatted_symbol}")
+                        # OPTIMIZATION: Process all numeric columns in one batch operation
+                        for col in ['open', 'high', 'low', 'close', 'volume', 'funding_rate']:
+                            if col in df.columns:
+                                formatted_data[col] = pd.to_numeric(df[col], errors='coerce')
                     
                     # CRITICAL FIX: Validate price data consistency
                     # Ensure high >= low and high,low are consistent with open,close
-                    formatted_data['high'] = formatted_data[['high', 'open', 'close']].max(axis=1)
-                    formatted_data['low'] = formatted_data[['low', 'open', 'close']].min(axis=1)
+                    # Only perform this operation if we have the required columns
+                    required_cols = ['high', 'open', 'close', 'low']
+                    if all(col in formatted_data.columns for col in required_cols):
+                        formatted_data['high'] = formatted_data[['high', 'open', 'close']].max(axis=1)
+                        formatted_data['low'] = formatted_data[['low', 'open', 'close']].min(axis=1)
+                    else:
+                        missing = [col for col in required_cols if col not in formatted_data.columns]
+                        logger.error(f"Cannot validate price consistency - missing columns: {missing}")
+                        # If we're missing high/low but have open/close, create them
+                        if 'high' not in formatted_data.columns and 'open' in formatted_data.columns and 'close' in formatted_data.columns:
+                            formatted_data['high'] = formatted_data[['open', 'close']].max(axis=1)
+                        if 'low' not in formatted_data.columns and 'open' in formatted_data.columns and 'close' in formatted_data.columns:
+                            formatted_data['low'] = formatted_data[['open', 'close']].min(axis=1)
+                    
+                    # Rest of the existing code for handling missing columns
+                    # ...
                     
                     # Handle missing columns with vectorized operations
                     if 'volume' not in df.columns:
