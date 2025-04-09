@@ -10,6 +10,7 @@ LOG_BASE_DIR="logs/manual"
 ENABLE_LOGGING=false  # Set to true to redirect output to log files
 HYPERPARAMS=""  # Initialize empty hyperparams string
 DRIVE_IDS_FILE=""  # Initialize empty drive IDs file parameter
+USE_RECOMMENDATIONS=false # Initialize use_recommendations flag
 
 # Create directories
 mkdir -p "$MODEL_BASE_DIR"
@@ -26,9 +27,9 @@ show_help() {
     echo "Manual Incremental Training Helper"
     echo ""
     echo "USAGE:"
-    echo "  $0 [--log] init 100000                # Initial training for 100K steps"
-    echo "  $0 [--log] init 100000 --training-mode # Initial training with optimizations"
-    echo "  $0 [--log] continue 2 1 100000        # Continue from phase 1 to phase 2 with 100K steps"
+    echo "  $0 [--log] init 500000                # Initial training for 500K steps"
+    echo "  $0 [--log] init 500000 --training-mode # Initial training with optimizations"
+    echo "  $0 [--log] continue 2 1 500000        # Continue from phase 1 to phase 2 with 500K steps"
     echo "  $0 [--log] evaluate 2                 # Evaluate model from phase 2"
     echo ""
     echo "OPTIONS:"
@@ -37,6 +38,7 @@ show_help() {
     echo "  --training-mode                - Enable training optimizations for faster speed"
     echo "  --hyperparams 'param1=value1,param2=value2' - Override hyperparameters for this training phase"
     echo "  --drive-ids-file FILE_PATH     - Path to JSON file with Google Drive file IDs for data"
+    echo "  --use-recommendations          - Automatically use hyperparameter recommendations from previous phase"
     echo ""
     echo "COMMANDS:"
     echo "  init STEPS [--verbose] [--training-mode] - Start initial training phase"
@@ -45,16 +47,19 @@ show_help() {
     echo "  help                           - Show this help message"
     echo ""
     echo "EXAMPLES:"
-    echo "  # Complete 1M steps in phases:"
-    echo "  $0 init 100000 --training-mode # Phase 1: 100K with performance optimizations"
-    echo "  $0 continue 2 1 100000 --training-mode # Phase 2: +100K (total: 200K) with optimizations"
-    echo "  $0 continue 3 2 100000 --training-mode # Phase 3: +100K (total: 300K) with optimizations"
-    echo "  $0 continue 4 3 200000 --training-mode # Phase 4: +200K (total: 500K) with optimizations"
-    echo "  $0 continue 5 4 300000 --training-mode # Phase 5: +300K (total: 800K) with optimizations"
-    echo "  $0 continue 6 5 200000 --training-mode # Phase 6: +200K (total: 1M) with optimizations"
+    echo "  # Complete 10M steps in phases:"
+    echo "  $0 init 500000 --training-mode # Phase 1: 500K with performance optimizations"
+    echo "  $0 continue 2 1 500000 --training-mode --use-recommendations # Phase 2: +500K (total: 1M) with recommendations"
+    echo "  $0 continue 3 2 1000000 --training-mode --use-recommendations # Phase 3: +1M (total: 2M) with recommendations"
+    echo "  $0 continue 4 3 1000000 --training-mode --use-recommendations # Phase 4: +1M (total: 3M) with recommendations"
+    echo "  $0 continue 5 4 1000000 --training-mode --use-recommendations # Phase 5: +1M (total: 4M) with recommendations"
+    echo "  $0 continue 6 5 1000000 --training-mode --use-recommendations # Phase 6: +1M (total: 5M) with recommendations"
+    echo "  $0 continue 7 6 2000000 --training-mode --use-recommendations # Phase 7: +2M (total: 7M) with recommendations"
+    echo "  $0 continue 8 7 2000000 --training-mode --use-recommendations # Phase 8: +2M (total: 9M) with recommendations"
+    echo "  $0 continue 9 8 1000000 --training-mode --use-recommendations # Phase 9: +1M (total: 10M) with recommendations"
     echo ""
     echo "  # Using Google Drive data:"
-    echo "  $0 init 100000 --drive-ids-file drive_file_ids.json # Train using data from Google Drive"
+    echo "  $0 init 500000 --drive-ids-file drive_file_ids.json # Train using data from Google Drive"
 }
 
 # Process global arguments that apply to all commands
@@ -85,6 +90,8 @@ for arg in "$@"; do
                 fi
             fi
         done
+    elif [[ $arg == --use-recommendations ]]; then
+        USE_RECOMMENDATIONS=true
     fi
 done
 
@@ -210,6 +217,9 @@ continue_training() {
     if [ "$verbose" = true ]; then
         echo "  WITH VERBOSE LOGGING ENABLED"
     fi
+    if [ "$USE_RECOMMENDATIONS" = true ]; then
+        echo "  USING HYPERPARAMETER RECOMMENDATIONS FROM PREVIOUS PHASE"
+    fi
     if [ -n "$DRIVE_IDS_FILE" ]; then
         echo "  USING GOOGLE DRIVE DATA FROM: $DRIVE_IDS_FILE"
     fi
@@ -260,13 +270,12 @@ continue_training() {
     # Create log directory for this phase
     mkdir -p "$LOG_BASE_DIR/phase$new_phase"
     
-    # Calculate global training progress (helpful for proper learning rate scheduling)
-    total_planned_steps=1000000  # Your expected total training across all phases
-    prev_steps_completed=0
+    # Calculate global training progress for 10M steps
+    total_planned_steps=10000000  # Total expected training across all phases (10M)
     
     # Check if recommendations exist from previous phase
     RECOMMENDATIONS_FILE="$PREV_PHASE_DIR/phase${new_phase}_recommendations.json"
-    if [ -f "$RECOMMENDATIONS_FILE" ] && [ -z "$HYPERPARAMS" ]; then
+    if [ -f "$RECOMMENDATIONS_FILE" ] && [ -z "$HYPERPARAMS" ] && [ "$USE_RECOMMENDATIONS" = false ]; then
         echo "Found parameter recommendations from previous phase"
         # Extract recommendations using jq (make sure it's installed)
         if command -v jq &> /dev/null; then
@@ -315,6 +324,11 @@ continue_training() {
     # Add hyperparams flag if requested
     if [ -n "$HYPERPARAMS" ]; then
         COMMAND="$COMMAND --hyperparams \"$HYPERPARAMS\""
+    fi
+    
+    # Add use-recommendations flag if requested
+    if [ "$USE_RECOMMENDATIONS" = true ]; then
+        COMMAND="$COMMAND --use-recommendations"
     fi
     
     # Add Google Drive integration if specified
@@ -367,17 +381,28 @@ continue_training() {
     echo "Model saved to $NEW_PHASE_DIR/phase${new_phase}_model$EXT"
     echo ""
     
-    # Show next suggested phase
+    # Show next suggested phase based on 10M steps training schedule
     next_phase=$((new_phase + 1))
-    next_steps=100000
-    if [ $new_phase -eq 2 ]; then
-        next_steps=200000
+    
+    # Updated for 10M step training with 9 phases
+    if [ $new_phase -eq 1 ]; then
+        next_steps=500000    # Phase 2: 500K
+    elif [ $new_phase -eq 2 ]; then
+        next_steps=1000000   # Phase 3: 1M
     elif [ $new_phase -eq 3 ]; then
-        next_steps=200000
+        next_steps=1000000   # Phase 4: 1M
     elif [ $new_phase -eq 4 ]; then
-        next_steps=300000
+        next_steps=1000000   # Phase 5: 1M
     elif [ $new_phase -eq 5 ]; then
-        next_steps=200000
+        next_steps=1000000   # Phase 6: 1M
+    elif [ $new_phase -eq 6 ]; then
+        next_steps=2000000   # Phase 7: 2M
+    elif [ $new_phase -eq 7 ]; then
+        next_steps=2000000   # Phase 8: 2M
+    elif [ $new_phase -eq 8 ]; then
+        next_steps=1000000   # Phase 9: 1M
+    else
+        next_steps=500000    # Default if somehow beyond phase 9
     fi
     
     echo ""
@@ -386,6 +411,10 @@ continue_training() {
     
     if [ "$training_mode" = true ]; then
         suggestion_cmd="$suggestion_cmd --training-mode"
+    fi
+    
+    if [ "$USE_RECOMMENDATIONS" = true ]; then
+        suggestion_cmd="$suggestion_cmd --use-recommendations"
     fi
     
     if [ -n "$DRIVE_IDS_FILE" ]; then

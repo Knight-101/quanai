@@ -118,7 +118,7 @@ data:
   exchanges:
     - "binance"
   cache_dir: "data"
-  history_days: 2555
+  history_days: 1825
   min_history_points: 1000
 
 # Monitoring

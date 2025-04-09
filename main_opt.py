@@ -466,6 +466,8 @@ def parse_args():
                         help='Evaluation frequency in timesteps')
     parser.add_argument('--hyperparams', type=str, default=None,
                        help='Comma-separated list of hyperparameters to override (format: param1=value1,param2=value2)')
+    parser.add_argument('--use-recommendations', action='store_true',
+                       help='Use recommended hyperparameters from previous phase when continuing training')
     parser.add_argument('--drive-ids-file', type=str, default=None,
                        help='Path to JSON file containing Google Drive file IDs for data files. This enables Google Drive integration.')
     parser.add_argument('--config', type=str, default='config/prod_config.yaml',
@@ -793,7 +795,7 @@ class TradingSystem:
         
         return env
         
-    def create_adaptive_lr_schedule(self, phase, total_phases=5, performance_metrics=None):
+    def create_adaptive_lr_schedule(self, phase, total_phases=9, performance_metrics=None):
         """
         Create a learning rate schedule that considers:
         1. Current phase in overall training
@@ -802,30 +804,60 @@ class TradingSystem:
         Returns a function suitable for PPO's learning_rate parameter
         """
         # Calculate global progress
-        total_steps = 1_000_000  # Total expected steps across all phases
+        total_steps = 10_000_000  # Total expected steps across all phases (10M)
         steps_per_phase = {
-            1: 100000, 2: 200000, 3: 200000, 4: 300000, 5: 200000
+            1: 500000,    # Phase 1: 0-500K
+            2: 500000,    # Phase 2: 500K-1M
+            3: 1000000,   # Phase 3: 1M-2M
+            4: 1000000,   # Phase 4: 2M-3M
+            5: 1000000,   # Phase 5: 3M-4M
+            6: 1000000,   # Phase 6: 4M-5M
+            7: 2000000,   # Phase 7: 5M-7M
+            8: 2000000,   # Phase 8: 7M-9M
+            9: 1000000    # Phase 9: 9M-10M
         }
         
         # Calculate steps completed so far (excluding current phase)
         steps_completed = sum(steps_per_phase.get(i, 0) for i in range(1, phase))
         
         # Current phase steps
-        current_phase_steps = steps_per_phase.get(phase, 100000)
+        current_phase_steps = steps_per_phase.get(phase, 500000)
         
         # Calculate appropriate LR bounds for this phase based on global progress
         global_progress = steps_completed / total_steps
         
         # Determine LR bounds based on where we are in training
-        if global_progress < 0.3:  # Early training (first 30%)
-            initial_lr = 0.00012  # Keep initial rate
-            final_lr = 0.00008   # Higher than before
-        elif global_progress < 0.7:  # Middle training (40%)
+        if phase == 1:  # Phase 1: Exploration (0-500K)
+            initial_lr = 0.00012
+            final_lr = 0.00008
+        elif phase == 2:  # Phase 2: Core strategy development (500K-1M)
             initial_lr = 0.00008
-            final_lr = 0.00003   # Higher than before
-        else:  # Late training (final 30%)
+            final_lr = 0.00005
+        elif phase == 3:  # Phase 3: Strategy refinement (1M-2M)
+            initial_lr = 0.00005
+            final_lr = 0.00004
+        elif phase == 4:  # Phase 4: Strategy consolidation (2M-3M)
+            initial_lr = 0.00004
+            final_lr = 0.00003
+        elif phase == 5:  # Phase 5: Stabilization (3M-4M)
             initial_lr = 0.00003
-            final_lr = 0.00003   # Keep higher final rate
+            final_lr = 0.00003
+        elif phase == 6:  # Phase 6: Regime specialization (4M-5M)
+            initial_lr = 0.00003
+            final_lr = 0.00002
+        elif phase == 7:  # Phase 7: Multi-timeframe integration (5M-7M)
+            initial_lr = 0.00002
+            final_lr = 0.000015
+        elif phase == 8:  # Phase 8: Advanced pattern recognition (7M-9M)
+            initial_lr = 0.000015
+            final_lr = 0.00001
+        elif phase == 9:  # Phase 9: Strategy perfection (9M-10M)
+            initial_lr = 0.00001
+            final_lr = 0.00001
+        else:
+            # Default values if phase is not recognized
+            initial_lr = 0.00001
+            final_lr = 0.00001
         
         # Performance-based adjustments
         if performance_metrics:
@@ -855,9 +887,9 @@ class TradingSystem:
             # Convert from progress_remaining to progress_completed
             progress = 1.0 - progress_remaining
             
-            # Add stabilization plateau at Phase 5 (800K steps)
-            if phase == 5 and 0.2 <= progress <= 0.3:  # Around 800K steps
-                return 0.00004  # Stabilization plateau
+            # Special plateaus for stabilization
+            if phase == 5 and 0.4 <= progress <= 0.6:  # Middle of stabilization phase
+                return 0.00003  # Stabilization plateau
             
             # Enhanced cosine annealing schedule
             if progress_remaining < 0.3:  # Final 30% of this phase
@@ -899,7 +931,7 @@ class TradingSystem:
         # Create adaptive learning rate schedule
         learning_rate = self.create_adaptive_lr_schedule(
             phase=current_phase,
-            total_phases=5,
+            total_phases=9,
             performance_metrics=performance_metrics
         )
         policy_kwargs = {
@@ -1872,7 +1904,7 @@ class TradingSystem:
             logger.error(f"Error during training: {str(e)}")
             raise
             
-    def continue_training(self, model_path, env_path=None, additional_timesteps=1_000_000, 
+    def continue_training(self, model_path, env_path=None, additional_timesteps=None, 
                         reset_num_timesteps=False, reset_reward_normalization=False,
                         tb_log_name="ppo_trading_continued", hyperparams=None, args=None):
         """
@@ -1881,7 +1913,7 @@ class TradingSystem:
         Args:
             model_path: Path to the saved model
             env_path: Path to the saved environment (optional)
-            additional_timesteps: Number of additional timesteps to train for
+            additional_timesteps: Number of additional timesteps to train for (if None, uses phase-specific value)
             reset_num_timesteps: Whether to reset the timestep counter
             reset_reward_normalization: Whether to reset reward normalization statistics
             tb_log_name: TensorBoard log name
@@ -1909,6 +1941,40 @@ class TradingSystem:
                 if hasattr(self.env, 'returns'):
                     self.env.returns = np.zeros(self.env.returns.shape)
         
+        # Detect current phase and determine next phase
+        current_phase = 1
+        if args and hasattr(args, 'model_dir'):
+            # Try to extract phase number from model directory
+            match = re.search(r'phase(\d+)', args.model_dir)
+            if match:
+                current_phase = int(match.group(1))
+                logger.info(f"Detected current phase {current_phase} from model directory")
+        else:
+            # Extract from model path if model_dir not provided
+            match = re.search(r'phase(\d+)', model_path)
+            if match:
+                current_phase = int(match.group(1))
+                logger.info(f"Detected current phase {current_phase} from model path")
+        
+        next_phase = current_phase + 1
+        
+        # Define phase-specific timesteps if not explicitly provided
+        if additional_timesteps is None:
+            # Phase-based step schedule for 10M total steps
+            steps_per_phase = {
+                1: 500000,    # Phase 1: 0-500K
+                2: 500000,    # Phase 2: 500K-1M
+                3: 1000000,   # Phase 3: 1M-2M
+                4: 1000000,   # Phase 4: 2M-3M
+                5: 1000000,   # Phase 5: 3M-4M
+                6: 1000000,   # Phase 6: 4M-5M
+                7: 2000000,   # Phase 7: 5M-7M
+                8: 2000000,   # Phase 8: 7M-9M
+                9: 1000000    # Phase 9: 9M-10M
+            }
+            additional_timesteps = steps_per_phase.get(next_phase, 1000000)
+            logger.info(f"Using phase-specific timesteps for Phase {next_phase}: {additional_timesteps}")
+        
         # Apply training_mode and verbose settings to environment if args provided
         if args and (hasattr(args, 'training_mode') or hasattr(args, 'verbose')):
             training_mode = args.training_mode if hasattr(args, 'training_mode') else False
@@ -1928,33 +1994,85 @@ class TradingSystem:
         # Set the model environment to our environment
         self.model.set_env(self.env)
         
-        # Override hyperparameters if provided
+        # Check for recommendations from previous phase
+        use_recommendations = False
+        if args and hasattr(args, 'use_recommendations'):
+            use_recommendations = args.use_recommendations
+        else:
+            # Default to using recommendations for phase transitions
+            use_recommendations = True
+        
+        # Try to load recommended hyperparameters if phase is changing and no explicit hyperparams provided
+        recommendations = {}
+        if use_recommendations and hyperparams is None and current_phase < 9:
+            recommendation_file = os.path.join(os.path.dirname(model_path), f"phase{next_phase}_recommendations.json")
+            if os.path.exists(recommendation_file):
+                try:
+                    with open(recommendation_file, 'r') as f:
+                        recommendations = json.load(f)
+                    logger.info(f"Loaded recommended hyperparameters for phase {next_phase}")
+                    hyperparams = recommendations
+                except Exception as e:
+                    logger.warning(f"Failed to load recommended hyperparameters: {str(e)}")
+        
+        # Merge provided hyperparams with recommendations, with provided values taking precedence
+        if hyperparams and recommendations:
+            for k, v in recommendations.items():
+                if k not in hyperparams:
+                    hyperparams[k] = v
+        
+        # Apply the hyperparameters
         if hyperparams:
-            logger.info(f"Overriding hyperparameters for continued training:")
+            logger.info(f"Applying hyperparameters for phase {next_phase}:")
+            applied_params = {}
+            
+            # Handle policy_kwargs specially since it's nested
+            if 'policy_kwargs' in hyperparams:
+                policy_kwargs = hyperparams.pop('policy_kwargs')
+                
+                # Apply features_extractor_kwargs
+                if 'features_extractor_kwargs' in policy_kwargs:
+                    fe_kwargs = policy_kwargs['features_extractor_kwargs']
+                    if hasattr(self.model.policy, 'features_extractor') and hasattr(self.model.policy.features_extractor, '_kwargs'):
+                        current_fe_kwargs = self.model.policy.features_extractor._kwargs
+                        
+                        for k, v in fe_kwargs.items():
+                            if k in current_fe_kwargs:
+                                old_value = current_fe_kwargs[k]
+                                current_fe_kwargs[k] = v
+                                logger.info(f"  - features_extractor.{k}: {old_value} -> {v}")
+                                applied_params[f"features_extractor.{k}"] = v
+            
+            # Apply direct model parameters
             for param, value in hyperparams.items():
                 if hasattr(self.model, param):
                     old_value = getattr(self.model, param)
                     setattr(self.model, param, value)
                     logger.info(f"  - {param}: {old_value} -> {value}")
+                    applied_params[param] = value
                 else:
                     logger.warning(f"Hyperparameter '{param}' not found in model")
         
             # Special handling for entropy coefficient (needs to be updated in policy too)
             if 'ent_coef' in hyperparams:
-                logger.info(f"Updating entropy coefficient to {hyperparams['ent_coef']}")
                 if hasattr(self.model, 'ent_coef'):
                     self.model.ent_coef = hyperparams['ent_coef']
-                    logger.info(f"Increased entropy coefficient to {self.model.ent_coef} for better exploration")
-                    wandb.log({"hyperparameters/ent_coef": self.model.ent_coef})
+                    logger.info(f"Updated entropy coefficient to {self.model.ent_coef}")
+                    applied_params['ent_coef'] = self.model.ent_coef
+            
+            # Log applied parameters to wandb
+            if len(applied_params) > 0:
+                for param, value in applied_params.items():
+                    wandb.log({f"hyperparameters/{param}": value})
         
         # Setup callbacks
         callbacks = []
         
         # Checkpoint callback
         checkpoint_callback = CheckpointCallback(
-            save_freq=10000,
+            save_freq=max(100000, additional_timesteps // 10),  # 10 checkpoints per training run
             save_path=self.config['model']['checkpoint_dir'],
-            name_prefix="ppo_trading_continued"
+            name_prefix=f"ppo_trading_phase{next_phase}"
         )
         callbacks.append(checkpoint_callback)
         
@@ -1962,20 +2080,26 @@ class TradingSystem:
         eval_callback = VecNormalizeEvalCallback(
             eval_env=self.env,
             n_eval_episodes=3,  # Reduced from 5 for better performance
-            eval_freq=20000, 
+            eval_freq=min(20000, additional_timesteps // 10),  # 10 evaluations per training run
             log_path=self.config['logging']['log_dir'],
-            best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], "best_continued"),
+            best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], f"best_phase{next_phase}"),
             deterministic=True,
             verbose=1  # Enable verbose to see training mode changes
         )
         callbacks.append(eval_callback)
         
         # Continue training
-        logger.info(f"Continuing training for {additional_timesteps} additional timesteps")
+        logger.info(f"Continuing training for Phase {next_phase} with {additional_timesteps} steps")
+        logger.info(f"Total training after this phase will be approximately {sum([steps_per_phase.get(i, 0) for i in range(1, next_phase+1)])} steps")
+        
+        # Create next phase directory
+        next_phase_dir = os.path.join(os.path.dirname(os.path.dirname(model_path)), f"phase{next_phase}")
+        os.makedirs(next_phase_dir, exist_ok=True)
         
         # Log continuation to wandb
         wandb.log({
             "training/continued_from": model_path,
+            "training/phase": next_phase,
             "training/additional_steps": additional_timesteps,
             "training/reset_num_timesteps": reset_num_timesteps,
             "training/reset_reward_normalization": reset_reward_normalization
@@ -1985,37 +2109,37 @@ class TradingSystem:
             self.model.learn(
                 total_timesteps=additional_timesteps,
                 callback=callbacks,
-                tb_log_name=tb_log_name,
+                tb_log_name=f"ppo_trading_phase{next_phase}",
                 progress_bar=True,
                 reset_num_timesteps=reset_num_timesteps
             )
             
             # Save final model after continued training
-            final_model_path = os.path.join(args.model_dir, "final_continued_model")
+            final_model_path = os.path.join(next_phase_dir, "final_model")
             self.model.save(final_model_path)
-            self.env.save(os.path.join(args.model_dir, "final_continued_env.pkl"))
+            self.env.save(os.path.join(next_phase_dir, "final_env.pkl"))
             
             # Final evaluation
             eval_metrics = self._evaluate_model(self.model)
-            logger.info("\nContinued training completed!")
-            logger.info(f"Final metrics after continuation:")
+            logger.info("\nPhase training completed!")
+            logger.info(f"Final metrics after Phase {next_phase}:")
             logger.info(f"Mean return: {eval_metrics.get('mean_reward', 'N/A'):.4f}")
             logger.info(f"Sharpe ratio: {eval_metrics.get('reward_sharpe', 'N/A'):.4f}")
             logger.info(f"Max drawdown: {eval_metrics.get('max_drawdown', 'N/A'):.4f}")
             
             
             # Generate recommendations for next phase
-            current_phase = int(args.model_dir.rstrip('/').split('phase')[-1])
-            next_phase_recommendations = recommend_next_phase_params(
-                current_phase=current_phase,
-                total_phases=6,  # Assuming standard 6-phase training
-                eval_metrics=eval_metrics
-            )
-
-            logger.info(f"Recommendations for phase {current_phase + 1} saved to: {args.model_dir}/phase{current_phase + 1}_recommendations.json")
+            next_next_phase = next_phase + 1
+            if next_next_phase <= 9:  # Only generate recommendations if not at final phase
+                next_phase_recommendations = recommend_next_phase_params(
+                    current_phase=next_phase,
+                    total_phases=9,  # Using 9-phase training for 10M steps
+                    eval_metrics=eval_metrics
+                )
+                logger.info(f"Recommendations for phase {next_next_phase} saved to: {next_phase_dir}/phase{next_next_phase}_recommendations.json")
             
-            # After evaluation in training/continue_training methods:
-            eval_metrics_file = os.path.join(args.model_dir, "evaluation_metrics.json")
+            # Save evaluation metrics
+            eval_metrics_file = os.path.join(next_phase_dir, "evaluation_metrics.json")
             with open(eval_metrics_file, 'w') as f:
                 json.dump(eval_metrics, f, indent=4)
             logger.info(f"Saved evaluation metrics to {eval_metrics_file}")
@@ -2411,76 +2535,238 @@ def recommend_next_phase_params(current_phase, total_phases, eval_metrics, curre
     
     Args:
         current_phase: Current training phase number (1-based)
-        total_phases: Total planned phases (default: 6)
+        total_phases: Total planned phases (default: 9 for 10M steps)
         eval_metrics: Dictionary of evaluation metrics from _evaluate_model
         current_params: Dictionary of current hyperparameters
         
     Returns:
         dict: Recommended hyperparameters for next phase
     """
-    # Default total planned phases if we're doing the standard 1M step schedule
+    # Default total planned phases for 10M step schedule
     if total_phases is None:
-        total_phases = 6  # Default phases in 1M steps: 100K, 100K, 200K, 200K, 300K, 200K
+        total_phases = 9  # Default phases in 10M steps
+    
+    next_phase = current_phase + 1
+    if next_phase > total_phases:
+        logger.warning(f"Already at final phase {current_phase}. No next phase available.")
+        return {}
     
     # Calculate global progress (how far we are through total training)
-    total_steps = 1_000_000  # Total expected steps
+    total_steps = 10_000_000  # Total expected steps for 10M
     steps_per_phase = {
-        1: 100000, 2: 100000, 3: 200000, 4: 200000, 5: 300000, 6: 100000
+        1: 500000,    # Phase 1: 0-500K
+        2: 500000,    # Phase 2: 500K-1M
+        3: 1000000,   # Phase 3: 1M-2M
+        4: 1000000,   # Phase 4: 2M-3M
+        5: 1000000,   # Phase 5: 3M-4M
+        6: 1000000,   # Phase 6: 4M-5M
+        7: 2000000,   # Phase 7: 5M-7M
+        8: 2000000,   # Phase 8: 7M-9M
+        9: 1000000    # Phase 9: 9M-10M
     }
     
-    # Calculate steps completed so far
-    steps_completed = sum(steps_per_phase.get(i, 0) for i in range(1, current_phase + 1))
-    global_progress = 1.0 - (steps_completed / total_steps)
+    # Predefined hyperparameter schedules based on training_schedule.md
+    lr_schedule = {
+        1: (0.00012, 0.00008),  # Phase 1: 0-500K
+        2: (0.00008, 0.00005),  # Phase 2: 500K-1M
+        3: (0.00005, 0.00004),  # Phase 3: 1M-2M
+        4: (0.00004, 0.00003),  # Phase 4: 2M-3M
+        5: (0.00003, 0.00003),  # Phase 5: 3M-4M
+        6: (0.00003, 0.00002),  # Phase 6: 4M-5M
+        7: (0.00002, 0.000015), # Phase 7: 5M-7M
+        8: (0.000015, 0.00001), # Phase 8: 7M-9M
+        9: (0.00001, 0.00001)   # Phase 9: 9M-10M
+    }
     
-    # Initialize recommendations dict
+    ent_coef_schedule = {
+        1: (0.05, 0.04),        # Phase 1: 0-500K
+        2: (0.04, 0.035),       # Phase 2: 500K-1M
+        3: (0.035, 0.025),      # Phase 3: 1M-2M
+        4: (0.025, 0.018),      # Phase 4: 2M-3M
+        5: (0.018, 0.015),      # Phase 5: 3M-4M
+        6: (0.015, 0.012),      # Phase 6: 4M-5M
+        7: (0.012, 0.008),      # Phase 7: 5M-7M
+        8: (0.008, 0.005),      # Phase 8: 7M-9M
+        9: (0.005, 0.005)       # Phase 9: 9M-10M
+    }
+    
+    # Other hyperparameters by phase groups
+    batch_size_by_phase = {
+        (1, 2): 512,            # Phases 1-2
+        (3, 4, 5): 768,         # Phases 3-5
+        (6, 7): 1024,           # Phases 6-7
+        (8, 9): 1536            # Phases 8-9
+    }
+    
+    gae_lambda_by_phase = {
+        (1, 2, 3): 0.935,       # Phases 1-3
+        (4, 5): 0.95,           # Phases 4-5
+        (6, 7): 0.96,           # Phases 6-7
+        (8, 9): 0.97            # Phases 8-9
+    }
+    
+    clip_range_by_phase = {
+        (1, 2, 3): 0.25,        # Phases 1-3
+        (4, 5): 0.2,            # Phases 4-5
+        (6, 7): 0.15,           # Phases 6-7
+        (8, 9): 0.1             # Phases 8-9
+    }
+    
+    vf_coef_by_phase = {
+        (1, 2): 1.0,            # Phases 1-2
+        (3, 4): 0.8,            # Phases 3-4
+        (5, 6): 0.6,            # Phases 5-6
+        (7, 8, 9): 0.4          # Phases 7-9
+    }
+    
+    n_epochs_by_phase = {
+        (1, 2, 3): 10,          # Phases 1-3
+        (4, 5): 8,              # Phases 4-5
+        (6, 7, 8, 9): 5         # Phases 6-9
+    }
+    
+    dropout_rate_by_phase = {
+        (1, 2, 3): 0.088,       # Phases 1-3
+        (4, 5): 0.066,          # Phases 4-5
+        (6, 7): 0.044,          # Phases 6-7
+        (8, 9): 0.022           # Phases 8-9
+    }
+    
+    transformer_config_by_phase = {
+        (1, 2, 3, 4, 5): {"heads": 4, "layers": 2},  # Phases 1-5
+        (6, 7, 8, 9): {"heads": 8, "layers": 3}      # Phases 6-9
+    }
+    
+    # Initialize recommendations dict with default values from schedule
     recommendations = {}
     
-    # Calculate next learning rate based on global progress and performance
-    if global_progress <= 0.3:  # Final 30% of training
-        # Lower learning rate for fine-tuning
-        recommendations["learning_rate"] = 0.000015
-    elif global_progress <= 0.7:  # Middle of training
-        # Moderate learning rate
-        recommendations["learning_rate"] = 0.00005
-    else:  # Early training
-        # Higher learning rate
-        recommendations["learning_rate"] = 0.0001
+    # Learning rate recommendation from schedule
+    if next_phase in lr_schedule:
+        recommendations["learning_rate"] = lr_schedule[next_phase][0]  # Initial LR for next phase
     
-    # Adjust entropy coefficient (exploration) based on performance and phase
+    # Entropy coefficient recommendation from schedule
+    if next_phase in ent_coef_schedule:
+        recommendations["ent_coef"] = ent_coef_schedule[next_phase][0]  # Initial ent_coef for next phase
+    
+    # Batch size
+    for phases, batch_size in batch_size_by_phase.items():
+        if next_phase in phases:
+            recommendations["batch_size"] = batch_size
+            break
+    
+    # GAE Lambda
+    for phases, gae_lambda in gae_lambda_by_phase.items():
+        if next_phase in phases:
+            recommendations["gae_lambda"] = gae_lambda
+            break
+    
+    # Clip range
+    for phases, clip_range in clip_range_by_phase.items():
+        if next_phase in phases:
+            recommendations["clip_range"] = clip_range
+            break
+    
+    # Value function coefficient
+    for phases, vf_coef in vf_coef_by_phase.items():
+        if next_phase in phases:
+            recommendations["vf_coef"] = vf_coef
+            break
+    
+    # Number of epochs
+    for phases, n_epochs in n_epochs_by_phase.items():
+        if next_phase in phases:
+            recommendations["n_epochs"] = n_epochs
+            break
+    
+    # Extract policy_kwargs updates
+    policy_kwargs_updates = {}
+    
+    # Dropout rate
+    for phases, dropout_rate in dropout_rate_by_phase.items():
+        if next_phase in phases:
+            policy_kwargs_updates["features_extractor_kwargs"] = {"dropout_rate": dropout_rate}
+            break
+    
+    # Transformer configuration (heads and layers)
+    for phases, config in transformer_config_by_phase.items():
+        if next_phase in phases:
+            if "features_extractor_kwargs" not in policy_kwargs_updates:
+                policy_kwargs_updates["features_extractor_kwargs"] = {}
+            policy_kwargs_updates["features_extractor_kwargs"].update({
+                "nhead": config["heads"],
+                "transformer_layers": config["layers"]
+            })
+            break
+    
+    if policy_kwargs_updates:
+        recommendations["policy_kwargs"] = policy_kwargs_updates
+    
+    # Performance-based adjustments
     mean_reward = eval_metrics.get("mean_reward", 0)
     reward_sharpe = eval_metrics.get("reward_sharpe", 0)
     trades_executed = eval_metrics.get("trades_executed", 0)
+    explained_variance = eval_metrics.get("explained_variance", 0)
+    max_drawdown = eval_metrics.get("max_drawdown", 0)
     
-    # If we're getting good rewards and good Sharpe, reduce exploration
-    if mean_reward > 1.0 and reward_sharpe > 0.5:
-        ent_coef = 0.02
-    # If we're not getting good trading frequency, increase exploration
-    elif trades_executed < 100:
-        ent_coef = 0.05
-    # Default exploration for mid-training
-    else:
-        ent_coef = 0.03
+    # Adjust learning rate based on performance
+    if "learning_rate" in recommendations:
+        if reward_sharpe < -1.0 or mean_reward < -0.5:
+            # Poor performance - reduce learning rate
+            recommendations["learning_rate"] *= 0.7
+            logger.info(f"Reducing learning rate due to poor performance")
+        elif reward_sharpe > 1.5 and mean_reward > 0.5:
+            # Excellent performance - slight increase for optimization
+            recommendations["learning_rate"] *= 1.1
+            logger.info(f"Slightly increasing learning rate due to excellent performance")
     
-    # Phase-based adjustments to entropy coefficient
-    if global_progress < 0.3:  # Early phases (first 30%)
-        # Early phases - increase exploration
-        ent_coef *= 1.5
-    elif global_progress < 0.7:  # Mid phases
-        # Mid phases - standard exploration
-        pass
-    else:  # Final phases (last 30%)
-        # Final phases - reduce exploration
-        ent_coef *= 0.5
+    # Adjust entropy based on performance
+    if "ent_coef" in recommendations:
+        if trades_executed < 100 or reward_sharpe < -1.0:
+            # Too few trades or poor performance - increase exploration
+            recommendations["ent_coef"] *= 1.3
+            logger.info(f"Increasing entropy coefficient for better exploration")
+        elif reward_sharpe > 1.0 and trades_executed > 500:
+            # Good performance with many trades - slightly reduce exploration
+            recommendations["ent_coef"] *= 0.9
+            logger.info(f"Reducing entropy coefficient due to good exploration")
     
-    recommendations["ent_coef"] = ent_coef
+    # Adjust value function coefficient based on explained variance
+    if "vf_coef" in recommendations:
+        if explained_variance < -2.0:
+            # Very poor value estimation - increase VF emphasis significantly
+            recommendations["vf_coef"] = min(2.0, recommendations["vf_coef"] * 2.0)
+            logger.info(f"Significantly increasing vf_coef due to poor explained variance")
+        elif explained_variance < -0.5:
+            # Poor value estimation - increase VF emphasis
+            recommendations["vf_coef"] *= 1.3
+            logger.info(f"Increasing vf_coef due to negative explained variance")
+        elif explained_variance > 0.5:
+            # Good value estimation - slightly reduce VF emphasis
+            recommendations["vf_coef"] *= 0.9
+            logger.info(f"Reducing vf_coef due to good explained variance")
+    
+    # Adjust clip range based on max drawdown
+    if "clip_range" in recommendations and max_drawdown is not None:
+        if max_drawdown > 0.3:
+            # High drawdown - more conservative updates
+            recommendations["clip_range"] = max(0.1, recommendations["clip_range"] * 0.8)
+            logger.info(f"Reducing clip_range due to high drawdown")
+        elif max_drawdown < 0.05 and reward_sharpe > 1.0:
+            # Low drawdown with good performance - allow larger updates
+            recommendations["clip_range"] = min(0.3, recommendations["clip_range"] * 1.2)
+            logger.info(f"Increasing clip_range due to controlled drawdown and good performance")
     
     # Log the recommendations
-    logger.info(f"Recommended parameters for phase {current_phase + 1}:")
+    logger.info(f"Recommended parameters for phase {next_phase} (steps {sum(steps_per_phase.get(i, 0) for i in range(1, next_phase))}-{sum(steps_per_phase.get(i, 0) for i in range(1, next_phase+1))}):")
     for param, value in recommendations.items():
-        logger.info(f"  {param}: {value}")
+        if param == "policy_kwargs":
+            logger.info(f"  {param}:")
+            for k, v in value.items():
+                logger.info(f"    {k}: {v}")
+        else:
+            logger.info(f"  {param}: {value}")
     
     # Save recommendations to file for easy retrieval
-    next_phase = current_phase + 1
     model_dir = os.path.dirname(os.path.abspath(os.path.join("models/manual", f"phase{current_phase}")))
     recommendation_file = os.path.join(model_dir, f"phase{current_phase}", f"phase{next_phase}_recommendations.json")
     os.makedirs(os.path.dirname(recommendation_file), exist_ok=True)

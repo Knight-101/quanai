@@ -5959,3 +5959,32 @@ python backtesting/run_backtest.py --model-path models/best_model --data-path da
 ```
 
 For more details and advanced usage, see the [Backtesting README](backtesting/README.md).
+
+## Extended Training (10M Steps)
+
+The system now supports extended training for up to 10 million steps with an intelligent phase-based approach:
+
+- **9-Phase Training Structure**: Divided into Foundation Phase (0-1M steps) and Mastery Phase (1M-10M steps)
+- **Automatic Phase Transitions**: The system can automatically move between training phases with appropriate hyperparameter adjustments
+- **Performance-Adaptive Recommendations**: Hyperparameters are recommended based on model performance in the previous phase
+
+### Using Extended Training
+
+1. **Start normal training for Phase 1**:
+
+   ```bash
+   python main_opt.py --train --model_dir models/manual/phase1
+   ```
+
+2. **Continue to next phase with automatic recommendations**:
+
+   ```bash
+   python main_opt.py --continue_training --model_path models/manual/phase1/final_model --model_dir models/manual/phase1 --use_recommendations
+   ```
+
+3. **Check progress and recommendations**:
+   ```bash
+   cat models/manual/phase1/phase2_recommendations.json
+   ```
+
+For complete details on the extended training approach, see [training_schedule.md](training_schedule.md).
