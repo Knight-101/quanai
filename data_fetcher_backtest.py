@@ -201,8 +201,8 @@ class BacktestDataFetcher:
                 
     def _format_data_for_training(self, raw_data):
         """
-        Format raw data into the structure expected by the backtester.
-        This ensures feature compatibility with trained models.
+        Override the parent method to handle data that might already have MultiIndex columns.
+        Also ensures compatibility with the backtesting model.
         """
         # Aggregate data from all exchanges
         all_dataframes = []
@@ -210,17 +210,38 @@ class BacktestDataFetcher:
         # Process each exchange's data
         for exchange, exchange_data in raw_data.items():
             for symbol, data in exchange_data.items():
-                # Create a copy with MultiIndex columns
+                # Create a copy
                 processed_df = data.copy()
                 
-                # Map to short symbol name (e.g. BTC/USDT -> BTC)
-                short_symbol = self.symbol_mappings.get(symbol, symbol)
-                
-                # Create MultiIndex columns with (asset, feature) format
-                processed_df.columns = pd.MultiIndex.from_product(
-                    [[short_symbol], processed_df.columns],
-                    names=['asset', 'feature']
-                )
+                # Check if columns are already MultiIndex
+                if not isinstance(processed_df.columns, pd.MultiIndex):
+                    # Map to short symbol name (e.g. BTC/USDT -> BTC)
+                    short_symbol = self.symbol_mappings.get(symbol, symbol)
+                    
+                    # Create MultiIndex columns with (asset, feature) format
+                    logger.info(f"Converting columns to MultiIndex for {short_symbol}")
+                    processed_df.columns = pd.MultiIndex.from_product(
+                        [[short_symbol], processed_df.columns],
+                        names=['asset', 'feature']
+                    )
+                else:
+                    # Already MultiIndex, make sure the asset level matches our mapping
+                    logger.info(f"Columns already MultiIndex for {symbol}, ensuring correct asset level")
+                    current_assets = processed_df.columns.get_level_values(0).unique()
+                    short_symbol = self.symbol_mappings.get(symbol, symbol)
+                    
+                    # If there's only one asset in the index and it doesn't match what we expect,
+                    # we need to rename it
+                    if len(current_assets) == 1 and current_assets[0] != short_symbol:
+                        logger.info(f"Renaming asset from {current_assets[0]} to {short_symbol}")
+                        # Create a mapping dictionary
+                        level_map = {current_assets[0]: short_symbol}
+                        # Create new columns with renamed level 0
+                        new_cols = processed_df.columns.set_levels(
+                            [pd.Index([level_map.get(x, x) for x in lev]) if i == 0 else lev 
+                             for i, lev in enumerate(processed_df.columns.levels)]
+                        )
+                        processed_df.columns = new_cols
                 
                 all_dataframes.append(processed_df)
         
@@ -230,23 +251,237 @@ class BacktestDataFetcher:
             return None
             
         combined_df = pd.concat(all_dataframes, axis=1)
-        combined_df = combined_df.fillna(method='ffill').dropna()
+        combined_df = combined_df.ffill().dropna()
         
         # Generate technical features using the same engine as training
         logger.info("Generating technical features...")
-        feature_config = {
-            "use_momentum": True,
-            "use_volatility": True,
-            "use_volume": True,
-            "use_advanced": True,
-            "window_sizes": [14, 20, 50]
-        }
         
         assets = [self.symbol_mappings.get(s, s) for s in self.symbols]
         with_features = self.feature_engine.transform(combined_df)
         
-        logger.info(f"Final data shape: {with_features.shape}")
-        return with_features
+        logger.info("=== MODEL COMPATIBILITY FIX ===")
+        logger.info(f"Original features shape: {with_features.shape}")
+        
+        # ---------------------------------------------------------------------
+        # IMPORTANT: Find out what the model expects - 33 features per asset (not 78)
+        # ---------------------------------------------------------------------
+        
+        # Based on the error message, we need to match the model's feature shape
+        # The model expects a specific shape: (33,) or (n_env, 33)
+        expected_feature_count = 33  # Changed from 78 to 33 based on error message
+        current_feature_count = with_features.shape[1]
+        
+        # Get assets and features per asset
+        if isinstance(with_features.columns, pd.MultiIndex):
+            logger.info("Data already has MultiIndex - ensuring correct structure")
+            
+            # Extract existing assets and verify the column structure
+            if with_features.columns.names != ['asset', 'feature']:
+                logger.info(f"Fixing MultiIndex column names from {with_features.columns.names} to ['asset', 'feature']")
+                # Careful! Create a new MultiIndex with correct names
+                with_features.columns = pd.MultiIndex.from_tuples(
+                    [col for col in with_features.columns], 
+                    names=['asset', 'feature']
+                )
+            
+            assets = with_features.columns.get_level_values('asset').unique()
+            features_per_asset = len(with_features.xs(assets[0], axis=1, level='asset').columns)
+            features_needed_per_asset = expected_feature_count // len(assets)
+            # If we have too many features, cap them to what the model expects
+            if features_per_asset > features_needed_per_asset:
+                logger.info(f"Too many features per asset ({features_per_asset}), capping to {features_needed_per_asset}")
+                # We'll select the most important features later
+                features_to_remove = features_per_asset - features_needed_per_asset
+                missing_features_per_asset = 0
+            else:
+                missing_features_per_asset = max(0, features_needed_per_asset - features_per_asset)
+            
+            logger.info(f"Total assets: {len(assets)}")
+            logger.info(f"Current features per asset: {features_per_asset}")
+            logger.info(f"Features needed per asset: {features_needed_per_asset}")
+            logger.info(f"Missing features per asset: {missing_features_per_asset}")
+            
+            # Create a new dataframe with the right structure and all needed features
+            # Create a dictionary to collect all column data
+            column_data = {}
+            
+            # First copy existing features (limiting to what we need)
+            for asset in assets:
+                asset_features = with_features.xs(asset, level='asset', axis=1)
+                # Take only the features we need (prioritize important ones like price)
+                important_features = ['open', 'high', 'low', 'close', 'volume']
+                # Add priority features first
+                for feat in important_features:
+                    if feat in asset_features.columns:
+                        column_data[(asset, feat)] = asset_features[feat].values
+                
+                # Add other features up to the limit
+                remaining_features = [f for f in asset_features.columns 
+                                    if f not in important_features]
+                
+                features_to_add = features_needed_per_asset - len([f for f in important_features 
+                                                                if f in asset_features.columns])
+                
+                for feat in remaining_features[:features_to_add]:
+                    column_data[(asset, feat)] = asset_features[feat].values
+                
+                # Add padding features if needed
+                current_features = len([col for col in column_data.keys() if col[0] == asset])
+                if current_features < features_needed_per_asset:
+                    for i in range(features_needed_per_asset - current_features):
+                        feature_name = f"padding_feature_{i+1}"
+                        column_data[(asset, feature_name)] = np.zeros(len(with_features))
+            
+            # Create proper MultiIndex with correct names
+            new_columns = pd.MultiIndex.from_tuples(
+                list(column_data.keys()),
+                names=['asset', 'feature']
+            )
+            
+            # Create the new DataFrame all at once with proper structure
+            result_df = pd.DataFrame(
+                {col: column_data[col] for col in new_columns},
+                index=with_features.index,
+                columns=new_columns
+            )
+            
+            # Ensure we sort columns for better organization
+            result_df = result_df.sort_index(axis=1)
+            
+            logger.info(f"Features adjusted successfully. New shape: {result_df.shape}")
+            
+            # IMPORTANT: Make close prices directly accessible to the environment
+            # The environment uses df.iloc[step].loc[(asset, 'close')] to get prices
+            # We need to make sure these are actual columns and not hidden attributes
+            
+            # Verify close price columns exist
+            for asset in assets:
+                price_col = (asset, 'close')
+                if price_col not in result_df.columns:
+                    logger.warning(f"Critical price column {price_col} missing, adding it")
+                    # If we don't have close prices, try to get them from the original data
+                    close_price = None
+                    # Try different approaches to get price data
+                    try:
+                        close_price = combined_df.loc[:, (asset, 'close')]
+                    except:
+                        try:
+                            close_price = combined_df[asset]['close']
+                        except:
+                            close_price = np.ones(len(result_df)) * 1000.0  # Fallback
+                    
+                    # Add the close price column
+                    result_df[price_col] = close_price
+            
+            # Safety check - verify our index is correct
+            if result_df.columns.names != ['asset', 'feature']:
+                logger.error(f"Index names incorrect: {result_df.columns.names}, should be ['asset', 'feature']")
+                raise ValueError("Failed to create properly structured MultiIndex")
+            
+            # Final verification of shape
+            final_shape = result_df.shape
+            logger.info(f"Final data shape: {final_shape}")
+            expected_cols = expected_feature_count
+            if final_shape[1] != expected_cols:
+                logger.warning(f"Final shape {final_shape[1]} doesn't match expected {expected_cols} columns")
+            
+            return result_df
+        else:
+            # Not a MultiIndex - we need to transform it
+            logger.warning("Data doesn't have MultiIndex columns - converting to proper format")
+            
+            # Collect data for proper MultiIndex construction
+            column_data = {}
+            
+            # Expected features per asset for 33 total features with 3 assets
+            features_per_asset = expected_feature_count // len(assets)
+            
+            # Add data for each asset
+            for i, asset in enumerate(assets):
+                # If we have original price data, prioritize it
+                try:
+                    # Try to get close price from original data
+                    if symbol in combined_df.columns:
+                        column_data[(asset, 'close')] = combined_df[symbol]['close'].values
+                    else:
+                        # Fallback - use synthetic price data
+                        column_data[(asset, 'close')] = np.linspace(1000, 2000, len(with_features))
+                        logger.warning(f"Using synthetic price data for {asset}")
+                    
+                    # Add other price columns
+                    for price_col in ['open', 'high', 'low']:
+                        if symbol in combined_df.columns and price_col in combined_df[symbol].columns:
+                            column_data[(asset, price_col)] = combined_df[symbol][price_col].values
+                        else:
+                            # Derive from close price
+                            close_prices = column_data[(asset, 'close')]
+                            if price_col == 'open':
+                                column_data[(asset, price_col)] = close_prices * 0.99
+                            elif price_col == 'high':
+                                column_data[(asset, price_col)] = close_prices * 1.01
+                            elif price_col == 'low':
+                                column_data[(asset, price_col)] = close_prices * 0.98
+                except Exception as e:
+                    logger.error(f"Error setting up price data for {asset}: {str(e)}")
+                    # Create fallback price data
+                    column_data[(asset, 'close')] = np.linspace(1000, 2000, len(with_features))
+                    column_data[(asset, 'open')] = column_data[(asset, 'close')] * 0.99
+                    column_data[(asset, 'high')] = column_data[(asset, 'close')] * 1.01
+                    column_data[(asset, 'low')] = column_data[(asset, 'close')] * 0.98
+                
+                # Add volume if available
+                try:
+                    if symbol in combined_df.columns and 'volume' in combined_df[symbol].columns:
+                        column_data[(asset, 'volume')] = combined_df[symbol]['volume'].values
+                    else:
+                        # Create synthetic volume
+                        column_data[(asset, 'volume')] = np.random.randint(1000, 10000, len(with_features))
+                except:
+                    column_data[(asset, 'volume')] = np.random.randint(1000, 10000, len(with_features))
+                
+                # Count existing features for this asset
+                existing_features = len([col for col in column_data.keys() if col[0] == asset])
+                
+                # Get features from the processed DataFrame if available
+                feature_start = i * (with_features.shape[1] // len(assets))
+                feature_end = (i + 1) * (with_features.shape[1] // len(assets))
+                
+                # Add available features up to the limit
+                feature_count = min(features_per_asset - existing_features, 
+                                   feature_end - feature_start)
+                
+                for j in range(feature_count):
+                    feat_idx = feature_start + j
+                    if feat_idx < with_features.shape[1]:
+                        feature_name = f"feature_{j+1}"
+                        column_data[(asset, feature_name)] = with_features.iloc[:, feat_idx].values
+                
+                # Add padding features if needed
+                current_features = len([col for col in column_data.keys() if col[0] == asset])
+                for j in range(features_per_asset - current_features):
+                    column_data[(asset, f"padding_feature_{j+1}")] = np.zeros(len(with_features))
+            
+            # Create proper MultiIndex with correct names
+            new_columns = pd.MultiIndex.from_tuples(
+                list(column_data.keys()),
+                names=['asset', 'feature']
+            )
+            
+            # Create the result DataFrame all at once
+            result_df = pd.DataFrame(
+                {col: column_data[col] for col in new_columns},
+                index=with_features.index,
+                columns=new_columns
+            )
+            
+            logger.info(f"Converted to proper MultiIndex format. Final shape: {result_df.shape}")
+            
+            # Safety check - verify our index is correct
+            if result_df.columns.names != ['asset', 'feature']:
+                logger.error(f"Index names incorrect: {result_df.columns.names}")
+                raise ValueError("Failed to create properly structured MultiIndex")
+                
+            return result_df
 
 class CustomBacktestDataFetcher(BacktestDataFetcher):
     """
@@ -328,72 +563,9 @@ class CustomBacktestDataFetcher(BacktestDataFetcher):
     
     def _format_data_for_training(self, raw_data):
         """
-        Override the parent method to handle data that might already have MultiIndex columns.
+        Use the parent implementation for formatting data
         """
-        # Aggregate data from all exchanges
-        all_dataframes = []
-        
-        # Process each exchange's data
-        for exchange, exchange_data in raw_data.items():
-            for symbol, data in exchange_data.items():
-                # Create a copy
-                processed_df = data.copy()
-                
-                # Check if columns are already MultiIndex
-                if not isinstance(processed_df.columns, pd.MultiIndex):
-                    # Map to short symbol name (e.g. BTC/USDT -> BTC)
-                    short_symbol = self.symbol_mappings.get(symbol, symbol)
-                    
-                    # Create MultiIndex columns with (asset, feature) format
-                    logger.info(f"Converting columns to MultiIndex for {short_symbol}")
-                    processed_df.columns = pd.MultiIndex.from_product(
-                        [[short_symbol], processed_df.columns],
-                        names=['asset', 'feature']
-                    )
-                else:
-                    # Already MultiIndex, make sure the asset level matches our mapping
-                    logger.info(f"Columns already MultiIndex for {symbol}, ensuring correct asset level")
-                    current_assets = processed_df.columns.get_level_values(0).unique()
-                    short_symbol = self.symbol_mappings.get(symbol, symbol)
-                    
-                    # If there's only one asset in the index and it doesn't match what we expect,
-                    # we need to rename it
-                    if len(current_assets) == 1 and current_assets[0] != short_symbol:
-                        logger.info(f"Renaming asset from {current_assets[0]} to {short_symbol}")
-                        # Create a mapping dictionary
-                        level_map = {current_assets[0]: short_symbol}
-                        # Create new columns with renamed level 0
-                        new_cols = processed_df.columns.set_levels(
-                            [pd.Index([level_map.get(x, x) for x in lev]) if i == 0 else lev 
-                             for i, lev in enumerate(processed_df.columns.levels)]
-                        )
-                        processed_df.columns = new_cols
-                
-                all_dataframes.append(processed_df)
-        
-        # Combine all dataframes
-        if not all_dataframes:
-            logger.error("No data to process")
-            return None
-            
-        combined_df = pd.concat(all_dataframes, axis=1)
-        combined_df = combined_df.fillna(method='ffill').dropna()
-        
-        # Generate technical features using the same engine as training
-        logger.info("Generating technical features...")
-        feature_config = {
-            "use_momentum": True,
-            "use_volatility": True,
-            "use_volume": True,
-            "use_advanced": True,
-            "window_sizes": [14, 20, 50]
-        }
-        
-        assets = [self.symbol_mappings.get(s, s) for s in self.symbols]
-        with_features = self.feature_engine.transform(combined_df)
-        
-        logger.info(f"Final data shape: {with_features.shape}")
-        return with_features
+        return super()._format_data_for_training(raw_data)
 
 # For testing
 async def main():

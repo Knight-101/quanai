@@ -66,6 +66,24 @@ class DerivativesFeatureEngine:
                 logger.warning("Empty DataFrame provided to transform")
                 return pd.DataFrame()
             
+            # Special handling for pipe-separated columns (format "BTCUSDT|close")
+            if not isinstance(df.columns, pd.MultiIndex) and any('|' in col for col in df.columns):
+                logger.info("Detected pipe-separated columns, converting to MultiIndex")
+                # Create a new DataFrame with proper MultiIndex columns
+                new_df = pd.DataFrame(index=df.index)
+                for col in df.columns:
+                    if '|' in col:
+                        asset, feature = col.split('|', 1)
+                        new_df[(asset, feature)] = df[col]
+                    else:
+                        # Handle any columns without pipe separator
+                        new_df[('unknown', col)] = df[col]
+                
+                # Convert to MultiIndex
+                new_df.columns = pd.MultiIndex.from_tuples(new_df.columns, names=['asset', 'feature'])
+                df = new_df
+                logger.info(f"Converted to MultiIndex with shape {df.shape}")
+            
             # Ensure MultiIndex columns with proper names
             if not isinstance(df.columns, pd.MultiIndex):
                 logger.warning("Input DataFrame columns are not MultiIndex, which may cause issues")
@@ -85,7 +103,7 @@ class DerivativesFeatureEngine:
             try:
                 # Get unique assets for processing
                 if isinstance(df.columns, pd.MultiIndex):
-                    assets = df.columns.get_level_values(asset_level).unique()
+                    assets = df.columns.get_level_values(0).unique()
                     logger.info(f"Processing features for assets: {list(assets)}")
                 else:
                     # For non-MultiIndex, assume single asset
@@ -98,7 +116,15 @@ class DerivativesFeatureEngine:
                 for asset in assets:
                     try:
                         # Get data for this asset
-                        asset_df = df.xs(asset, axis=1, level=asset_level) if isinstance(df.columns, pd.MultiIndex) else df
+                        asset_df = df.xs(asset, axis=1, level=0) if isinstance(df.columns, pd.MultiIndex) else df
+                        
+                        # Fix: Check for NaN values in the DataFrame itself, not in the columns
+                        # Ensure we're working with actual values
+                        if asset_df.values.size > 0:
+                            nan_check = pd.isna(asset_df.values).any()
+                            if nan_check:
+                                logger.warning(f"NaN values detected in {asset} data, applying fillna")
+                                asset_df = asset_df.ffill().fillna(0)
                         
                         # Process basic technical indicators
                         features[asset] = self._compute_technical_indicators(asset_df)
@@ -164,80 +190,57 @@ class DerivativesFeatureEngine:
             if isinstance(df.columns, pd.MultiIndex):
                 logger.info(f"MultiIndex levels: {df.columns.names}")
                 logger.info(f"Available assets: {df.columns.get_level_values(0).unique()}")
+                
+                # Convert MultiIndex columns to flat columns for TA library compatibility
+                logger.warning("Converting MultiIndex columns to flat for TA calculation")
+                df = df.copy()
+                # If we have a MultiIndex, convert it to single-level
+                # Creating flat columns by joining level names with underscore
+                flat_cols = [f"{col[0]}_{col[1]}" if isinstance(col, tuple) else col for col in df.columns]
+                df.columns = flat_cols
             else:
                 logger.info(f"Available columns: {list(df.columns)}")
                 
             result = {}
             
-            # Handle different column structures
-            if isinstance(df.columns, pd.MultiIndex):
-                # Get the name of the first level (which should be 'asset')
-                asset_level = df.columns.names[0] if df.columns.names[0] is not None else 0
-                
-                # Loop through each unique asset
-                for asset in df.columns.get_level_values(asset_level).unique():
-                    try:
-                        # Extract data for this asset
-                        try:
-                            asset_data = df.xs(asset, axis=1, level=asset_level)
-                        except Exception as e:
-                            logger.error(f"Error accessing asset {asset}: {str(e)}")
-                            logger.error(f"Column structure: {df.columns}")
-                            continue
-                            
-                        # Skip if we don't have close prices
-                        if 'close' not in asset_data.columns:
-                            logger.warning(f"No close price data for {asset}, skipping")
-                            continue
-                            
-                        # Extract price and volume data
-                        features = {}
-                        features['close'] = pd.to_numeric(asset_data['close'], errors='coerce')
-                        
-                        if 'open' in asset_data.columns:
-                            features['open'] = pd.to_numeric(asset_data['open'], errors='coerce')
-                        if 'high' in asset_data.columns:
-                            features['high'] = pd.to_numeric(asset_data['high'], errors='coerce')
-                        if 'low' in asset_data.columns:
-                            features['low'] = pd.to_numeric(asset_data['low'], errors='coerce')
-                        if 'volume' in asset_data.columns:
-                            features['volume'] = pd.to_numeric(asset_data['volume'], errors='coerce')
-                            
-                        # Now compute indicators
-                        result[asset] = self._calculate_indicators(features)
-                    except Exception as e:
-                        logger.error(f"Error processing asset {asset}: {str(e)}")
-                        continue
-            else:
-                # Single asset DataFrame with plain columns
-                logger.warning("Input DataFrame does not have MultiIndex columns")
-                
-                # Skip if we don't have close prices
-                if 'close' not in df.columns:
+            # Skip if we don't have close prices
+            if 'close' not in df.columns:
+                logger.warning("No close price data found in columns")
+                close_candidates = [col for col in df.columns if 'close' in col.lower()]
+                if close_candidates:
+                    logger.info(f"Found potential close price columns: {close_candidates}")
+                    # Try to use the first close-like column - use loc for proper assignment
+                    df = df.copy()  # Create a copy to avoid SettingWithCopyWarning
+                    df.loc[:, 'close'] = df[close_candidates[0]]
+                else:
                     logger.warning("No close price data, skipping")
                     return {}
                     
-                # Create a dummy asset name
-                asset = "asset"
-                features = {}
-                features['close'] = pd.to_numeric(df['close'], errors='coerce')
-                
-                if 'open' in df.columns:
-                    features['open'] = pd.to_numeric(df['open'], errors='coerce')
-                if 'high' in df.columns:
-                    features['high'] = pd.to_numeric(df['high'], errors='coerce')
-                if 'low' in df.columns:
-                    features['low'] = pd.to_numeric(df['low'], errors='coerce')
-                if 'volume' in df.columns:
-                    features['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-                    
-                # Compute indicators
-                result[asset] = self._calculate_indicators(features)
-                
+            # Create a dummy asset name
+            asset = "asset"
+            features = {}
+            
+            # Ensure we have basic OHLCV data in the right format
+            features['close'] = pd.to_numeric(df['close'], errors='coerce')
+            
+            # Add OHLC and volume if available
+            for col in ['open', 'high', 'low', 'volume']:
+                if col in df.columns:
+                    features[col] = pd.to_numeric(df[col], errors='coerce')
+                else:
+                    # Look for similar column names if exact match not found
+                    candidates = [c for c in df.columns if col in c.lower()]
+                    if candidates:
+                        features[col] = pd.to_numeric(df[candidates[0]], errors='coerce')
+            
+            # Compute indicators with safe handling
+            result[asset] = self._calculate_indicators(features)
+            
             return result
             
         except Exception as e:
             logger.error(f"Error computing technical indicators: {str(e)}")
+            logger.error(traceback.format_exc())
             if isinstance(df.columns, pd.MultiIndex):
                 logger.error(f"MultiIndex levels: {df.columns.names}")
             else:
@@ -246,181 +249,174 @@ class DerivativesFeatureEngine:
         
     def _calculate_indicators(self, data: Dict[str, pd.Series]) -> Dict[str, pd.Series]:
         """Calculate comprehensive technical indicators from price and volume data"""
-        features = {}
-        
-        # Copy basic price data
-        for key in ['open', 'high', 'low', 'close', 'volume']:
-            if key in data:
-                features[key] = data[key]
+        try:
+            features = {}
+            
+            # Helper function for safe indicator calculation
+            def safe_indicator(func, default_value=None):
+                try:
+                    result = func()
+                    # Check for NaN values
+                    if isinstance(result, pd.Series) and result.isna().any():
+                        result = result.ffill().fillna(0)
+                    return result
+                except Exception as e:
+                    logger.debug(f"Error calculating indicator: {str(e)}")
+                    # Return appropriate default
+                    if default_value is not None:
+                        return default_value
+                    else:
+                        # Create a Series of zeros with the same index as close
+                        return pd.Series(0, index=data['close'].index)
+            
+            # Check if we have all OHLC data
+            has_ohlc = all(k in data for k in ['open', 'high', 'low', 'close'])
+            # Get close prices (required for all indicators)
+            close = data['close'].copy()
+            
+            # Basic price features
+            features['close'] = close
+            if 'open' in data:
+                features['open'] = data['open']
+            if 'high' in data:
+                features['high'] = data['high']
+            if 'low' in data:
+                features['low'] = data['low']
+            
+            # Volume features
+            if 'volume' in data:
+                features['volume'] = data['volume']
                 
-        # Extract price and volume series
-        close = data['close']
-        
-        # Only try to calculate full indicators if we have the necessary data
-        has_ohlc = all(k in data for k in ['open', 'high', 'low', 'close'])
-        has_volume = 'volume' in data
-        
-        # Safe indicator calculation helper
-        def safe_indicator(func):
+                # Calculate more sophisticated volume indicators
+                try:
+                    if has_ohlc:
+                        obv = OnBalanceVolumeIndicator(close=close, volume=data['volume'])
+                        features['obv'] = safe_indicator(obv.on_balance_volume)
+                        
+                        cmf = ChaikinMoneyFlowIndicator(
+                            high=data['high'], 
+                            low=data['low'], 
+                            close=close, 
+                            volume=data['volume']
+                        )
+                        features['cmf'] = safe_indicator(cmf.chaikin_money_flow)
+                        
+                        accum_dist = AccDistIndexIndicator(
+                            high=data['high'], 
+                            low=data['low'], 
+                            close=close, 
+                            volume=data['volume']
+                        )
+                        features['accum_dist'] = safe_indicator(accum_dist.acc_dist_index)
+                except Exception as e:
+                    logger.debug(f"Error calculating volume indicators: {str(e)}")
+            
+            # =================== TREND INDICATORS ===================
+            
+            # EMA indicators
             try:
-                return func()
+                for period in [5, 10, 20, 50, 100, 200]:
+                    try:
+                        ema = EMAIndicator(close=close, window=period)
+                        features[f'ema_{period}'] = safe_indicator(ema.ema_indicator)
+                    except Exception as e:
+                        logger.debug(f"Error calculating EMA-{period}: {str(e)}")
             except Exception as e:
-                logger.debug(f"Error calculating indicator: {str(e)}")
-                return pd.Series(index=close.index, data=np.nan)
-        
-        # =================== MARKET REGIME INDICATORS ===================
-        
-        # 1. ADX to identify trending markets
-        if has_ohlc:
+                logger.debug(f"Error calculating EMA group: {str(e)}")
+            
+            # MACD
             try:
-                adx = ADXIndicator(data['high'], data['low'], close, self.adx_period)
-                features['adx'] = adx.adx()
-                features['adx_pos'] = adx.adx_pos()  # Positive directional indicator
-                features['adx_neg'] = adx.adx_neg()  # Negative directional indicator
-                
-                # ADX-based regime classification
-                # ADX > 25 typically indicates trending market
-                features['is_trending'] = (features['adx'] > 25).astype(float)
-                
-                # Direction strength indicator (combination of +DI and -DI)
-                features['trend_strength'] = features['adx_pos'] - features['adx_neg']
+                macd_ind = MACD(close=close)
+                features['macd'] = safe_indicator(macd_ind.macd)
+                features['macd_signal'] = safe_indicator(macd_ind.macd_signal)
+                features['macd_diff'] = safe_indicator(macd_ind.macd_diff)
             except Exception as e:
-                logger.warning(f"Error calculating ADX: {e}")
-        
-        # 2. Hurst Exponent for long-term trend/mean-reversion detection
-        try:
-            # Calculate Hurst exponent in a rolling window
-            features['hurst_exponent'] = self._calculate_rolling_hurst(close, self.hurst_period)
+                logger.debug(f"Error calculating MACD: {str(e)}")
             
-            # Hurst > 0.5 suggests trending, < 0.5 suggests mean-reverting
-            features['is_mean_reverting'] = (features['hurst_exponent'] < 0.45).astype(float)
-            features['is_random_walk'] = ((features['hurst_exponent'] >= 0.45) & 
-                                       (features['hurst_exponent'] <= 0.55)).astype(float)
-            features['is_persistent'] = (features['hurst_exponent'] > 0.55).astype(float)
-        except Exception as e:
-            logger.warning(f"Error calculating Hurst exponent: {e}")
-        
-        # 3. Volatility regime
-        try:
-            returns = close.pct_change(fill_method=None).fillna(0)
-            # Rolling volatility
-            rolling_vol = returns.rolling(30).std()
-            # Volatility of volatility - meta-volatility
-            vol_of_vol = rolling_vol.rolling(30).std()
-            features['volatility'] = rolling_vol
-            features['vol_of_vol'] = vol_of_vol
+            # ADX (trend strength)
+            if has_ohlc:
+                try:
+                    adx = ADXIndicator(high=data['high'], low=data['low'], close=close)
+                    features['adx'] = safe_indicator(adx.adx)
+                    features['adx_pos'] = safe_indicator(adx.adx_pos)
+                    features['adx_neg'] = safe_indicator(adx.adx_neg)
+                except Exception as e:
+                    logger.debug(f"Error calculating ADX: {str(e)}")
             
-            # High vol-of-vol indicates regime shifts
-            features['vol_regime_shift'] = (vol_of_vol > vol_of_vol.rolling(100).mean() * 1.5).astype(float)
+            # =================== MOMENTUM INDICATORS ===================
             
-            # Classify volatility regime
-            if len(rolling_vol) > 252:
-                vol_quantiles = rolling_vol.rolling(252).quantile(0.75)
-                features['high_vol_regime'] = (rolling_vol > vol_quantiles).astype(float)
-        except Exception as e:
-            logger.warning(f"Error calculating volatility regime: {e}")
-        
-        # 4. Combined market regime score (1 = strong trend, 0 = strong range)
-        try:
-            if 'is_trending' in features and 'is_persistent' in features:
-                # Combine ADX trend and Hurst persistence
-                raw_regime = (features['is_trending'] + features['is_persistent']) / 2
-                # Smooth the regime indicator
-                features['market_regime'] = raw_regime.rolling(self.regime_smoothing).mean().fillna(0.5)
-        except Exception as e:
-            logger.warning(f"Error calculating market regime: {e}")
-        
-        # =================== TREND INDICATORS ===================
-        
-        # Moving averages
-        for window in [5, 10, 20, 50, 100]:
+            # RSI
             try:
-                features[f'ma_{window}'] = close.rolling(window=window).mean()
+                rsi = RSIIndicator(close=close)
+                features['rsi'] = safe_indicator(rsi.rsi)
             except Exception as e:
-                logger.debug(f"Error calculating MA{window}: {str(e)}")
-        
-        # EMA indicators        
-        try:
-            ema_short = EMAIndicator(close=close, window=12)
-            ema_medium = EMAIndicator(close=close, window=26)
-            ema_long = EMAIndicator(close=close, window=50)
+                logger.debug(f"Error calculating RSI: {str(e)}")
             
-            features['ema_short'] = safe_indicator(ema_short.ema_indicator)
-            features['ema_medium'] = safe_indicator(ema_medium.ema_indicator)
-            features['ema_long'] = safe_indicator(ema_long.ema_indicator)
-        except Exception as e:
-            logger.debug(f"Error calculating EMAs: {str(e)}")
+            # Other momentum indicators
+            if has_ohlc:
+                try:
+                    roc = ROCIndicator(close=close, window=10)
+                    features['roc'] = safe_indicator(roc.roc)
+                    
+                    williams = WilliamsRIndicator(high=data['high'], low=data['low'], close=close)
+                    features['willr'] = safe_indicator(williams.williams_r)
+                    
+                    stoch = StochasticOscillator(high=data['high'], low=data['low'], close=close)
+                    features['stoch_k'] = safe_indicator(stoch.stoch)
+                    features['stoch_d'] = safe_indicator(stoch.stoch_signal)
+                except Exception as e:
+                    logger.debug(f"Error calculating momentum indicators: {str(e)}")
             
-        # MACD
-        try:
-            macd = MACD(close=close)
-            features['macd'] = safe_indicator(macd.macd)
-            features['macd_signal'] = safe_indicator(macd.macd_signal)
-        except Exception as e:
-            logger.debug(f"Error calculating MACD: {str(e)}")
+            # =================== VOLATILITY INDICATORS ===================
             
-        # =================== OSCILLATORS ===================
-        
-        # Relative strength index
-        try:
-            rsi = RSIIndicator(close=close)
-            features['rsi'] = safe_indicator(rsi.rsi)
-        except Exception as e:
-            logger.debug(f"Error calculating RSI: {str(e)}")
-            
-        # Other momentum indicators
-        if has_ohlc:
+            # Bollinger Bands
             try:
-                roc = ROCIndicator(close=close, window=10)
-                features['roc'] = safe_indicator(roc.roc)
-                
-                williams = WilliamsRIndicator(high=data['high'], low=data['low'], close=close)
-                features['willr'] = safe_indicator(williams.williams_r)
-                
-                stoch = StochasticOscillator(high=data['high'], low=data['low'], close=close)
-                features['stoch_k'] = safe_indicator(stoch.stoch)
-                features['stoch_d'] = safe_indicator(stoch.stoch_signal)
+                bb = BollingerBands(close=close)
+                features['bbands_upper'] = safe_indicator(bb.bollinger_hband)
+                features['bbands_middle'] = safe_indicator(bb.bollinger_mavg)
+                features['bbands_lower'] = safe_indicator(bb.bollinger_lband)
             except Exception as e:
-                logger.debug(f"Error calculating momentum indicators: {str(e)}")
-        
-        # =================== VOLATILITY INDICATORS ===================
-        
-        # Bollinger Bands
-        try:
-            bb = BollingerBands(close=close)
-            features['bbands_upper'] = safe_indicator(bb.bollinger_hband)
-            features['bbands_middle'] = safe_indicator(bb.bollinger_mavg)
-            features['bbands_lower'] = safe_indicator(bb.bollinger_lband)
-        except Exception as e:
-            logger.debug(f"Error calculating Bollinger Bands: {str(e)}")
+                logger.debug(f"Error calculating Bollinger Bands: {str(e)}")
             
-        # ATR
-        if has_ohlc:
+            # ATR
+            if has_ohlc:
+                try:
+                    atr = AverageTrueRange(high=data['high'], low=data['low'], close=close)
+                    features['atr'] = safe_indicator(atr.average_true_range)
+                except Exception as e:
+                    logger.debug(f"Error calculating ATR: {str(e)}")
+            
+            # =================== DERIVED FEATURES ===================
+            
+            # Volatility calculation
             try:
-                atr = AverageTrueRange(high=data['high'], low=data['low'], close=close)
-                features['atr'] = safe_indicator(atr.average_true_range)
+                # Calculate returns
+                returns = close.pct_change().fillna(0)
+                # Calculate rolling volatility
+                for window in [5, 10, 20]:
+                    features[f'volatility_{window}d'] = returns.rolling(window=window).std().fillna(0) * np.sqrt(252)
             except Exception as e:
-                logger.debug(f"Error calculating ATR: {str(e)}")
-        
-        # =================== VOLUME INDICATORS ===================
-        
-        if has_volume and has_ohlc:
+                logger.debug(f"Error calculating volatility features: {str(e)}")
+            
+            # Calculate returns
             try:
-                # OBV
-                obv = OnBalanceVolumeIndicator(close=close, volume=data['volume'])
-                features['obv'] = safe_indicator(obv.on_balance_volume)
-                
-                # A/D Line
-                adi = AccDistIndexIndicator(high=data['high'], low=data['low'], close=close, volume=data['volume'])
-                features['ad'] = safe_indicator(adi.acc_dist_index)
-                
-                # Chaikin Money Flow
-                cmf = ChaikinMoneyFlowIndicator(high=data['high'], low=data['low'], close=close, volume=data['volume'])
-                features['cmf'] = safe_indicator(cmf.chaikin_money_flow)
+                # Calculate price changes
+                for period in [1, 5, 10]:
+                    features[f'returns_{period}d'] = close.pct_change(periods=period).fillna(0)
             except Exception as e:
-                logger.debug(f"Error calculating volume indicators: {str(e)}")
-        
-        return features
+                logger.debug(f"Error calculating returns features: {str(e)}")
+            
+            # Final check for NaN values in all features
+            for key, value in features.items():
+                if isinstance(value, pd.Series) and value.isna().any():
+                    features[key] = value.fillna(0)
+            
+            return features
+        except Exception as e:
+            logger.error(f"Error in _calculate_indicators: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return at least the raw price data
+            return {'close': data.get('close', pd.Series())}
         
     def _add_vol_surface_features(self, df: pd.DataFrame) -> Dict:
         """Advanced volatility modeling and regime detection"""
@@ -480,7 +476,7 @@ class DerivativesFeatureEngine:
                 volume = df['volume']
                 result['vol_ma'] = volume.rolling(5).mean()
                 # Replace deprecated fillna(method='pad') with ffill()
-                result['vol_ratio'] = (volume / volume.rolling(10).mean()).replace([np.inf, -np.inf], np.nan).ffill()
+                result['vol_ratio'] = (volume / volume.rolling(10).mean()).replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
                 
                 # Volume trend
                 result['vol_trend'] = volume.diff(5)
@@ -495,7 +491,7 @@ class DerivativesFeatureEngine:
                 result['ob_imbalance'] = (bid_depth - ask_depth) / total_depth.replace(0, np.nan)
                 
                 # Fill missing values
-                result['ob_imbalance'] = result['ob_imbalance'].ffill().bfill()
+                result['ob_imbalance'] = result['ob_imbalance'].ffill().fillna(0)
                 
                 # Smoothed imbalance
                 result['ob_imbalance_ma'] = result['ob_imbalance'].rolling(5).mean()
@@ -554,15 +550,21 @@ class DerivativesFeatureEngine:
             for asset in full_df.columns.get_level_values('asset').unique():
                 try:
                     # Get close prices properly handling MultiIndex
-                    close_prices = full_df.loc[:, (asset, 'close')]
-                    if isinstance(close_prices, pd.DataFrame):
-                        close_prices = close_prices.iloc[:, 0]
+                    try:
+                        close_prices = full_df.loc[:, (asset, 'close')]
+                        if isinstance(close_prices, pd.DataFrame):
+                            close_prices = close_prices.iloc[:, 0]
+                    except Exception as e:
+                        logger.warning(f"Error accessing close prices for {asset} in intermarket correlation: {str(e)}")
+                        continue
                     
                     # Handle zeros and missing values before log
                     close_prices = pd.to_numeric(close_prices, errors='coerce')
-                    close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan)
-                    close_prices = close_prices.ffill().bfill()
-                    close_prices = close_prices.clip(lower=1e-8)
+                    # Check for NaN/inf on values, not on MultiIndex
+                    if pd.isna(close_prices.values).any() or np.isinf(close_prices.values).any():
+                        close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan)
+                        close_prices = close_prices.ffill().bfill()
+                        close_prices = close_prices.clip(lower=1e-8)
                     
                     # Calculate returns safely
                     returns = np.log(close_prices / close_prices.shift(1)).fillna(0)
@@ -570,13 +572,19 @@ class DerivativesFeatureEngine:
                     returns_dict[asset] = returns
                     
                 except Exception as e:
-                    logger.warning(f"Could not calculate returns for {asset}: {str(e)}")
+                    logger.warning(f"Could not calculate returns for {asset} in intermarket correlation: {str(e)}")
                     continue
             
             if not returns_dict:
                 return {}
-                
+            
             returns_df = pd.DataFrame(returns_dict).fillna(0)
+            
+            # Ensure the current asset exists in the returns data
+            if current_asset not in returns_df.columns:
+                logger.warning(f"Current asset {current_asset} not found in returns data")
+                return {}
+            
             current_returns = returns_df[current_asset]
             
             # Calculate correlations safely
@@ -598,6 +606,7 @@ class DerivativesFeatureEngine:
             
         except Exception as e:
             logger.error(f"Error in intermarket correlations for {current_asset}: {str(e)}")
+            logger.error(traceback.format_exc())
             return {}
         
     def _add_cross_sectional_features(self, full_df: pd.DataFrame, current_asset: str) -> Dict:
@@ -610,21 +619,30 @@ class DerivativesFeatureEngine:
             for asset in full_df.columns.get_level_values('asset').unique():
                 try:
                     # Get close prices properly handling MultiIndex
-                    close_prices = full_df.loc[:, (asset, 'close')]
-                    if isinstance(close_prices, pd.DataFrame):
-                        close_prices = close_prices.iloc[:, 0]
+                    try:
+                        close_prices = full_df.loc[:, (asset, 'close')]
+                        if isinstance(close_prices, pd.DataFrame):
+                            close_prices = close_prices.iloc[:, 0]
+                    except Exception as e:
+                        logger.warning(f"Error accessing close prices for {asset}: {str(e)}")
+                        continue
                     
                     # Handle zeros and missing values before log
                     close_prices = pd.to_numeric(close_prices, errors='coerce')
-                    close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan)
-                    close_prices = close_prices.ffill().bfill()
-                    close_prices = close_prices.clip(lower=1e-8)
+                    # Use pandas method to check for NaN or infinity, not directly on MultiIndex
+                    mask = pd.isna(close_prices.values) | np.isinf(close_prices.values)
+                    if mask.any():
+                        close_prices = close_prices.replace([0, np.inf, -np.inf], np.nan)
+                        close_prices = close_prices.ffill().bfill()
+                        close_prices = close_prices.clip(lower=1e-8)
                     
                     # Calculate returns safely
                     returns = pd.Series(
                         np.log(close_prices / close_prices.shift(1)),
                         index=close_prices.index
-                    ).replace([np.inf, -np.inf], np.nan).fillna(0)
+                    )
+                    # Replace inf with NaN then fill NaN with 0
+                    returns = returns.replace([np.inf, -np.inf], np.nan).fillna(0)
                     
                     returns_dict[asset] = returns
                     
@@ -645,19 +663,28 @@ class DerivativesFeatureEngine:
                 try:
                     # Modify before PCA application:
                     # Add volatility-normalized features
-                    volatility = full_df.groupby(level='asset').std().rolling(100).std()
-                    normalized_df = full_df.groupby(level='asset').apply(
-                        lambda x: x / volatility.loc[x.name].replace(0, 1e-6)
-                    )
-
-                    # Then apply PCA to normalized features
-                    pca = PCA(n_components=n_components)
-                    pca.fit(normalized_df)
+                    volatility = returns_df.rolling(100).std().ffill().fillna(0.01)
+                    # Avoid division by zero
+                    volatility = volatility.replace(0, 0.01)
                     
-                    # Factor loadings
-                    loadings = pca.components_[:, list(returns_dict.keys()).index(current_asset)]
-                    for i, loading in enumerate(loadings):
-                        features[f'factor_{i+1}_loading'] = pd.Series(loading, index=returns_df.index)
+                    # Create normalized returns for PCA
+                    normalized_returns = returns_df.div(volatility)
+                    
+                    # Apply PCA safely
+                    if len(normalized_returns) > n_components + 10:  # Ensure enough data
+                        pca = PCA(n_components=n_components)
+                        pca.fit(normalized_returns.fillna(0))
+                        
+                        # Factor loadings
+                        if current_asset in normalized_returns.columns:
+                            idx = list(normalized_returns.columns).index(current_asset)
+                            loadings = pca.components_[:, idx]
+                            for i, loading in enumerate(loadings):
+                                features[f'factor_{i+1}_loading'] = pd.Series(loading, index=returns_df.index)
+                    else:
+                        # Not enough data for PCA
+                        for i in range(n_components):
+                            features[f'factor_{i+1}_loading'] = pd.Series(0, index=returns_df.index)
                 except Exception as e:
                     logger.warning(f"Error in PCA calculation: {str(e)}")
                     # Fill with zeros if PCA fails
@@ -667,13 +694,16 @@ class DerivativesFeatureEngine:
             # Cross-sectional momentum
             try:
                 # Calculate rolling means for each asset
-                rolling_means = returns_df.rolling(5).mean()
+                rolling_means = returns_df.rolling(5).mean().fillna(0)
                 
                 # Rank assets at each timestamp
                 ranks = rolling_means.rank(axis=1)
                 
                 # Get the rank for the current asset
-                features['xs_momentum'] = ranks[current_asset]
+                if current_asset in ranks.columns:
+                    features['xs_momentum'] = ranks[current_asset]
+                else:
+                    features['xs_momentum'] = pd.Series(0, index=returns_df.index)
                 
             except Exception as e:
                 logger.warning(f"Error calculating cross-sectional momentum: {str(e)}")
@@ -683,6 +713,7 @@ class DerivativesFeatureEngine:
             
         except Exception as e:
             logger.error(f"Error in cross-sectional features: {str(e)}")
+            logger.error(traceback.format_exc())
             return {}
         
     def _detect_regime(self, returns: pd.Series) -> pd.Series:
@@ -801,15 +832,22 @@ class DerivativesFeatureEngine:
                                 else:
                                     # Convert numpy array to series with common index
                                     value = pd.Series(value, index=common_index[:len(value)])
-                                asset_df[feat_name] = pd.to_numeric(value, errors='coerce')
+                                # Use pd.to_numeric to convert, and handle any errors gracefully
+                                try:
+                                    asset_df[feat_name] = pd.to_numeric(value, errors='coerce')
+                                except Exception as e:
+                                    logger.warning(f"Error converting {feat_name} to numeric: {str(e)}")
+                                    asset_df[feat_name] = 0.0
                         else:
                             # If feature doesn't exist for this asset, fill with 0
                             asset_df[feat_name] = 0.0
                             logger.debug(f"Adding missing feature {feat_name} for {asset}")
                     
                     if len(asset_df) > 0:
-                        # Handle missing values properly
-                        asset_df = self._handle_missing_values(asset_df)
+                        # Check for NaN values directly on the values array, not the columns
+                        if pd.isna(asset_df.values).any():
+                            logger.debug(f"Asset {asset} has NaN values, filling them")
+                            asset_df = self._handle_missing_values(asset_df)
                         
                         # Keep all features by default
                         if self.selected_features is None:
@@ -829,10 +867,14 @@ class DerivativesFeatureEngine:
                     
                 except Exception as e:
                     logger.error(f"Error combining features for {asset}: {str(e)}")
+                    logger.error(traceback.format_exc())
                     continue
             
             # Sort columns for consistency
-            combined = combined.sort_index(axis=1)
+            try:
+                combined = combined.sort_index(axis=1)
+            except Exception as e:
+                logger.warning(f"Error sorting columns: {str(e)}")
             
             # Final verification
             logger.info(f"Combined features shape: {combined.shape}")
@@ -843,6 +885,7 @@ class DerivativesFeatureEngine:
             
         except Exception as e:
             logger.error(f"Error in combine_features: {str(e)}")
+            logger.error(traceback.format_exc())
             return pd.DataFrame()
 
     def engineer_features(self, data_dict):
@@ -866,12 +909,19 @@ class DerivativesFeatureEngine:
                         df.columns = pd.MultiIndex.from_product([[exchange], df.columns], names=['asset', 'feature'])
                     else:
                         # Ensure the multi-index has proper names
+                        # Don't try to check isna on the MultiIndex
                         df.columns.names = ['asset', 'feature']
                     
-                    # Process features
-                    processed = self.transform(df)
-                    if isinstance(processed, pd.DataFrame) and not processed.empty:
-                        processed_data[exchange] = processed
+                    # Process features with error handling
+                    try:
+                        processed = self.transform(df)
+                        if isinstance(processed, pd.DataFrame) and not processed.empty:
+                            processed_data[exchange] = processed
+                        else:
+                            logger.warning(f"Transform returned empty DataFrame for {exchange}")
+                    except Exception as e:
+                        logger.error(f"Error transforming data for {exchange}: {str(e)}")
+                        logger.error(traceback.format_exc())
                 
                 # Case B: exchange_data is a nested dictionary (symbol -> dataframe)
                 elif isinstance(exchange_data, dict):
@@ -887,38 +937,56 @@ class DerivativesFeatureEngine:
                             continue
                             
                         # Create multi-level columns for the symbol with proper names
-                        symbol_data.columns = pd.MultiIndex.from_product([[symbol], symbol_data.columns], names=['asset', 'feature'])
-                        symbol_dfs.append(symbol_data)
+                        try:
+                            symbol_data.columns = pd.MultiIndex.from_product([[symbol], symbol_data.columns], names=['asset', 'feature'])
+                            symbol_dfs.append(symbol_data)
+                        except Exception as e:
+                            logger.error(f"Error creating MultiIndex for {symbol}: {str(e)}")
+                            continue
                     
                     if not symbol_dfs:
                         logger.warning(f"No valid DataFrames for exchange {exchange}, skipping")
                         continue
                         
                     # Combine all symbols into one DataFrame for this exchange
-                    combined_df = pd.concat(symbol_dfs, axis=1)
-                    
-                    # Process features
-                    processed = self.transform(combined_df)
-                    if isinstance(processed, pd.DataFrame) and not processed.empty:
-                        processed_data[exchange] = processed
+                    try:
+                        combined_df = pd.concat(symbol_dfs, axis=1)
+                        
+                        # Process features with error handling
+                        processed = self.transform(combined_df)
+                        if isinstance(processed, pd.DataFrame) and not processed.empty:
+                            processed_data[exchange] = processed
+                        else:
+                            logger.warning(f"Transform returned empty DataFrame for {exchange} combined data")
+                    except Exception as e:
+                        logger.error(f"Error processing combined data for {exchange}: {str(e)}")
+                        logger.error(traceback.format_exc())
                 else:
                     logger.warning(f"Data for {exchange} is not a DataFrame or dict (type: {type(exchange_data)}), skipping")
                     continue
                 
             if not processed_data:
-                raise ValueError("No data processed successfully")
+                logger.warning("No data processed successfully, returning empty DataFrame")
+                return pd.DataFrame()
             
             # Combine all exchanges
-            combined = pd.concat(processed_data.values(), axis=1)
-            
-            # Final validation
-            if combined.empty:
-                raise ValueError("Combined DataFrame is empty")
-            
-            return combined
+            try:
+                combined = pd.concat(processed_data.values(), axis=1)
+                
+                # Final validation
+                if combined.empty:
+                    logger.warning("Combined DataFrame is empty")
+                    return pd.DataFrame()
+                
+                return combined
+            except Exception as e:
+                logger.error(f"Error combining processed data: {str(e)}")
+                logger.error(traceback.format_exc())
+                return pd.DataFrame()
             
         except Exception as e:
             logger.error(f"Error in engineer_features: {str(e)}")
+            logger.error(traceback.format_exc())
             return pd.DataFrame()
 
     def _calculate_rolling_hurst(self, series, window):
@@ -937,8 +1005,8 @@ class DerivativesFeatureEngine:
             time_series = series.iloc[start_idx:i].values
             result.iloc[i] = self._hurst_exponent(time_series)
             
-        # Forward fill initial NaN values
-        result = result.ffill()
+        # Forward fill initial NaN values - replace deprecated fillna(method='ffill')
+        result = result.ffill().fillna(0)
         return result
         
     def _hurst_exponent(self, time_series, max_lag=20):
