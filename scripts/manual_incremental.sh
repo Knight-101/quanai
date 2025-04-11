@@ -304,6 +304,15 @@ continue_training() {
     fi
     echo "Saving new model to: $NEW_PHASE_DIR"
     
+    # Check if recommendations file exists
+    RECOMMENDATION_FILE="$PREV_PHASE_DIR/phase${new_phase}_recommendations.json"
+    if [ -f "$RECOMMENDATION_FILE" ]; then
+        echo "Found recommendations file: $RECOMMENDATION_FILE"
+        cat "$RECOMMENDATION_FILE"
+    else
+        echo "No recommendations file found at $RECOMMENDATION_FILE"
+    fi
+    
     # Build the base command
     if [ -n "$PREV_ENV_PATH" ]; then
         COMMAND="python main_opt.py --continue-training --model-path \"$PREV_MODEL_PATH\" --env-path \"$PREV_ENV_PATH\" --additional-steps $steps --model-dir \"$NEW_PHASE_DIR\""
@@ -329,6 +338,7 @@ continue_training() {
     # Add use-recommendations flag if requested
     if [ "$USE_RECOMMENDATIONS" = true ]; then
         COMMAND="$COMMAND --use-recommendations"
+        echo "Enabling use of recommendations from previous phase"
     fi
     
     # Add Google Drive integration if specified

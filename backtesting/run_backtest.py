@@ -24,6 +24,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 # Import the backtester
 from backtesting.institutional_backtester import run_institutional_backtest
+from data_system.feature_engine import DerivativesFeatureEngine
+from data_system.data_manager import DataManager
+from data_system.drive_adapter import DriveAdapter
 
 
 def parse_args():
@@ -70,6 +73,14 @@ def parse_args():
                         help="Window size for walk-forward validation in days (default: 60)")
     parser.add_argument("--walk-forward-step", type=int, default=30,
                         help="Step size for walk-forward validation in days (default: 30)")
+    parser.add_argument("--use-gdrive", action="store_true",
+                        help="Enable Google Drive support for data loading")
+    parser.add_argument("--drive-ids-file", type=str, default="drive_file_ids.json",
+                        help="Path to the Google Drive file IDs JSON (default: drive_file_ids.json)")
+    parser.add_argument("--generate-features", action="store_true",
+                        help="Generate features even if data already has features")
+    parser.add_argument("--feature-config", type=str, default=None,
+                        help="JSON string with feature generation configuration")
     
     return parser.parse_args()
 
@@ -97,6 +108,129 @@ def find_latest_data_file(data_dir: str) -> str:
     return latest_file
 
 
+def load_and_prepare_data(
+    data_path: str, 
+    assets: List[str] = None, 
+    start_date: str = None, 
+    end_date: str = None,
+    generate_features: bool = False,
+    feature_config: Dict = None
+) -> pd.DataFrame:
+    """
+    Load and prepare data for backtesting, ensuring it has proper format and features.
+    
+    Args:
+        data_path: Path to the data file
+        assets: List of assets to include
+        start_date: Start date for filtering
+        end_date: End date for filtering
+        generate_features: Whether to generate features even if data has them
+        feature_config: Configuration for feature generation
+        
+    Returns:
+        Prepared DataFrame with proper MultiIndex columns
+    """
+    logger.info(f"Loading data from: {data_path}")
+    
+    # Load data based on file extension
+    file_ext = os.path.splitext(data_path)[1].lower()
+    try:
+        if file_ext == '.parquet':
+            data = pd.read_parquet(data_path)
+        elif file_ext == '.csv':
+            data = pd.read_csv(data_path, parse_dates=True, index_col=0)
+        elif file_ext in ['.pkl', '.pickle']:
+            with open(data_path, 'rb') as f:
+                import pickle
+                data = pickle.load(f)
+        else:
+            raise ValueError(f"Unsupported file extension: {file_ext}")
+    except Exception as e:
+        logger.error(f"Error loading data: {str(e)}")
+        raise
+    
+    # Apply date filters if provided
+    if start_date or end_date:
+        logger.info(f"Filtering data from {start_date} to {end_date}")
+        if isinstance(data.index, pd.DatetimeIndex):
+            mask = pd.Series(True, index=data.index)
+            if start_date:
+                mask = mask & (data.index >= pd.Timestamp(start_date))
+            if end_date:
+                mask = mask & (data.index <= pd.Timestamp(end_date))
+            data = data.loc[mask]
+        else:
+            logger.warning("Data index is not DatetimeIndex, cannot filter by date")
+    
+    # Check if data has proper format
+    needs_feature_extraction = False
+    
+    # If it's not a MultiIndex, we need to create features
+    if not isinstance(data.columns, pd.MultiIndex):
+        logger.info("Data doesn't have MultiIndex columns, will perform feature extraction")
+        needs_feature_extraction = True
+    elif generate_features:
+        logger.info("Forcing feature generation even though data has MultiIndex columns")
+        needs_feature_extraction = True
+    else:
+        # Check if we have the required technical features
+        tech_features = [
+            'rsi', 'volatility', 'macd', 'returns_1d', 'returns_5d', 'returns_10d'
+        ]
+        # Check for at least some of these features
+        if not any(feat in data.columns.get_level_values(1) for feat in tech_features):
+            logger.info("Data has MultiIndex but lacks technical features, performing feature extraction")
+            needs_feature_extraction = True
+        
+    # Extract or filter assets if provided
+    if assets:
+        logger.info(f"Filtering for assets: {assets}")
+        
+        if isinstance(data.columns, pd.MultiIndex):
+            # For MultiIndex, we need to filter level 0
+            available_assets = data.columns.get_level_values(0).unique()
+            valid_assets = [a for a in assets if a in available_assets]
+            
+            if not valid_assets:
+                raise ValueError(f"None of the requested assets {assets} found in data. Available: {available_assets}")
+            
+            # Create subset with requested assets
+            data = data.loc[:, data.columns.get_level_values(0).isin(valid_assets)]
+        else:
+            # If not MultiIndex, just warn - we'll create proper structure below
+            logger.warning(f"Cannot filter non-MultiIndex data for assets {assets} before feature extraction")
+    elif isinstance(data.columns, pd.MultiIndex):
+        # If assets not specified, use all available in the data
+        assets = list(data.columns.get_level_values(0).unique())
+        logger.info(f"Using all assets from data: {assets}")
+    
+    # Perform feature extraction if needed
+    if needs_feature_extraction:
+        logger.info("Generating technical features from raw data")
+        
+        # Create feature engine
+        engine = DerivativesFeatureEngine()
+        
+        # Default feature config
+        default_config = {
+            "use_momentum": True,
+            "use_volatility": True,
+            "use_volume": True,
+            "use_advanced": True,
+            "window_sizes": [14, 20, 50]
+        }
+        
+        # Use provided config or default
+        config = feature_config or default_config
+        logger.info(f"Using feature config: {config}")
+        
+        # Generate features
+        data = engine.calculate_features(data, assets=assets, **config)
+    
+    logger.info(f"Final data shape: {data.shape}")
+    return data
+
+
 def main():
     """Main entry point"""
     args = parse_args()
@@ -114,17 +248,54 @@ def main():
         return 1
         
     if data_path and not os.path.exists(data_path):
-        logger.error(f"Data file not found: {data_path}")
-        return 1
+        # Try Google Drive if enabled
+        if args.use_gdrive and os.path.exists(args.drive_ids_file):
+            logger.info(f"Data file not found locally, will try Google Drive: {data_path}")
+            
+            # Initialize Drive adapter
+            drive_adapter = DriveAdapter(drive_ids_file=args.drive_ids_file)
+            
+            # Try to download the file
+            if not drive_adapter._download_from_drive(data_path):
+                logger.error(f"Data file could not be downloaded from Google Drive: {data_path}")
+                return 1
+        else:
+            logger.error(f"Data file not found: {data_path}")
+            return 1
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Parse feature config if provided
+    feature_config = None
+    if args.feature_config:
+        try:
+            feature_config = json.loads(args.feature_config)
+        except json.JSONDecodeError:
+            logger.error(f"Invalid feature config JSON: {args.feature_config}")
+            return 1
+    
+    # Load and prepare data
+    try:
+        data = load_and_prepare_data(
+            data_path=data_path,
+            assets=args.assets,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            generate_features=args.generate_features,
+            feature_config=feature_config
+        )
+    except Exception as e:
+        logger.error(f"Error preparing data: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return 1
     
     # Save run configuration
     config = {
         "model_path": args.model_path,
         "data_path": data_path,
-        "assets": args.assets,
+        "assets": args.assets if args.assets else list(data.columns.get_level_values(0).unique()),
         "initial_capital": args.initial_capital,
         "start_date": args.start_date,
         "end_date": args.end_date,
@@ -136,7 +307,8 @@ def main():
         "regime_analysis": not args.no_regime_analysis,
         "walk_forward": args.walk_forward,
         "walk_forward_window": args.walk_forward_window,
-        "walk_forward_step": args.walk_forward_step
+        "walk_forward_step": args.walk_forward_step,
+        "data_shape": data.shape
     }
     
     config_path = os.path.join(args.output_dir, "backtest_config.json")
@@ -146,14 +318,12 @@ def main():
     logger.info(f"Starting backtest with configuration saved to {config_path}")
     
     try:
-        # Run the backtest
+        # Run the backtest with data
         results = run_institutional_backtest(
             model_path=args.model_path,
-            data_path=data_path,
+            data_df=data,  # Pass DataFrame directly
             assets=args.assets,
             initial_capital=args.initial_capital,
-            start_date=args.start_date,
-            end_date=args.end_date,
             output_dir=args.output_dir,
             regime_analysis=not args.no_regime_analysis,
             walk_forward=args.walk_forward

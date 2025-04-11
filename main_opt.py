@@ -1844,7 +1844,7 @@ class TradingSystem:
         eval_callback = VecNormalizeEvalCallback(
             eval_env=self.env,
             n_eval_episodes=3,  # Reduced from 5 for better performance
-            eval_freq=20000, 
+            eval_freq=25000, 
             log_path=self.config['logging']['log_dir'],
             best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], "best"),
             deterministic=True,
@@ -1943,35 +1943,42 @@ class TradingSystem:
         
         # Detect current phase and determine next phase
         current_phase = 1
-        if args and hasattr(args, 'model_dir'):
+        
+        # First try to extract phase from model_path (this is more reliable for the source phase)
+        match = re.search(r'phase(\d+)', model_path)
+        if match:
+            current_phase = int(match.group(1))
+            logger.info(f"Detected current phase {current_phase} from model path")
+        # Only if not found in model_path, try from model_dir
+        elif args and hasattr(args, 'model_dir'):
             # Try to extract phase number from model directory
             match = re.search(r'phase(\d+)', args.model_dir)
             if match:
-                current_phase = int(match.group(1))
-                logger.info(f"Detected current phase {current_phase} from model directory")
-        else:
-            # Extract from model path if model_dir not provided
-            match = re.search(r'phase(\d+)', model_path)
-            if match:
-                current_phase = int(match.group(1))
-                logger.info(f"Detected current phase {current_phase} from model path")
+                # If extracting from model_dir, we don't increment - this is already the target phase
+                current_phase = int(match.group(1)) - 1
+                next_phase = int(match.group(1))
+                logger.info(f"Using target phase {next_phase} from model directory")
+                logger.info(f"Setting current phase to {current_phase}")
         
-        next_phase = current_phase + 1
+        # Only calculate next_phase if not already set above
+        if not locals().get('next_phase'):
+            next_phase = current_phase + 1
         
-        # Define phase-specific timesteps if not explicitly provided
+        # Define phase-specific timesteps
+        steps_per_phase = {
+            1: 500000,    # Phase 1: 0-500K
+            2: 500000,    # Phase 2: 500K-1M
+            3: 1000000,   # Phase 3: 1M-2M
+            4: 1000000,   # Phase 4: 2M-3M
+            5: 1000000,   # Phase 5: 3M-4M
+            6: 1000000,   # Phase 6: 4M-5M
+            7: 2000000,   # Phase 7: 5M-7M
+            8: 2000000,   # Phase 8: 7M-9M
+            9: 1000000    # Phase 9: 9M-10M
+        }
+        
+        # Set additional_timesteps if not explicitly provided
         if additional_timesteps is None:
-            # Phase-based step schedule for 10M total steps
-            steps_per_phase = {
-                1: 500000,    # Phase 1: 0-500K
-                2: 500000,    # Phase 2: 500K-1M
-                3: 1000000,   # Phase 3: 1M-2M
-                4: 1000000,   # Phase 4: 2M-3M
-                5: 1000000,   # Phase 5: 3M-4M
-                6: 1000000,   # Phase 6: 4M-5M
-                7: 2000000,   # Phase 7: 5M-7M
-                8: 2000000,   # Phase 8: 7M-9M
-                9: 1000000    # Phase 9: 9M-10M
-            }
             additional_timesteps = steps_per_phase.get(next_phase, 1000000)
             logger.info(f"Using phase-specific timesteps for Phase {next_phase}: {additional_timesteps}")
         
@@ -2004,7 +2011,7 @@ class TradingSystem:
         
         # Try to load recommended hyperparameters if phase is changing and no explicit hyperparams provided
         recommendations = {}
-        if use_recommendations and hyperparams is None and current_phase < 9:
+        if use_recommendations and (hyperparams is None or not hyperparams) and current_phase < 9:
             recommendation_file = os.path.join(os.path.dirname(model_path), f"phase{next_phase}_recommendations.json")
             if os.path.exists(recommendation_file):
                 try:
@@ -2047,7 +2054,17 @@ class TradingSystem:
             for param, value in hyperparams.items():
                 if hasattr(self.model, param):
                     old_value = getattr(self.model, param)
-                    setattr(self.model, param, value)
+                    
+                    # Special handling for parameters that should be callables
+                    if param in ['clip_range', 'clip_range_vf']:
+                        # Create a proper schedule function instead of replacing with float
+                        def make_schedule_func(val):
+                            return lambda _: val
+                        setattr(self.model, param, make_schedule_func(value))
+                    else:
+                        # Normal parameter update
+                        setattr(self.model, param, value)
+                        
                     logger.info(f"  - {param}: {old_value} -> {value}")
                     applied_params[param] = value
                 else:
@@ -2080,7 +2097,7 @@ class TradingSystem:
         eval_callback = VecNormalizeEvalCallback(
             eval_env=self.env,
             n_eval_episodes=3,  # Reduced from 5 for better performance
-            eval_freq=min(20000, additional_timesteps // 10),  # 10 evaluations per training run
+            eval_freq=min(25000, additional_timesteps // 10),  # 10 evaluations per training run
             log_path=self.config['logging']['log_dir'],
             best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], f"best_phase{next_phase}"),
             deterministic=True,

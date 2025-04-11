@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("BacktestRunner")
 
 # Import our custom data fetcher
-from data_fetcher_backtest import BacktestDataFetcher
+from data_fetcher_backtest import CustomBacktestDataFetcher
 
 # Import the institutional backtester
 from backtesting.institutional_backtester import run_institutional_backtest
@@ -35,10 +35,13 @@ async def run_backtest(
     output_dir: str = "results/backtest",
     exchange: str = "binance",
     regime_analysis: bool = True,
-    walk_forward: bool = False
+    walk_forward: bool = False,
+    use_existing_features: bool = True,
+    drive_ids_file: str = "drive_file_ids.json"
 ):
     """
-    Run a complete backtest with freshly fetched data.
+    Run a complete backtest with freshly fetched data or use existing data following
+    the same logic as in the training module.
     
     Args:
         model_path: Path to the trained model
@@ -52,21 +55,25 @@ async def run_backtest(
         exchange: Trading exchange to fetch from
         regime_analysis: Whether to perform market regime analysis
         walk_forward: Whether to perform walk-forward validation
+        use_existing_features: Whether to use existing feature data files
+        drive_ids_file: Path to the Google Drive file IDs JSON
     """
     try:
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
         
-        # Step 1: Fetch market data
-        logger.info(f"Fetching market data for {symbols} from {exchange}...")
+        # Step 1: Set up the data fetcher with compatibility for both local and Google Drive data
+        logger.info(f"Setting up data fetcher for {symbols} from {exchange}...")
         
-        data_fetcher = BacktestDataFetcher(
+        data_fetcher = CustomBacktestDataFetcher(
             symbols=symbols,
             timeframe=timeframe,
             start_date=start_date,
             end_date=end_date,
             lookback_days=lookback_days,
-            exchange=exchange
+            exchange=exchange,
+            data_dir="data",  # Use the same data directory as training
+            drive_ids_file=drive_ids_file
         )
         
         # Generate a descriptive filename for the data
@@ -80,7 +87,7 @@ async def run_backtest(
             logger.error("Failed to fetch market data")
             return
             
-        logger.info(f"Market data fetched and saved to {data_path}")
+        logger.info(f"Market data processed and saved to {data_path}")
         
         # Step 2: Run the backtest
         logger.info(f"Running institutional backtest with model {model_path}...")
@@ -128,7 +135,7 @@ async def run_backtest(
 
 async def main():
     """Parse command line arguments and run the backtest"""
-    parser = argparse.ArgumentParser(description="Run a complete backtest with freshly fetched data")
+    parser = argparse.ArgumentParser(description="Run a complete backtest with data fetching that matches training logic")
     
     parser.add_argument("--model-path", type=str, required=True,
                       help="Path to the trained model")
@@ -162,6 +169,12 @@ async def main():
                      
     parser.add_argument("--walk-forward", action="store_true",
                      help="Perform walk-forward validation")
+                     
+    parser.add_argument("--use-existing-features", action="store_true", default=True,
+                     help="Use existing feature data files if available (default: True)")
+                     
+    parser.add_argument("--drive-ids-file", type=str, default="drive_file_ids.json",
+                     help="Path to Google Drive file IDs JSON (default: drive_file_ids.json)")
     
     args = parser.parse_args()
     
@@ -177,7 +190,9 @@ async def main():
         output_dir=args.output_dir,
         exchange=args.exchange,
         regime_analysis=args.regime_analysis,
-        walk_forward=args.walk_forward
+        walk_forward=args.walk_forward,
+        use_existing_features=args.use_existing_features,
+        drive_ids_file=args.drive_ids_file
     )
 
 if __name__ == "__main__":

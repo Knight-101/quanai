@@ -1,114 +1,103 @@
 #!/usr/bin/env python3
 """
-Backtest With Fetched Data
+Run Complete Backtest
 
-This script demonstrates how to use the data fetcher to get fresh market data
-and then run a backtest using the institutional backtester.
+This script provides a simple interface to run a complete backtest
+with the same data loading/feature extraction logic as used in training,
+ensuring compatibility with trained models.
 """
 
+import argparse
+import asyncio
+import logging
 import os
 import sys
-import asyncio
-import argparse
-import logging
 from pathlib import Path
-from datetime import datetime
-
-# Add the project root directory to the Python path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BacktestRunner")
 
-# Import our custom data fetcher
-from backtesting.data_fetchers.data_fetcher_backtest import BacktestDataFetcher
+# Add the current directory to path
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-# Import the institutional backtester
+# Import our data fetcher and backtester
+from data_fetcher_backtest import CustomBacktestDataFetcher
 from backtesting.institutional_backtester import run_institutional_backtest
 
-async def run_backtest(
+async def run_complete_backtest(
     model_path: str,
     symbols: list = ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
     timeframe: str = "5m",
     start_date: str = None,
     end_date: str = None,
-    lookback_days: int = 365, # Default to 1 year
+    lookback_days: int = 365,
     initial_capital: float = 100000.0,
     output_dir: str = "results/backtest",
-    exchange: str = "binance",
+    drive_ids_file: str = "drive_file_ids.json",
     regime_analysis: bool = True,
     walk_forward: bool = False
 ):
     """
-    Run a complete backtest with freshly fetched data.
+    Run a complete backtest with the same data loading/feature logic as training.
     
     Args:
         model_path: Path to the trained model
-        symbols: List of trading symbols to fetch
-        timeframe: Data timeframe (e.g., '1m', '5m', '1h', '1d')
-        start_date: Start date in YYYY-MM-DD format
-        end_date: End date in YYYY-MM-DD format
-        lookback_days: Number of days to look back if start_date is not provided
+        symbols: List of trading symbols
+        timeframe: Data timeframe (e.g., '5m', '1h')
+        start_date: Start date for backtest (YYYY-MM-DD)
+        end_date: End date for backtest (YYYY-MM-DD)
+        lookback_days: Number of days to look back if start_date not provided
         initial_capital: Initial capital for backtesting
         output_dir: Directory for output files
-        exchange: Trading exchange to fetch from
+        drive_ids_file: Path to Google Drive file IDs JSON
         regime_analysis: Whether to perform market regime analysis
         walk_forward: Whether to perform walk-forward validation
     """
     try:
-        # Create output directory if it doesn't exist
+        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Step 1: Fetch market data
-        logger.info(f"Fetching market data for {symbols} from {exchange}...")
-        
-        data_fetcher = BacktestDataFetcher(
+        # Step 1: Fetch and process data
+        logger.info(f"Fetching data for backtest: {symbols}")
+        data_fetcher = CustomBacktestDataFetcher(
             symbols=symbols,
             timeframe=timeframe,
             start_date=start_date,
             end_date=end_date,
             lookback_days=lookback_days,
-            exchange=exchange
+            drive_ids_file=drive_ids_file
         )
         
-        # Generate a descriptive filename for the data
-        data_filename = f"market_data_for_backtest.parquet"
-        data_path = os.path.join(output_dir, data_filename)
-        
-        # Fetch and save the data
+        # Save data to output directory
+        data_path = os.path.join(output_dir, "backtest_data.parquet")
         market_data = await data_fetcher.run(data_path)
         
         if market_data is None or market_data.empty:
-            logger.error("Failed to fetch market data")
-            return
+            logger.error("Failed to fetch or process market data")
+            return None
             
-        logger.info(f"Market data fetched and saved to {data_path}")
+        logger.info(f"Data processed successfully with shape: {market_data.shape}")
         
-        # Step 2: Run the backtest
-        logger.info(f"Running institutional backtest with model {model_path}...")
+        # Step 2: Run backtest
+        logger.info(f"Running backtest with model: {model_path}")
         
-        # Extract asset names from the symbols
+        # Extract asset names for backtester
         assets = [data_fetcher.symbol_mappings.get(symbol, symbol) for symbol in symbols]
         
-        # Run the institutional backtest
-        backtest_results = run_institutional_backtest(
+        results = run_institutional_backtest(
             model_path=model_path,
-            data_path=data_path,  # Use the fetched data
+            data_df=market_data,  # Pass DataFrame directly
             assets=assets,
             initial_capital=initial_capital,
-            start_date=start_date,
-            end_date=end_date,
             output_dir=output_dir,
             regime_analysis=regime_analysis,
             walk_forward=walk_forward
         )
         
-        # Step 3: Display results summary
-        logger.info("Backtest completed!")
-        
-        if backtest_results and 'metrics' in backtest_results:
-            metrics = backtest_results['metrics']
+        # Display results
+        if results and 'metrics' in results:
+            metrics = results['metrics']
             
             print("\n====== BACKTEST RESULTS SUMMARY ======")
             print(f"Total Return: {metrics.get('total_return', 0):.2%}")
@@ -119,19 +108,20 @@ async def run_backtest(
             print(f"Total Trades: {metrics.get('total_trades', 0)}")
             print("=======================================")
             
-            print(f"\nDetailed results saved to: {output_dir}")
-        
-        return backtest_results
+            # Show results path
+            print(f"\nDetailed backtest results saved to: {output_dir}")
+            
+        return results
         
     except Exception as e:
-        logger.error(f"Error running backtest: {str(e)}")
+        logger.error(f"Error in backtest process: {str(e)}")
         import traceback
         traceback.print_exc()
         return None
 
-async def main():
-    """Parse command line arguments and run the backtest"""
-    parser = argparse.ArgumentParser(description="Run a complete backtest with freshly fetched data")
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Run complete backtest with training-compatible data processing")
     
     parser.add_argument("--model-path", type=str, required=True,
                       help="Path to the trained model")
@@ -157,19 +147,22 @@ async def main():
     parser.add_argument("--output-dir", type=str, default="results/backtest",
                      help="Directory for output files (default: results/backtest)")
                      
-    parser.add_argument("--exchange", type=str, default="binance",
-                     help="Exchange to fetch from (default: binance)")
+    parser.add_argument("--drive-ids-file", type=str, default="drive_file_ids.json",
+                     help="Path to Google Drive file IDs JSON (default: drive_file_ids.json)")
                      
     parser.add_argument("--regime-analysis", action="store_true", default=True,
                      help="Perform market regime analysis (default: True)")
                      
     parser.add_argument("--walk-forward", action="store_true",
                      help="Perform walk-forward validation")
+                     
+    return parser.parse_args()
+
+async def main():
+    """Main entry point"""
+    args = parse_args()
     
-    args = parser.parse_args()
-    
-    # Run the backtest
-    await run_backtest(
+    await run_complete_backtest(
         model_path=args.model_path,
         symbols=args.symbols,
         timeframe=args.timeframe,
@@ -178,11 +171,10 @@ async def main():
         lookback_days=args.lookback_days,
         initial_capital=args.initial_capital,
         output_dir=args.output_dir,
-        exchange=args.exchange,
+        drive_ids_file=args.drive_ids_file,
         regime_analysis=args.regime_analysis,
         walk_forward=args.walk_forward
     )
 
 if __name__ == "__main__":
-    # Run the main function
     asyncio.run(main()) 
