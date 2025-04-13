@@ -1832,13 +1832,13 @@ class TradingSystem:
         # Setup callbacks for checkpointing and evaluation
         callbacks = []
         
-        # Checkpoint callback - save every 100k steps
-        checkpoint_callback = CheckpointCallback(
-            save_freq=10000,
-            save_path=self.config['model']['checkpoint_dir'],
-            name_prefix="ppo_trading"
-        )
-        callbacks.append(checkpoint_callback)
+        # # Checkpoint callback - save every 100k steps
+        # checkpoint_callback = CheckpointCallback(
+        #     save_freq=10000,
+        #     save_path=self.config['model']['checkpoint_dir'],
+        #     name_prefix="ppo_trading"
+        # )
+        # callbacks.append(checkpoint_callback)
 
         # Replace EvalCallback with our custom VecNormalizeEvalCallback
         eval_callback = VecNormalizeEvalCallback(
@@ -2085,13 +2085,13 @@ class TradingSystem:
         # Setup callbacks
         callbacks = []
         
-        # Checkpoint callback
-        checkpoint_callback = CheckpointCallback(
-            save_freq=max(100000, additional_timesteps // 10),  # 10 checkpoints per training run
-            save_path=self.config['model']['checkpoint_dir'],
-            name_prefix=f"ppo_trading_phase{next_phase}"
-        )
-        callbacks.append(checkpoint_callback)
+        # # Checkpoint callback
+        # checkpoint_callback = CheckpointCallback(
+        #     save_freq=max(100000, additional_timesteps // 10),  # 10 checkpoints per training run
+        #     save_path=self.config['model']['checkpoint_dir'],
+        #     name_prefix=f"ppo_trading_phase{next_phase}"
+        # )
+        # callbacks.append(checkpoint_callback)
         
         # Use our custom VecNormalizeEvalCallback instead of standard EvalCallback
         eval_callback = VecNormalizeEvalCallback(
