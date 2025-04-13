@@ -126,8 +126,12 @@ class DerivativesFeatureEngine:
                                 logger.warning(f"NaN values detected in {asset} data, applying fillna")
                                 asset_df = asset_df.ffill().fillna(0)
                         
-                        # Process basic technical indicators
-                        features[asset] = self._compute_technical_indicators(asset_df)
+                        # Process technical indicators
+                        tech_indicators = self._compute_technical_indicators(asset_df)
+                        features[asset] = tech_indicators
+                        
+                        # NEW LOG: Log indicators for this asset
+                        logger.info(f"Technical indicators for {asset}: {list(tech_indicators.keys())}")
                         
                         # Add volume/price features if basic features are present
                         if isinstance(features[asset], dict) and 'close' in features[asset]:
@@ -147,6 +151,9 @@ class DerivativesFeatureEngine:
                         logger.error(traceback.format_exc())
                         continue
                     
+                # NEW LOG: Log all features before combining
+                logger.info(f"Features before combining: {[{k: list(v.keys()) for k, v in features.items()}]}")
+                
                 # Handle cross-sectional features if multiple assets
                 if len(assets) > 1:
                     for asset in assets:
@@ -174,6 +181,12 @@ class DerivativesFeatureEngine:
             # Combine all features
             result = self._combine_features(features)
             
+            # NEW LOG: Log the structure of the combined result
+            if isinstance(result, pd.DataFrame):
+                logger.info(f"Combined result columns: {list(result.columns)}")
+            else:
+                logger.info(f"Combined result type: {type(result)}")
+            
             logger.info(f"Transformed data shape: {result.shape}")
             return result
             
@@ -187,65 +200,176 @@ class DerivativesFeatureEngine:
         try:
             # Log available columns for debugging
             logger.info(f"DataFrame columns type: {type(df.columns)}")
-            if isinstance(df.columns, pd.MultiIndex):
-                logger.info(f"MultiIndex levels: {df.columns.names}")
-                logger.info(f"Available assets: {df.columns.get_level_values(0).unique()}")
-                
-                # Convert MultiIndex columns to flat columns for TA library compatibility
-                logger.warning("Converting MultiIndex columns to flat for TA calculation")
-                df = df.copy()
-                # If we have a MultiIndex, convert it to single-level
-                # Creating flat columns by joining level names with underscore
-                flat_cols = [f"{col[0]}_{col[1]}" if isinstance(col, tuple) else col for col in df.columns]
-                df.columns = flat_cols
-            else:
-                logger.info(f"Available columns: {list(df.columns)}")
-                
-            result = {}
+            logger.info(f"Available columns: {list(df.columns)}")
             
-            # Skip if we don't have close prices
-            if 'close' not in df.columns:
-                logger.warning("No close price data found in columns")
-                close_candidates = [col for col in df.columns if 'close' in col.lower()]
-                if close_candidates:
-                    logger.info(f"Found potential close price columns: {close_candidates}")
-                    # Try to use the first close-like column - use loc for proper assignment
-                    df = df.copy()  # Create a copy to avoid SettingWithCopyWarning
-                    df.loc[:, 'close'] = df[close_candidates[0]]
-                else:
-                    logger.warning("No close price data, skipping")
-                    return {}
+            result = {'asset': df.iloc[:, 0].name if hasattr(df.iloc[:, 0], 'name') else 'unknown'}
+            
+            # Make sure we have required columns
+            required = ['open', 'high', 'low', 'close']
+            if not all(col in df.columns for col in required):
+                logger.warning(f"Missing required columns for TA calculations. Available: {df.columns}")
+                return result
+            
+            # Ensure all data is numeric and fill NaN values to avoid calculation issues
+            for col in required:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+                df[col] = df[col].ffill().bfill().fillna(0)
+            
+            # Avoid zero values in close price to prevent division by zero
+            df['close'] = df['close'].replace(0, np.nan).ffill().fillna(1e-8)
+            
+            # Calculate returns
+            result['returns_1d'] = df['close'].pct_change(1).fillna(0)
+            result['returns_5d'] = df['close'].pct_change(5).fillna(0)
+            result['returns_10d'] = df['close'].pct_change(10).fillna(0)
+            
+            # Calculate volatility with proper handling of NaN/zero values
+            returns = df['close'].pct_change().fillna(0)
+            result['volatility_5d'] = returns.rolling(5, min_periods=2).std().fillna(0)
+            result['volatility_10d'] = returns.rolling(10, min_periods=3).std().fillna(0)
+            result['volatility_20d'] = returns.rolling(20, min_periods=5).std().fillna(0)
+            
+            # Calculate RSI
+            try:
+                rsi = RSIIndicator(df['close'], window=14)
+                result['rsi_14'] = rsi.rsi().fillna(50)  # Neutral value for NaN
+            except Exception as e:
+                logger.warning(f"Error calculating RSI: {e}")
+                result['rsi_14'] = pd.Series(50, index=df.index)  # Default to neutral
+            
+            # Calculate MACD
+            try:
+                macd_indicator = MACD(df['close'])
+                result['macd'] = macd_indicator.macd().fillna(0)
+                result['macd_signal'] = macd_indicator.macd_signal().fillna(0)
+                result['macd_diff'] = macd_indicator.macd_diff().fillna(0)
+            except Exception as e:
+                logger.warning(f"Error calculating MACD: {e}")
+                # Create default values
+                result['macd'] = pd.Series(0, index=df.index)
+                result['macd_signal'] = pd.Series(0, index=df.index)
+                result['macd_diff'] = pd.Series(0, index=df.index)
+            
+            # Calculate Bollinger Bands
+            try:
+                bb = BollingerBands(df['close'])
+                result['bb_upper'] = bb.bollinger_hband().fillna(df['close'] * 1.02)  # Default: 2% above price
+                result['bb_middle'] = bb.bollinger_mavg().fillna(df['close'])         # Default: current price
+                result['bb_lower'] = bb.bollinger_lband().fillna(df['close'] * 0.98)  # Default: 2% below price
+            except Exception as e:
+                logger.warning(f"Error calculating Bollinger Bands: {e}")
+                # Create default bands
+                result['bb_upper'] = df['close'] * 1.02
+                result['bb_middle'] = df['close']
+                result['bb_lower'] = df['close'] * 0.98
+            
+            # Calculate ATR
+            try:
+                atr = AverageTrueRange(df['high'], df['low'], df['close'], window=14)
+                result['atr_14'] = atr.average_true_range().ffill().fillna(df['close'] * 0.02)
+            except Exception as e:
+                logger.warning(f"Error calculating ATR: {e}")
+                result['atr_14'] = df['close'] * 0.02  # Default: 2% of price
+            
+            # Calculate ADX
+            try:
+                adx = ADXIndicator(df['high'], df['low'], df['close'], window=14)
+                result['adx_14'] = adx.adx().fillna(20)  # Default: moderate trend strength
+            except Exception as e:
+                logger.warning(f"Error calculating ADX: {e}")
+                result['adx_14'] = pd.Series(20, index=df.index)
+            
+            # Calculate CCI (simple implementation rather than using talib to avoid dependency)
+            try:
+                tp = (df['high'] + df['low'] + df['close']) / 3
+                ma20 = tp.rolling(window=20, min_periods=5).mean()
+                # Avoid division by zero with small constant
+                mean_dev = tp.rolling(window=20, min_periods=5).apply(
+                    lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+                ).fillna(0.0001)
+                # Where mean_dev is too small, use a minimum value
+                mean_dev = mean_dev.replace(0, 0.0001)
+                result['cci_14'] = ((tp - ma20) / (0.015 * mean_dev)).fillna(0)
+            except Exception as e:
+                logger.warning(f"Error calculating CCI: {e}")
+                result['cci_14'] = pd.Series(0, index=df.index)
+            
+            # Simplified Hurst exponent to avoid numerical issues
+            try:
+                # We'll calculate a simplified proxy for trend strength instead of actual Hurst
+                # Use ratio of long-term to short-term volatility as a proxy
+                short_vol = returns.rolling(10, min_periods=3).std().fillna(0.0001)
+                long_vol = returns.rolling(40, min_periods=10).std().fillna(0.0001)
+                # Avoid division by zero
+                short_vol = short_vol.replace(0, 0.0001)
+                # Values > 1 suggest trend (like high Hurst), < 1 suggest mean reversion (low Hurst)
+                vol_ratio = (long_vol / short_vol).fillna(1.0)
+                # Map to 0-1 range like Hurst
+                result['hurst_exponent'] = (0.5 + 0.5 * np.tanh(vol_ratio - 1)).fillna(0.5)
+            except Exception as e:
+                logger.warning(f"Error calculating Hurst proxy: {e}")
+                result['hurst_exponent'] = pd.Series(0.5, index=df.index)  # Default: random walk
+            
+            # Market regime (simplified)
+            try:
+                # Base regime on ADX and direction
+                adx_series = result['adx_14'] 
+                
+                # 0 = ranging, 1 = uptrend, 2 = downtrend
+                result['market_regime'] = pd.Series(0, index=df.index)  # Default to ranging
+                
+                # Uptrend: ADX > 25 and price rising
+                uptrend = (adx_series > 25) & (result['returns_5d'] > 0)
+                # Downtrend: ADX > 25 and price falling
+                downtrend = (adx_series > 25) & (result['returns_5d'] < 0)
+                
+                result['market_regime'] = np.where(uptrend, 1, 
+                                          np.where(downtrend, 2, 0))
+            except Exception as e:
+                logger.warning(f"Error calculating market regime: {e}")
+                result['market_regime'] = pd.Series(0, index=df.index)  # Default to ranging
+            
+            # Volatility regime (simplified)
+            try:
+                vol_series = result['volatility_20d']
+                # Ensure we have some non-zero values to work with
+                if vol_series.max() > 0:
+                    vol_med = vol_series.replace(0, np.nan).median()
+                    if np.isnan(vol_med) or vol_med == 0:
+                        vol_med = 0.01  # Fallback if median is NaN or zero
                     
-            # Create a dummy asset name
-            asset = "asset"
-            features = {}
-            
-            # Ensure we have basic OHLCV data in the right format
-            features['close'] = pd.to_numeric(df['close'], errors='coerce')
-            
-            # Add OHLC and volume if available
-            for col in ['open', 'high', 'low', 'volume']:
-                if col in df.columns:
-                    features[col] = pd.to_numeric(df[col], errors='coerce')
+                    # 0 = low, 1 = medium, 2 = high volatility
+                    result['volatility_regime'] = np.where(
+                        vol_series > vol_med * 1.5, 2,
+                        np.where(vol_series < vol_med * 0.5, 0, 1)
+                    )
                 else:
-                    # Look for similar column names if exact match not found
-                    candidates = [c for c in df.columns if col in c.lower()]
-                    if candidates:
-                        features[col] = pd.to_numeric(df[candidates[0]], errors='coerce')
+                    result['volatility_regime'] = pd.Series(1, index=df.index)  # Default to medium
+            except Exception as e:
+                logger.warning(f"Error calculating volatility regime: {e}")
+                result['volatility_regime'] = pd.Series(1, index=df.index)  # Default to medium
             
-            # Compute indicators with safe handling
-            result[asset] = self._calculate_indicators(features)
+            # Ensure all calculated indicators are properly aligned Series with the same index
+            for key, value in list(result.items()):
+                if isinstance(value, pd.Series):
+                    # Ensure the series has the right index
+                    if not value.index.equals(df.index):
+                        result[key] = value.reindex(df.index, fill_value=0)
+                    # Replace any remaining NaN/inf values
+                    result[key] = result[key].replace([np.inf, -np.inf], np.nan).fillna(0)
+                else:
+                    # If not a Series, remove it (except 'asset' key)
+                    if key != 'asset':
+                        del result[key]
             
+            logger.info(f"Technical indicators calculated: {list(result.keys())}")
             return result
-            
+        
         except Exception as e:
-            logger.error(f"Error computing technical indicators: {str(e)}")
+            logger.error(f"Error in _compute_technical_indicators: {str(e)}")
             logger.error(traceback.format_exc())
-            if isinstance(df.columns, pd.MultiIndex):
-                logger.error(f"MultiIndex levels: {df.columns.names}")
-            else:
-                logger.error(f"Available columns: {list(df.columns)}")
-            return {}
+            return {'asset': 'error'}
         
     def _calculate_indicators(self, data: Dict[str, pd.Series]) -> Dict[str, pd.Series]:
         """Calculate comprehensive technical indicators from price and volume data"""
@@ -795,6 +919,9 @@ class DerivativesFeatureEngine:
     def _combine_features(self, features: Dict) -> pd.DataFrame:
         """Combine all features into a single DataFrame with proper normalization"""
         try:
+            # ADD THIS: Log what's coming into the combine method
+            logger.info(f"Combining features for assets: {list(features.keys())}")
+            
             combined = pd.DataFrame()
             all_features = set()
             
@@ -880,6 +1007,9 @@ class DerivativesFeatureEngine:
             logger.info(f"Combined features shape: {combined.shape}")
             logger.info(f"Features per asset: {len(self.selected_features) if self.selected_features else 0}")
             logger.info(f"Total assets: {len(features)}")
+            
+            # ADD THIS: Log the combined features before returning
+            logger.info(f"Combined features columns: {list(combined.columns) if isinstance(combined, pd.DataFrame) else 'Not a DataFrame'}")
             
             return combined
             
