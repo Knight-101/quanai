@@ -1,11 +1,10 @@
 """
-Institutional Backtesting Package
+Institutional-grade backtesting module for cryptocurrency trading models.
 
-This package provides robust backtesting capabilities for crypto trading models,
-specifically designed to be compatible with the existing codebase.
+This module provides tools for backtesting trading models with a focus on
+eliminating bias, analyzing market regimes, and providing comprehensive metrics.
 """
 
 from .institutional_backtester import InstitutionalBacktester
-from .regime_analyzer import RegimeAnalyzer, MarketRegime
 
-__all__ = ['InstitutionalBacktester', 'RegimeAnalyzer', 'MarketRegime'] 
+__all__ = ['InstitutionalBacktester'] 
