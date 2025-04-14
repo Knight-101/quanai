@@ -3,8 +3,8 @@
 Run Complete Backtest
 
 This script provides a simple interface to run a complete backtest
-with the same data loading/feature extraction logic as used in training,
-ensuring compatibility with trained models.
+with the backtesting module that ensures compatibility
+between trained models and backtesting data.
 """
 
 import argparse
@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import sys
+import pandas as pd
 from pathlib import Path
 
 # Configure logging
@@ -23,7 +24,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 # Import our data fetcher and backtester
 from data_fetcher_backtest import CustomBacktestDataFetcher
-from backtesting.institutional_backtester import run_institutional_backtest
+from backtesting_opt import run_institutional_backtest
 
 async def run_complete_backtest(
     model_path: str,
@@ -33,13 +34,13 @@ async def run_complete_backtest(
     end_date: str = None,
     lookback_days: int = 365,
     initial_capital: float = 100000.0,
-    output_dir: str = "results/backtest",
+    output_dir: str = "results/backtest_opt",
     drive_ids_file: str = "drive_file_ids.json",
     regime_analysis: bool = True,
     walk_forward: bool = False
 ):
     """
-    Run a complete backtest with the same data loading/feature logic as training.
+    Run a complete backtest with the optimized backtesting module.
     
     Args:
         model_path: Path to the trained model
@@ -79,11 +80,24 @@ async def run_complete_backtest(
             
         logger.info(f"Data processed successfully with shape: {market_data.shape}")
         
+        # Show column structure to verify MultiIndex
+        if isinstance(market_data.columns, pd.MultiIndex):
+            logger.info(f"Data has MultiIndex columns: {market_data.columns.names}")
+            assets = list(market_data.columns.get_level_values(0).unique())
+            logger.info(f"Detected assets: {assets}")
+            
+            for asset in assets:
+                columns = market_data.xs(asset, axis=1, level=0).columns
+                logger.info(f"Asset {asset} has {len(columns)} features: {list(columns)}")
+        else:
+            logger.error("Data does not have MultiIndex columns, which may cause issues")
+            
         # Step 2: Run backtest
         logger.info(f"Running backtest with model: {model_path}")
         
         # Extract asset names for backtester
-        assets = [data_fetcher.symbol_mappings.get(symbol, symbol) for symbol in symbols]
+        assets = [data_fetcher.symbol_mappings.get(symbol, symbol.split('/')[0]) for symbol in symbols]
+        logger.info(f"Assets for backtesting: {assets}")
         
         results = run_institutional_backtest(
             model_path=model_path,
@@ -106,6 +120,7 @@ async def run_complete_backtest(
             print(f"Max Drawdown: {metrics.get('max_drawdown', 0):.2%}")
             print(f"Win Rate: {metrics.get('win_rate', 0):.2%}")
             print(f"Total Trades: {metrics.get('total_trades', 0)}")
+            print(f"Profit Factor: {metrics.get('profit_factor', 0):.2f}")
             print("=======================================")
             
             # Show results path
@@ -119,9 +134,9 @@ async def run_complete_backtest(
         traceback.print_exc()
         return None
 
-def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Run complete backtest with training-compatible data processing")
+def setup_arg_parser():
+    """Create and return the argument parser"""
+    parser = argparse.ArgumentParser(description="Run complete backtest with optimized module")
     
     parser.add_argument("--model-path", type=str, required=True,
                       help="Path to the trained model")
@@ -144,8 +159,8 @@ def parse_args():
     parser.add_argument("--initial-capital", type=float, default=100000.0,
                      help="Initial capital for backtesting (default: 100000.0)")
                      
-    parser.add_argument("--output-dir", type=str, default="results/backtest",
-                     help="Directory for output files (default: results/backtest)")
+    parser.add_argument("--output-dir", type=str, default="results/backtest_opt",
+                     help="Directory for output files (default: results/backtest_opt)")
                      
     parser.add_argument("--drive-ids-file", type=str, default="drive_file_ids.json",
                      help="Path to Google Drive file IDs JSON (default: drive_file_ids.json)")
@@ -156,11 +171,25 @@ def parse_args():
     parser.add_argument("--walk-forward", action="store_true",
                      help="Perform walk-forward validation")
                      
-    return parser.parse_args()
+    return parser
+
+def parse_args():
+    """Parse command line arguments"""
+    return setup_arg_parser().parse_args()
 
 async def main():
     """Main entry point"""
     args = parse_args()
+    
+    # Print info about the run
+    print("\n====== BACKTEST ======")
+    print(f"Model: {args.model_path}")
+    print(f"Symbols: {args.symbols}")
+    print(f"Timeframe: {args.timeframe}")
+    print(f"Period: {args.start_date or 'Last'} to {args.end_date or 'Now'}")
+    print(f"Initial Capital: ${args.initial_capital:,.2f}")
+    print(f"Output: {args.output_dir}")
+    print("======================\n")
     
     await run_complete_backtest(
         model_path=args.model_path,
