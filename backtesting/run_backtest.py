@@ -69,6 +69,8 @@ def parse_args():
                         help='Directory to save backtest results')
     parser.add_argument('--no-visualizations', action='store_true',
                         help='Disable creation of visualizations')
+    parser.add_argument('--no-env-check', action='store_true',
+                        help='Skip environment file check and confirmation')
     parser.add_argument('--config-path', type=str, default='config/prod_config.yaml',
                         help='Path to configuration file')
     
@@ -118,12 +120,78 @@ def main():
     )
     
     try:
-        # Run backtest
-        results = backtester.run_backtest(n_eval_episodes=args.n_episodes)
+        # Check if the environment file exists
+        model_dir = os.path.dirname(args.model_path)
+        model_name = os.path.splitext(os.path.basename(args.model_path))[0]
         
-        # Create visualizations if enabled
-        if not args.no_visualizations:
-            backtester.create_visualizations()
+        # Check common env filenames
+        env_file_found = False
+        possible_env_files = [
+            os.path.join(model_dir, "final_env.pkl"),
+            os.path.join(model_dir, f"{model_name}_env.pkl"),
+            os.path.join(model_dir, "vec_normalize.pkl"),
+            os.path.join(model_dir, "env.pkl")
+        ]
+        
+        for env_file in possible_env_files:
+            if os.path.exists(env_file):
+                logger.info(f"Found environment file: {env_file}")
+                env_file_found = True
+                break
+                
+        if not env_file_found:
+            logger.warning("No environment file found. The backtester may not work correctly.")
+            logger.warning("Please ensure there is a 'final_env.pkl' or similar file in the model directory.")
+            
+            # Ask user whether to continue
+            if not args.no_env_check:
+                while True:
+                    response = input("No environment file found. Continue anyway? (y/n): ").lower().strip()
+                    if response in ['y', 'yes']:
+                        break
+                    elif response in ['n', 'no']:
+                        logger.info("Aborting backtest due to missing environment file.")
+                        return None
+        
+        # Run backtest with progress tracking
+        logger.info("Starting backtest...")
+        from tqdm import tqdm
+        
+        # Setup progress bar for overall process
+        with tqdm(total=4, desc="Backtest progress", position=0) as pbar:
+            # Load data
+            pbar.set_description("Loading data")
+            backtester.load_data()
+            pbar.update(1)
+            
+            # Load model
+            pbar.set_description("Loading model")
+            backtester.load_model()
+            pbar.update(1)
+            
+            # Run backtest
+            pbar.set_description("Running backtest")
+            try:
+                results = backtester.run_backtest(n_eval_episodes=args.n_episodes)
+                if not results or all(v == 0 for k, v in results.items() if k != 'error'):
+                    logger.warning("Backtest returned empty or null results. Check the logs for errors.")
+                    print("\nWARNING: Backtest results appear to be empty or invalid.")
+                    print("This is often caused by missing base features (open, high, low, close, volume) in the processed data.")
+                    print("Check the log files for more details and ensure your environment has access to these features.")
+            except Exception as e:
+                logger.error(f"Error during backtest execution: {str(e)}", exc_info=True)
+                print(f"\nERROR: Backtest execution failed: {str(e)}")
+                print("This may be due to missing base features in the data or environment setup issues.")
+                print("Check the logs for detailed error information.")
+                results = {"error": str(e), "total_return": 0.0}
+            
+            pbar.update(1)
+            
+            # Create visualizations and finish
+            pbar.set_description("Creating visualizations")
+            if not args.no_visualizations:
+                backtester.create_visualizations()
+            pbar.update(1)
         
         # Run additional analyses if requested
         if args.walk_forward:
