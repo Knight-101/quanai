@@ -2048,7 +2048,7 @@ class TradingSystem:
             # Temporarily modify hyperparameters for recalibration
             # 1. Increase value function coefficient to focus on value prediction
             if hasattr(self.model, 'vf_coef'):
-                self.model.vf_coef = 1.5  # Enhanced: increased from 2.0 to 5.0
+                self.model.vf_coef = 2  # Enhanced: increased from 2.0 to 5.0
                 logger.info(f"Temporarily increased vf_coef to {self.model.vf_coef} (was {original_hyperparams.get('vf_coef', 'unknown')})")
                 
             # 2. Set a very low fixed learning rate for more stable value function learning
