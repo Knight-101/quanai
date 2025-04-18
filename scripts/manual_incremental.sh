@@ -11,6 +11,7 @@ ENABLE_LOGGING=false  # Set to true to redirect output to log files
 HYPERPARAMS=""  # Initialize empty hyperparams string
 DRIVE_IDS_FILE=""  # Initialize empty drive IDs file parameter
 USE_RECOMMENDATIONS=false # Initialize use_recommendations flag
+RECALIBRATE_VALUE=false # Initialize recalibrate value function flag
 
 # Create directories
 mkdir -p "$MODEL_BASE_DIR"
@@ -39,6 +40,7 @@ show_help() {
     echo "  --hyperparams 'param1=value1,param2=value2' - Override hyperparameters for this training phase"
     echo "  --drive-ids-file FILE_PATH     - Path to JSON file with Google Drive file IDs for data"
     echo "  --use-recommendations          - Automatically use hyperparameter recommendations from previous phase"
+    echo "  --recalibrate-value-function   - Enable value function recalibration phase before continuing training"
     echo ""
     echo "COMMANDS:"
     echo "  init STEPS [--verbose] [--training-mode] - Start initial training phase"
@@ -92,6 +94,8 @@ for arg in "$@"; do
         done
     elif [[ $arg == --use-recommendations ]]; then
         USE_RECOMMENDATIONS=true
+    elif [[ $arg == --recalibrate-value-function ]]; then
+        RECALIBRATE_VALUE=true
     fi
 done
 
@@ -220,6 +224,9 @@ continue_training() {
     if [ "$USE_RECOMMENDATIONS" = true ]; then
         echo "  USING HYPERPARAMETER RECOMMENDATIONS FROM PREVIOUS PHASE"
     fi
+    if [ "$RECALIBRATE_VALUE" = true ]; then
+        echo "  WITH VALUE FUNCTION RECALIBRATION ENABLED"
+    fi
     if [ -n "$DRIVE_IDS_FILE" ]; then
         echo "  USING GOOGLE DRIVE DATA FROM: $DRIVE_IDS_FILE"
     fi
@@ -339,6 +346,12 @@ continue_training() {
     if [ "$USE_RECOMMENDATIONS" = true ]; then
         COMMAND="$COMMAND --use-recommendations"
         echo "Enabling use of recommendations from previous phase"
+    fi
+    
+    # Add recalibrate-value-function flag if requested
+    if [ "$RECALIBRATE_VALUE" = true ]; then
+        COMMAND="$COMMAND --recalibrate-value-function"
+        echo "Enabling value function recalibration"
     fi
     
     # Add Google Drive integration if specified

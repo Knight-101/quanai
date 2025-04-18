@@ -468,6 +468,8 @@ def parse_args():
                        help='Comma-separated list of hyperparameters to override (format: param1=value1,param2=value2)')
     parser.add_argument('--use-recommendations', action='store_true',
                        help='Use recommended hyperparameters from previous phase when continuing training')
+    parser.add_argument('--recalibrate-value-function', action='store_true',
+                       help='Run a value function recalibration phase before continuing training')
     parser.add_argument('--drive-ids-file', type=str, default=None,
                        help='Path to JSON file containing Google Drive file IDs for data files. This enables Google Drive integration.')
     parser.add_argument('--config', type=str, default='config/prod_config.yaml',
@@ -1871,9 +1873,33 @@ class TradingSystem:
             )
             
             # Save final model
-            final_model_path = os.path.join(self.config['model']['checkpoint_dir'], "final_model")
+            final_model_path = os.path.join(self.config['model']['checkpoint_dir'], "final_model.zip")
+            logger.info(f"Saving final model to {final_model_path}")
             self.model.save(final_model_path)
-            self.env.save(os.path.join(self.config['model']['checkpoint_dir'], "final_env.pkl"))
+            
+            # Save environment with proper naming convention
+            env_save_path = os.path.join(self.config['model']['checkpoint_dir'], "final_env.pkl")
+            # Ensure we're in training mode for saving to preserve all stats
+            original_training = self.env.training
+            original_norm_reward = self.env.norm_reward
+            self.env.training = True
+            self.env.norm_reward = True
+            
+            # Save with different names for maximum compatibility
+            logger.info(f"Saving environment normalization to {env_save_path}")
+            self.env.save(env_save_path)
+            self.env.save(os.path.join(self.config['model']['checkpoint_dir'], "vec_normalize.pkl"))
+            
+            # Also save phase1-specific environment if in phase1 directory
+            if args and hasattr(args, 'model_dir') and "phase1" in args.model_dir:
+                self.env.save(os.path.join(self.config['model']['checkpoint_dir'], "phase1_env.pkl"))
+            
+            # Restore original environment settings
+            self.env.training = original_training
+            self.env.norm_reward = original_norm_reward
+            
+            # Debug: Print final normalization statistics
+            self._debug_print_norm_stats(self.env, "Final Environment")
             
             # Final evaluation
             eval_metrics = self._evaluate_model(self.model)
@@ -1928,18 +1954,175 @@ class TradingSystem:
         logger.info(f"Loading model from {model_path}")
         model = PPO.load(model_path)
         
+        # CRITICAL FIX: More robust environment path finding
+        if env_path is None:
+            # Try to find environment file with consistent naming convention
+            model_dir = os.path.dirname(model_path)
+            potential_env_paths = [
+                os.path.join(model_dir, "final_env.pkl"),
+                os.path.join(model_dir, "vec_normalize.pkl")
+            ]
+            
+            # Extract phase number if present in model_path
+            match = re.search(r'phase(\d+)', model_path)
+            if match:
+                phase_num = match.group(1)
+                potential_env_paths.append(os.path.join(model_dir, f"phase{phase_num}_env.pkl"))
+            
+            for potential_path in potential_env_paths:
+                if os.path.exists(potential_path):
+                    env_path = potential_path
+                    logger.info(f"Automatically found environment at {env_path}")
+                    break
+                    
+            if env_path is None:
+                logger.warning("Could not find environment file automatically. Will create new environment.")
+        
+        # Always create a fresh base environment with the same parameters
+        base_env = self._create_environment(self.processed_data, train=True, args=args)
+        original_env = base_env  # Store original in case loading fails
+        
         # Set the loaded model to the same environment
         if env_path and os.path.exists(env_path):
-            logger.info(f"Loading environment from {env_path}")
-            self.env = VecNormalize.load(env_path, self.env)
+            logger.info(f"Loading environment normalization from {env_path}")
+            try:
+                # CRITICAL FIX: Load normalization with proper validation
+                self.env = VecNormalize.load(env_path, base_env)
+                
+                # Debug: Print normalization statistics to verify they're loaded correctly
+                self._debug_print_norm_stats(self.env, "Loaded Environment")
+                
+                # Reset reward normalization if requested (useful when changing reward function)
+                if reset_reward_normalization:
+                    logger.info("Resetting reward normalization statistics")
+                    self.env.obs_rms = self.env.obs_rms  # Keep observation normalization
+                    self.env.ret_rms = RunningMeanStd(shape=())  # Reset reward normalization
+                    if hasattr(self.env, 'returns'):
+                        self.env.returns = np.zeros(self.env.returns.shape)
+                
+                # CRITICAL FIX: Explicitly set training mode to True for continued training
+                self.env.training = True
+                self.env.norm_reward = True
+                
+                # Validate that environment loaded correctly
+                if not self._validate_environment_compatibility(self.env, model):
+                    logger.warning("Environment validation failed! Creating new environment.")
+                    self.env = original_env
+            except Exception as e:
+                logger.error(f"Failed to load environment: {str(e)}")
+                logger.error(traceback.format_exc())
+                logger.warning("Using fresh environment instead.")
+                self.env = original_env
+        else:
+            logger.info("No environment file provided or found. Using fresh environment.")
+            # Keep the base_env created above
+            self.env = base_env
+        
+        # Set the model
+        self.model = model
+        # Set the model environment to our environment
+        self.model.set_env(self.env)
+        
+        # CRITICAL FIX: Debug output after setting up environment
+        logger.info(f"Environment setup complete. Training: {self.env.training}, Normalize reward: {self.env.norm_reward}")
+        self._debug_print_norm_stats(self.env, "Environment After Setup")
+        
+        # FEATURE: Value Function Recalibration Phase
+        # Check if we should run a recalibration phase
+        run_recalibration = False
+        if args and hasattr(args, 'recalibrate_value_function'):
+            run_recalibration = args.recalibrate_value_function
             
-            # Reset reward normalization if requested (useful when changing reward function)
-            if reset_reward_normalization:
-                logger.info("Resetting reward normalization statistics")
-                self.env.obs_rms = self.env.obs_rms  # Keep observation normalization
-                self.env.ret_rms = RunningMeanStd(shape=())  # Reset reward normalization
-                if hasattr(self.env, 'returns'):
-                    self.env.returns = np.zeros(self.env.returns.shape)
+        if run_recalibration:
+            logger.info("Starting value function recalibration phase with enhanced parameters...")
+            
+            # Store original hyperparameters
+            original_hyperparams = {}
+            if hasattr(self.model, 'vf_coef'):
+                original_hyperparams['vf_coef'] = self.model.vf_coef
+            if hasattr(self.model, 'ent_coef'):
+                original_hyperparams['ent_coef'] = self.model.ent_coef
+            if hasattr(self.model, 'learning_rate'):
+                original_hyperparams['learning_rate'] = self.model.learning_rate
+                
+            # Temporarily modify hyperparameters for recalibration
+            # 1. Increase value function coefficient to focus on value prediction
+            if hasattr(self.model, 'vf_coef'):
+                self.model.vf_coef = 1.5  # Enhanced: increased from 2.0 to 5.0
+                logger.info(f"Temporarily increased vf_coef to {self.model.vf_coef} (was {original_hyperparams.get('vf_coef', 'unknown')})")
+                
+            # 2. Set a very low fixed learning rate for more stable value function learning
+            if hasattr(self.model, 'learning_rate') and callable(self.model.learning_rate):
+                original_lr_schedule = self.model.learning_rate
+                recalibration_lr = 1e-5  # Enhanced: fixed very low value instead of percentage
+                self.model.learning_rate = lambda _: recalibration_lr
+                logger.info(f"Set recalibration learning rate to {recalibration_lr}")
+            
+            # Calculate recalibration steps - enhanced duration
+            recalibration_steps = 100000  # Enhanced: doubled from 50000 to 70000
+            logger.info(f"Running enhanced recalibration for {recalibration_steps} steps")
+            
+            # Monitor callback to track explained variance
+            class RecalibrationMonitorCallback(BaseCallback):
+                def __init__(self, verbose=0):
+                    super().__init__(verbose)
+                    self.explained_variances = []
+                    self.iteration = 0
+                    self.best_explained_var = -float('inf')
+                    
+                def _on_step(self):
+                    self.iteration += 1
+                    # Extract explained variance from logger if available
+                    if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):
+                        for name, value in self.model.logger.name_to_value.items():
+                            if 'explained_variance' in name:
+                                self.explained_variances.append(value)
+                                # Log progress every 10 iterations or when significant improvement
+                                if len(self.explained_variances) % 10 == 0 or value > self.best_explained_var + 0.1:
+                                    self.best_explained_var = max(self.best_explained_var, value)
+                                    recent_avg = np.mean(self.explained_variances[-10:]) if len(self.explained_variances) >= 10 else value
+                                    logger.info(f"Recalibration progress: Step {self.iteration}, Explained variance: {value:.4f}, Recent avg: {recent_avg:.4f}")
+                    return True
+            
+            # Run the recalibration phase
+            recalibration_callback = RecalibrationMonitorCallback()
+            self.model.learn(
+                total_timesteps=recalibration_steps,
+                callback=recalibration_callback,
+                reset_num_timesteps=False
+            )
+            
+            # Restore original hyperparameters
+            for param, value in original_hyperparams.items():
+                if hasattr(self.model, param):
+                    setattr(self.model, param, value)
+                    logger.info(f"Restored {param} to original value: {value}")
+            
+            # Log recalibration results
+            if hasattr(recalibration_callback, 'explained_variances') and len(recalibration_callback.explained_variances) > 0:
+                final_exp_var = recalibration_callback.explained_variances[-1]
+                initial_exp_var = recalibration_callback.explained_variances[0] if len(recalibration_callback.explained_variances) > 0 else float('nan')
+                best_exp_var = max(recalibration_callback.explained_variances) if recalibration_callback.explained_variances else float('nan')
+                
+                logger.info(f"Value function recalibration complete:")
+                logger.info(f"  Initial explained variance: {initial_exp_var:.4f}")
+                logger.info(f"  Final explained variance: {final_exp_var:.4f}")
+                logger.info(f"  Best explained variance: {best_exp_var:.4f}")
+                logger.info(f"  Improvement: {final_exp_var - initial_exp_var:.4f}")
+                
+                # Try to log to wandb if it's available
+                try:
+                    if 'wandb' in globals():
+                        wandb.log({
+                            "recalibration/initial_explained_variance": initial_exp_var,
+                            "recalibration/final_explained_variance": final_exp_var,
+                            "recalibration/best_explained_variance": best_exp_var,
+                            "recalibration/improvement": final_exp_var - initial_exp_var
+                        })
+                except Exception as e:
+                    logger.warning(f"Failed to log recalibration results to wandb: {e}")
+            else:
+                logger.warning("No explained variance data was collected during recalibration")
         
         # Detect current phase and determine next phase
         current_phase = 1
@@ -1995,11 +2178,6 @@ class TradingSystem:
                     self.env.env_method("update_parameters", training_mode=training_mode)
                 if hasattr(args, 'verbose'):
                     self.env.env_method("update_parameters", verbose=verbose)
-        
-        # Set the model
-        self.model = model
-        # Set the model environment to our environment
-        self.model.set_env(self.env)
         
         # Check for recommendations from previous phase
         use_recommendations = False
@@ -2131,10 +2309,32 @@ class TradingSystem:
                 reset_num_timesteps=reset_num_timesteps
             )
             
+            # CRITICAL FIX: More robust final saving with environment preservation
             # Save final model after continued training
-            final_model_path = os.path.join(next_phase_dir, "final_model")
+            final_model_path = os.path.join(next_phase_dir, "final_model.zip")
+            logger.info(f"Saving final model to {final_model_path}")
             self.model.save(final_model_path)
-            self.env.save(os.path.join(next_phase_dir, "final_env.pkl"))
+            
+            # Save environment with proper naming convention
+            env_save_path = os.path.join(next_phase_dir, "final_env.pkl")
+            # Ensure we're in training mode for saving to preserve all stats
+            original_training = self.env.training
+            original_norm_reward = self.env.norm_reward
+            self.env.training = True
+            self.env.norm_reward = True
+            
+            # Save with different names for maximum compatibility
+            logger.info(f"Saving environment normalization to {env_save_path}")
+            self.env.save(env_save_path)
+            self.env.save(os.path.join(next_phase_dir, "vec_normalize.pkl"))
+            self.env.save(os.path.join(next_phase_dir, f"phase{next_phase}_env.pkl"))
+            
+            # Restore original environment settings
+            self.env.training = original_training
+            self.env.norm_reward = original_norm_reward
+            
+            # Debug: Print final normalization statistics
+            self._debug_print_norm_stats(self.env, "Final Environment")
             
             # Final evaluation
             eval_metrics = self._evaluate_model(self.model)
@@ -2442,6 +2642,44 @@ class TradingSystem:
             except Exception as e:
                 logger.warning(f"Error during environment cleanup: {e}")
 
+    def _debug_print_norm_stats(self, env, label="Environment"):
+        """Print normalization statistics for debugging"""
+        try:
+            if hasattr(env, 'obs_rms') and hasattr(env, 'ret_rms'):
+                # Observation stats
+                if hasattr(env.obs_rms, 'mean') and hasattr(env.obs_rms, 'var'):
+                    obs_mean_avg = np.mean(env.obs_rms.mean) if env.obs_rms.mean.size > 0 else 0
+                    obs_var_avg = np.mean(env.obs_rms.var) if env.obs_rms.var.size > 0 else 0
+                    logger.info(f"{label} - Obs RMS: mean_avg={obs_mean_avg:.4f}, var_avg={obs_var_avg:.4f}")
+                
+                # Return stats
+                if hasattr(env.ret_rms, 'mean') and hasattr(env.ret_rms, 'var'):
+                    logger.info(f"{label} - Ret RMS: mean={env.ret_rms.mean:.4f}, var={env.ret_rms.var:.4f}")
+                
+                # Check for zeros or NaNs which could indicate problems
+                if hasattr(env.obs_rms, 'var') and (np.all(env.obs_rms.var == 0) or np.any(np.isnan(env.obs_rms.var))):
+                    logger.warning(f"{label} - WARNING: Observation variance contains zeros or NaNs!")
+                
+                if hasattr(env.ret_rms, 'var') and (env.ret_rms.var == 0 or np.isnan(env.ret_rms.var)):
+                    logger.warning(f"{label} - WARNING: Return variance is zero or NaN!")
+        except Exception as e:
+            logger.error(f"Error checking normalization stats: {str(e)}")
+
+    def _validate_environment_compatibility(self, env, model):
+        """Ensures environment and model are compatible for continued training"""
+        try:
+            # Test a prediction to check shape compatibility
+            obs = env.reset()
+            action, _ = model.predict(obs, deterministic=True)
+            next_obs, reward, done, info = env.step(action)
+            
+            logger.info("Environment and model compatibility verified successfully.")
+            return True
+        except Exception as e:
+            logger.error(f"Environment and model incompatibility: {e}")
+            logger.error(traceback.format_exc())
+            return False
+        
 class VecNormalizeEvalCallback(BaseCallback):
     """
     Custom callback for evaluation with VecNormalize environments.
@@ -2471,6 +2709,7 @@ class VecNormalizeEvalCallback(BaseCallback):
         self.best_model_step = 0
         self.n_eval_episodes = n_eval_episodes
         self.eval_env = eval_env
+        self.best_model_save_path = best_model_save_path
 
     def _init_callback(self):
         # Initialize nested callback - only pass the model
@@ -2520,7 +2759,30 @@ class VecNormalizeEvalCallback(BaseCallback):
             
             # Store properties for easy access
             if hasattr(self.eval_callback, 'best_mean_reward'):
+                prev_best = self.best_mean_reward
                 self.best_mean_reward = self.eval_callback.best_mean_reward
+                
+                # CRITICAL FIX: Save environment when model improves
+                if self.best_mean_reward > prev_best and is_vec_normalize and self.best_model_save_path:
+                    # Check if best model was saved
+                    if hasattr(self.eval_callback, 'best_model_path'):
+                        model_path = self.eval_callback.best_model_path
+                        if model_path:
+                            # Get directory from model path
+                            save_dir = os.path.dirname(model_path)
+                            env_path = os.path.join(save_dir, "vec_normalize.pkl")
+                            
+                            # Temporarily set to training=True to save full stats
+                            was_training = self.eval_env.training
+                            self.eval_env.training = True
+                            # Save environment with normalization stats
+                            self.eval_env.save(env_path)
+                            # Also save with phase-specific naming
+                            self.eval_env.save(os.path.join(save_dir, "best_env.pkl"))
+                            # Restore original training state
+                            self.eval_env.training = was_training
+                            
+                            logger.info(f"New best model found! Saved environment normalization to {env_path}")
                 
             if hasattr(self.eval_callback, 'best_model_step'): 
                 self.best_model_step = self.eval_callback.best_model_step
@@ -2925,4 +3187,30 @@ async def main():
         raise
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Train a trading agent using PPO")
+    parser.add_argument("--data-path", type=str, help="Path to the preprocessed data file")
+    parser.add_argument("--model-dir", type=str, help="Directory to save the model to")
+    parser.add_argument("--training-steps", type=int, help="Number of training steps")
+    parser.add_argument("--eval-episodes", type=int, default=5, help="Number of episodes for evaluation")
+    parser.add_argument("--training-mode", action="store_true", help="Enable training mode for the environment")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--optimize", action="store_true", help="Optimize hyperparameters")
+    parser.add_argument("--continue-training", action="store_true", help="Continue training from a saved model")
+    parser.add_argument("--eval-only", action="store_true", help="Only evaluate the model, no training")
+    parser.add_argument("--model-path", type=str, help="Path to the saved model for continued training or evaluation")
+    parser.add_argument("--env-path", type=str, help="Path to the saved environment for continued training")
+    parser.add_argument("--use-recommendations", action="store_true", help="Load recommended parameters for continued training")
+    parser.add_argument("--recalibrate-value-function", action="store_true", help="Run a value function recalibration phase before continuing training")
+    parser.add_argument("--reset-num-timesteps", action="store_true", help="Reset timestep counter for continued training")
+    parser.add_argument("--reset-reward-norm", action="store_true", help="Reset reward normalization for continued training")
+    parser.add_argument("--additional-steps", type=int, help="Additional training steps for continued training")
+    parser.add_argument("--assets", type=str, help="Comma-separated list of assets to use")
+    parser.add_argument("--timeframe", type=str, help="Timeframe to use (e.g. 1h, 4h, 1d)")
+    parser.add_argument("--max-leverage", type=float, help="Maximum leverage to use")
+    parser.add_argument("--hyperparams", type=str, help="Comma-separated list of hyperparameters to override (e.g. learning_rate=0.0003,ent_coef=0.01)")
+    parser.add_argument("--drive-ids-file", type=str, help="Path to file containing Google Drive IDs")
+    parser.add_argument("--gpus", type=int, default=0, help="Number of GPUs to use (0 for CPU)")
+    
+    # Parse args and run main
     asyncio.run(main())
