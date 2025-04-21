@@ -1,11 +1,11 @@
 {
-    "mean_reward": -8.266056829597801e-05,
-    "reward_sharpe": -2.7753247132372043,
-    "max_drawdown": 0.04456875146906114,
-    "avg_leverage": 6.797522145756207,
-    "avg_sharpe": -0.5935575694583751,
-    "avg_sortino": -0.48131471860778,
-    "avg_calmar": -0.019877507078220502,
-    "objective_value": -0.2168530929881105,
-    "trades_executed": 286
+    "mean_reward": -0.01987866684794426,
+    "reward_sharpe": -2.5593858209594136,
+    "max_drawdown": 0.07868640669073235,
+    "avg_leverage": 5.209524869446973,
+    "avg_sharpe": 8.55833215673128,
+    "avg_sortino": 2.518856191575241,
+    "avg_calmar": 0.02437576713907052,
+    "objective_value": 1.2178545636265032,
+    "trades_executed": 298
 }

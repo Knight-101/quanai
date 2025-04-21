@@ -2027,126 +2027,86 @@ class TradingSystem:
         logger.info(f"Environment setup complete. Training: {self.env.training}, Normalize reward: {self.env.norm_reward}")
         self._debug_print_norm_stats(self.env, "Environment After Setup")
         
-        # FEATURE: Value Function Recalibration Phase
-        # Check if we should run a recalibration phase
-        run_recalibration = False
-        if args and hasattr(args, 'recalibrate_value_function'):
-            run_recalibration = args.recalibrate_value_function
-            
-        if run_recalibration:
-            logger.info("Starting value function recalibration phase with enhanced parameters...")
-            
-            # Store original hyperparameters
-            original_hyperparams = {}
-            if hasattr(self.model, 'vf_coef'):
-                original_hyperparams['vf_coef'] = self.model.vf_coef
-            if hasattr(self.model, 'ent_coef'):
-                original_hyperparams['ent_coef'] = self.model.ent_coef
-            if hasattr(self.model, 'learning_rate'):
-                original_hyperparams['learning_rate'] = self.model.learning_rate
-                
-            # Temporarily modify hyperparameters for recalibration
-            # 1. Increase value function coefficient to focus on value prediction
-            if hasattr(self.model, 'vf_coef'):
-                self.model.vf_coef = 2  # Enhanced: increased from 2.0 to 5.0
-                logger.info(f"Temporarily increased vf_coef to {self.model.vf_coef} (was {original_hyperparams.get('vf_coef', 'unknown')})")
-                
-            # 2. Set a very low fixed learning rate for more stable value function learning
-            if hasattr(self.model, 'learning_rate') and callable(self.model.learning_rate):
-                original_lr_schedule = self.model.learning_rate
-                recalibration_lr = 1e-5  # Enhanced: fixed very low value instead of percentage
-                self.model.learning_rate = lambda _: recalibration_lr
-                logger.info(f"Set recalibration learning rate to {recalibration_lr}")
-            
-            # Calculate recalibration steps - enhanced duration
-            recalibration_steps = 100000  # Enhanced: doubled from 50000 to 70000
-            logger.info(f"Running enhanced recalibration for {recalibration_steps} steps")
-            
-            # Monitor callback to track explained variance
-            class RecalibrationMonitorCallback(BaseCallback):
-                def __init__(self, verbose=0):
-                    super().__init__(verbose)
-                    self.explained_variances = []
-                    self.iteration = 0
-                    self.best_explained_var = -float('inf')
-                    
-                def _on_step(self):
-                    self.iteration += 1
-                    # Extract explained variance from logger if available
-                    if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):
-                        for name, value in self.model.logger.name_to_value.items():
-                            if 'explained_variance' in name:
-                                self.explained_variances.append(value)
-                                # Log progress every 10 iterations or when significant improvement
-                                if len(self.explained_variances) % 10 == 0 or value > self.best_explained_var + 0.1:
-                                    self.best_explained_var = max(self.best_explained_var, value)
-                                    recent_avg = np.mean(self.explained_variances[-10:]) if len(self.explained_variances) >= 10 else value
-                                    logger.info(f"Recalibration progress: Step {self.iteration}, Explained variance: {value:.4f}, Recent avg: {recent_avg:.4f}")
-                    return True
-            
-            # Run the recalibration phase
-            recalibration_callback = RecalibrationMonitorCallback()
-            self.model.learn(
-                total_timesteps=recalibration_steps,
-                callback=recalibration_callback,
-                reset_num_timesteps=False
-            )
-            
-            # Restore original hyperparameters
-            for param, value in original_hyperparams.items():
-                if hasattr(self.model, param):
-                    setattr(self.model, param, value)
-                    logger.info(f"Restored {param} to original value: {value}")
-            
-            # Log recalibration results
-            if hasattr(recalibration_callback, 'explained_variances') and len(recalibration_callback.explained_variances) > 0:
-                final_exp_var = recalibration_callback.explained_variances[-1]
-                initial_exp_var = recalibration_callback.explained_variances[0] if len(recalibration_callback.explained_variances) > 0 else float('nan')
-                best_exp_var = max(recalibration_callback.explained_variances) if recalibration_callback.explained_variances else float('nan')
-                
-                logger.info(f"Value function recalibration complete:")
-                logger.info(f"  Initial explained variance: {initial_exp_var:.4f}")
-                logger.info(f"  Final explained variance: {final_exp_var:.4f}")
-                logger.info(f"  Best explained variance: {best_exp_var:.4f}")
-                logger.info(f"  Improvement: {final_exp_var - initial_exp_var:.4f}")
-                
-                # Try to log to wandb if it's available
-                try:
-                    if 'wandb' in globals():
-                        wandb.log({
-                            "recalibration/initial_explained_variance": initial_exp_var,
-                            "recalibration/final_explained_variance": final_exp_var,
-                            "recalibration/best_explained_variance": best_exp_var,
-                            "recalibration/improvement": final_exp_var - initial_exp_var
-                        })
-                except Exception as e:
-                    logger.warning(f"Failed to log recalibration results to wandb: {e}")
-            else:
-                logger.warning("No explained variance data was collected during recalibration")
+        # Determine phase and check whether to use recommendations
+        current_phase = None
+        next_phase = None
         
-        # Detect current phase and determine next phase
-        current_phase = 1
+        # Determine current phase from model path
+        try:
+            model_dir = os.path.dirname(model_path)
+            if 'phase' in model_dir:
+                # Try to extract the phase number
+                phase_match = re.search(r'phase(\d+)', model_dir)
+                if phase_match:
+                    current_phase = int(phase_match.group(1))
+                    next_phase = current_phase + 1
+                    logger.info(f"Detected current phase: {current_phase}, next phase: {next_phase}")
+        except Exception as e:
+            logger.warning(f"Could not determine current phase: {e}")
         
-        # First try to extract phase from model_path (this is more reliable for the source phase)
-        match = re.search(r'phase(\d+)', model_path)
-        if match:
-            current_phase = int(match.group(1))
-            logger.info(f"Detected current phase {current_phase} from model path")
-        # Only if not found in model_path, try from model_dir
-        elif args and hasattr(args, 'model_dir'):
-            # Try to extract phase number from model directory
-            match = re.search(r'phase(\d+)', args.model_dir)
+        # If current_phase not determined from directory, try from model_path directly
+        if current_phase is None:
+            match = re.search(r'phase(\d+)', model_path)
             if match:
-                # If extracting from model_dir, we don't increment - this is already the target phase
-                current_phase = int(match.group(1)) - 1
-                next_phase = int(match.group(1))
-                logger.info(f"Using target phase {next_phase} from model directory")
-                logger.info(f"Setting current phase to {current_phase}")
-        
+                current_phase = int(match.group(1))
+                logger.info(f"Detected current phase {current_phase} from model path")
+            # Only if not found in model_path, try from model_dir
+            elif args and hasattr(args, 'model_dir'):
+                # Try to extract phase number from model directory
+                match = re.search(r'phase(\d+)', args.model_dir)
+                if match:
+                    # If extracting from model_dir, we don't increment - this is already the target phase
+                    current_phase = int(match.group(1)) - 1
+                    next_phase = int(match.group(1))
+                    logger.info(f"Using target phase {next_phase} from model directory")
+                    logger.info(f"Setting current phase to {current_phase}")
+
         # Only calculate next_phase if not already set above
-        if not locals().get('next_phase'):
+        if next_phase is None and current_phase is not None:
             next_phase = current_phase + 1
-        
+            
+        # CRITICAL FIX: Hybrid solution for negative explained variance - Only for Phase 1->2 transition
+        if current_phase == 1 and next_phase == 2:
+            logger.info("Applying hybrid fix for explained variance issue (Phase 1 to 2 transition)")
+
+            # Part 1: Reset return normalization statistics
+            if hasattr(self.env, 'ret_rms'):
+                logger.info(f"Previous return stats - mean: {self.env.ret_rms.mean}, var: {self.env.ret_rms.var}")
+                # Initialize with values that better match phase 2 expectations
+                self.env.ret_rms.var = np.ones_like(self.env.ret_rms.var) * 200.0  # Increased variance
+                # Don't reset mean completely, but reduce its influence
+                self.env.ret_rms.mean = self.env.ret_rms.mean * 0.2
+                self.env.ret_rms.count = 20  # Low count for faster adaptation but not complete reset
+                logger.info(f"Modified return stats - mean: {self.env.ret_rms.mean}, var: {self.env.ret_rms.var}")
+
+            # Part 2: Partial reset of value function while preserving policy
+            if hasattr(self.model, 'policy'):
+                if hasattr(self.model.policy, 'value_net'):
+                    # Only reset the final layer weights (not the full network)
+                    for name, param in self.model.policy.value_net.named_parameters():
+                        if 'weight' in name or 'bias' in name:
+                            # Partially reset parameters - preserve some structure but allow adaptation
+                            param.data = param.data * 0.1 + torch.randn_like(param.data) * 0.01
+                            logger.info(f"Partially reset value network layer: {name}")
+                # If using separate value function head (common in PPO)
+                elif hasattr(self.model.policy, 'value_head') or hasattr(self.model.policy, 'vf_head'):
+                    value_head = getattr(self.model.policy, 'value_head', None) or getattr(self.model.policy, 'vf_head', None)
+                    if value_head is not None:
+                        for name, param in value_head.named_parameters():
+                            if 'weight' in name or 'bias' in name:
+                                param.data = param.data * 0.1 + torch.randn_like(param.data) * 0.01
+                                logger.info(f"Partially reset value head layer: {name}")
+                # If custom architecture is used
+                elif hasattr(self.model.policy, 'critic'):
+                    for name, param in self.model.policy.critic.named_parameters():
+                        if 'weight' in name or 'bias' in name:
+                            param.data = param.data * 0.1 + torch.randn_like(param.data) * 0.01
+                            logger.info(f"Partially reset critic layer: {name}")
+                else:
+                    logger.warning("Could not identify value function network to reset. Architecture may be custom.")
+        else:
+            logger.info(f"Skipping hybrid fix (only needed for Phase 1 to 2 transition, current: Phase {current_phase} to {next_phase})")
+
         # Define phase-specific timesteps
         steps_per_phase = {
             1: 500000,    # Phase 1: 0-500K
@@ -2159,12 +2119,12 @@ class TradingSystem:
             8: 2000000,   # Phase 8: 7M-9M
             9: 1000000    # Phase 9: 9M-10M
         }
-        
+
         # Set additional_timesteps if not explicitly provided
-        if additional_timesteps is None:
+        if additional_timesteps is None and next_phase is not None:
             additional_timesteps = steps_per_phase.get(next_phase, 1000000)
             logger.info(f"Using phase-specific timesteps for Phase {next_phase}: {additional_timesteps}")
-        
+
         # Apply training_mode and verbose settings to environment if args provided
         if args and (hasattr(args, 'training_mode') or hasattr(args, 'verbose')):
             training_mode = args.training_mode if hasattr(args, 'training_mode') else False
@@ -2178,18 +2138,18 @@ class TradingSystem:
                     self.env.env_method("update_parameters", training_mode=training_mode)
                 if hasattr(args, 'verbose'):
                     self.env.env_method("update_parameters", verbose=verbose)
-        
-        # Check for recommendations from previous phase
+
+        # Check for recommended hyperparameters if transitioning between phases
+        recommendations = {}
         use_recommendations = False
         if args and hasattr(args, 'use_recommendations'):
             use_recommendations = args.use_recommendations
         else:
             # Default to using recommendations for phase transitions
-            use_recommendations = True
+            use_recommendations = current_phase is not None and next_phase is not None
         
         # Try to load recommended hyperparameters if phase is changing and no explicit hyperparams provided
-        recommendations = {}
-        if use_recommendations and (hyperparams is None or not hyperparams) and current_phase < 9:
+        if use_recommendations and (hyperparams is None or not hyperparams) and current_phase is not None and current_phase < 9:
             recommendation_file = os.path.join(os.path.dirname(model_path), f"phase{next_phase}_recommendations.json")
             if os.path.exists(recommendation_file):
                 try:
@@ -2199,7 +2159,7 @@ class TradingSystem:
                     hyperparams = recommendations
                 except Exception as e:
                     logger.warning(f"Failed to load recommended hyperparameters: {str(e)}")
-        
+
         # Merge provided hyperparams with recommendations, with provided values taking precedence
         if hyperparams and recommendations:
             for k, v in recommendations.items():

@@ -1,5 +1,7 @@
 # Quantum AI Trading System
 
+<!-- ./scripts/manual_incremental.sh init 500000 --training-mode --drive-ids-file drive_file_ids.json  -->
+
 A sophisticated AI-powered perpetual futures trading system that utilizes multiple data sources and advanced machine learning techniques to make trading decisions across multiple cryptocurrencies. The system employs a hierarchical reinforcement learning approach with attention mechanisms to process various types of data and generate trading signals.
 
 ## Trading Strategies
