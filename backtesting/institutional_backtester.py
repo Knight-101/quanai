@@ -1238,6 +1238,38 @@ class InstitutionalBacktester:
                         portfolio_value = info.get('portfolio_value', episode_portfolio[-1])
                         episode_portfolio.append(portfolio_value)
                         
+                        # NEW: Add periodic portfolio logging every 1000 steps
+                        if step_count % 1000 == 0:
+                            # Log portfolio summary regardless of verbose setting
+                            logger.info(f"\n==== PORTFOLIO SUMMARY - STEP {step_count} ====")
+                            logger.info(f"Portfolio Value: ${portfolio_value:.2f} | Balance: ${info.get('balance', 0):.2f}")
+                            
+                            # Log position details if available
+                            if 'positions' in info:
+                                positions = info['positions']
+                                if positions:
+                                    logger.info("Current Positions:")
+                                    for asset, pos in positions.items():
+                                        size = pos.get('size', 0)
+                                        # Only log non-zero positions
+                                        if abs(size) > 1e-8:
+                                            entry_price = pos.get('entry_price', 0)
+                                            # Get current price if available
+                                            current_price = self._get_mark_price(asset) if hasattr(self, '_get_mark_price') else None
+                                            direction = "LONG" if size > 0 else "SHORT"
+                                            
+                                            position_value = abs(size * (current_price or entry_price))
+                                            logger.info(f"  {asset}: {direction} {abs(size):.6f} @ ${entry_price:.2f} | Value: ${position_value:.2f}")
+                                else:
+                                    logger.info("No open positions")
+                            
+                            # Log risk metrics if available
+                            if 'risk_metrics' in info:
+                                risk = info['risk_metrics']
+                                logger.info(f"Leverage: {risk.get('gross_leverage', 0):.2f}x | Drawdown: {risk.get('current_drawdown', 0)*100:.2f}%")
+                            
+                            logger.info("======================================\n")
+                        
                         # Track returns
                         if len(episode_portfolio) >= 2:
                             returns = (episode_portfolio[-1] / episode_portfolio[-2]) - 1

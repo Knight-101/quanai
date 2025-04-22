@@ -2788,6 +2788,29 @@ class InstitutionalPerpetualEnv(gym.Env):
         # Calculate portfolio value first to use it later
         portfolio_value = self._calculate_portfolio_value()
         
+        # Collect trades from this step
+        current_trades = []
+        if hasattr(self, 'position_changes_this_step') and self.position_changes_this_step > 0:
+            # Extract trades from trades_history that occurred in the current step
+            if hasattr(self, 'trades_history'):
+                current_trades = [trade for trade in self.trades_history if trade.get('timestamp') == self.current_step]
+                # If no trades found but we know position changes happened, create synthetic trades
+                if not current_trades and self.position_changes_this_step > 0:
+                    for asset, position in self.positions.items():
+                        # Skip positions that haven't changed
+                        if not hasattr(position, 'last_size_change') or position.get('last_size_change') != self.current_step:
+                            continue
+                        
+                        # Create a synthetic trade record
+                        current_trades.append({
+                            'asset': asset,
+                            'timestamp': self.current_step,
+                            'size_change': position.get('size', 0),  # Current size is the change from zero
+                            'price': position.get('entry_price', self._get_mark_price(asset)),
+                            'type': 'synthetic',
+                            'generated': 'backtest'
+                        })
+        
         info = {
             'step': self.current_step,
             'portfolio_value': portfolio_value,
@@ -2798,8 +2821,8 @@ class InstitutionalPerpetualEnv(gym.Env):
                           for asset, pos in self.positions.items()},
             'total_trades': len(self.trades),
             'risk_metrics': risk_metrics,
-            # Add the latest trades from trades_history to the info dictionary
-            'trades': [trade for trade in getattr(self, 'trades_history', []) if trade.get('timestamp') == self.current_step]
+            # Include trades from this step
+            'trades': current_trades
         }
         
         # ENHANCED: Add position durations to info
