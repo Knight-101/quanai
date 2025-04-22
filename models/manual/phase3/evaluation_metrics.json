@@ -1,0 +1,11 @@
+{
+    "mean_reward": -0.028654854744672775,
+    "reward_sharpe": -3.2278748653737086,
+    "max_drawdown": 0.07223746140050757,
+    "avg_leverage": 8.276739971752965,
+    "avg_sharpe": -5.4611528734286034,
+    "avg_sortino": -11.08096651542537,
+    "avg_calmar": -0.05825543218845531,
+    "objective_value": -1.0,
+    "trades_executed": 289
+}
