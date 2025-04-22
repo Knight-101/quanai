@@ -1890,7 +1890,7 @@ class InstitutionalBacktester:
                 start_date=regime_start,
                 end_date=regime_end,
                 assets=self.assets,
-                config_path=os.path.join(self.config['data']['cache_dir'], 'config/prod_config.yaml')
+                config_path=self.config_path
             )
             
             # Use the same model and data
@@ -2356,7 +2356,7 @@ class InstitutionalBacktester:
                 start_date=start_date.strftime('%Y-%m-%d'),
                 end_date=end_date.strftime('%Y-%m-%d'),
                 assets=self.assets,
-                config_path=os.path.join(self.config['data']['cache_dir'], 'config/prod_config.yaml')
+                config_path=self.config_path
             )
             
             # Use the same model
