@@ -911,12 +911,26 @@ class InstitutionalBacktester:
                 logger.info(f"Loading normalization statistics from {self.env_path}")
                 vec_norm_env = VecNormalize.load(self.env_path, vec_env)
                 
+                # Add debug information about the loaded environment
+                logger.info(f"Loaded environment with norm_obs={vec_norm_env.norm_obs}, "
+                           f"norm_reward={vec_norm_env.norm_reward}, "
+                           f"clip_obs={vec_norm_env.clip_obs}, "
+                           f"clip_reward={vec_norm_env.clip_reward}, "
+                           f"norm_obs_keys={getattr(vec_norm_env, 'norm_obs_keys', None)}")
+                
                 # Disable training-related features for backtesting
                 vec_norm_env.training = False  # No updates to normalization stats
                 vec_norm_env.norm_reward = False  # Use raw rewards for evaluation
+                
+                # Ensure we're getting back the correct environment type
+                if not isinstance(vec_norm_env, VecNormalize):
+                    logger.error(f"Loaded environment is not a VecNormalize, got {type(vec_norm_env)}")
+                    vec_norm_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, training=False)
+                
                 logger.info("Environment loaded with existing normalization statistics")
             except Exception as e:
-                logger.warning(f"Error loading environment, creating new one: {str(e)}")
+                logger.error(f"Error loading environment, creating new one: {str(e)}")
+                logger.error(traceback.format_exc())  # Print full traceback for more detailed diagnosis
                 vec_norm_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, training=False)
         else:
             logger.info("Creating new environment with default normalization")
@@ -1121,7 +1135,14 @@ class InstitutionalBacktester:
                         # Process trades if any
                         if 'trades' in info:
                             trades = info['trades']
+                            
+                            # Debug log how many trades were returned
+                            logger.info(f"Step {step_count}: Found {len(trades)} trade(s) in info dictionary")
+                            
                             for trade in trades:
+                                # Log raw trade data for debugging
+                                logger.debug(f"Raw trade data: {trade}")
+                                
                                 # Sanitize trade data for JSON serialization
                                 sanitized_trade = {}
                                 for key, value in trade.items():
@@ -1248,7 +1269,20 @@ class InstitutionalBacktester:
                     
                     logger.info(f"Episode {episode+1} completed with {step_count} steps")
                     logger.info(f"Final portfolio value: ${episode_portfolio[-1]:.2f}")
-                    logger.info(f"Number of trades: {len(episode_trades)}")
+                    
+                    # Analyze trade activity
+                    if episode_trades:
+                        # Calculate trade statistics
+                        buy_trades = len([t for t in episode_trades if t.get('size_change', 0) > 0])
+                        sell_trades = len([t for t in episode_trades if t.get('size_change', 0) < 0])
+                        avg_trade_size = sum(abs(t.get('size_change', 0)) for t in episode_trades) / len(episode_trades) if episode_trades else 0
+                        total_costs = sum(t.get('cost', 0) for t in episode_trades)
+                        
+                        # Log trade statistics
+                        logger.info(f"Trade statistics - Total: {len(episode_trades)}, Buy: {buy_trades}, Sell: {sell_trades}")
+                        logger.info(f"Avg trade size: {avg_trade_size:.4f}, Total costs: ${total_costs:.2f}")
+                    else:
+                        logger.warning("No trades recorded for this episode!")
                     
                     # Store episode results
                     all_portfolio_values.append(episode_portfolio)

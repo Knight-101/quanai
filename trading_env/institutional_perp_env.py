@@ -254,6 +254,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         
         # Trading history
         self.trades = []
+        self.trades_history = []  # Record detailed trade information
         self.portfolio_history = [{'step': 0, 'value': self.initial_balance}]
         
         # Track historical performance with deques
@@ -2796,7 +2797,9 @@ class InstitutionalPerpetualEnv(gym.Env):
             'positions': {asset: {'size': pos['size'], 'entry_price': pos['entry_price']} 
                           for asset, pos in self.positions.items()},
             'total_trades': len(self.trades),
-            'risk_metrics': risk_metrics
+            'risk_metrics': risk_metrics,
+            # Add the latest trades from trades_history to the info dictionary
+            'trades': [trade for trade in getattr(self, 'trades_history', []) if trade.get('timestamp') == self.current_step]
         }
         
         # ENHANCED: Add position durations to info
