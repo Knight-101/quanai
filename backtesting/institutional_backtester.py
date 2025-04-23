@@ -1136,8 +1136,9 @@ class InstitutionalBacktester:
                         if 'trades' in info:
                             trades = info['trades']
                             
-                            # Debug log how many trades were returned
-                            logger.info(f"Step {step_count}: Found {len(trades)} trade(s) in info dictionary")
+                            # Only log when trades are actually found
+                            if trades and len(trades) > 0:
+                                logger.info(f"Step {step_count}: Found {len(trades)} trade(s) in info dictionary")
                             
                             for trade in trades:
                                 # Log raw trade data for debugging

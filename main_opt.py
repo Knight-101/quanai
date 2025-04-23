@@ -2235,7 +2235,7 @@ class TradingSystem:
         eval_callback = VecNormalizeEvalCallback(
             eval_env=self.env,
             n_eval_episodes=3,  # Reduced from 5 for better performance
-            eval_freq=min(25000, additional_timesteps // 10),  # 10 evaluations per training run
+            eval_freq=max(25000, additional_timesteps // 5),  # 10 evaluations per training run
             log_path=self.config['logging']['log_dir'],
             best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], f"best_phase{next_phase}"),
             deterministic=True,

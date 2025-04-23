@@ -369,6 +369,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.historical_leverage = deque(maxlen=10000)
         self.portfolio_history = [{'step': 0, 'value': self.initial_balance}]
         self.trades = []  # Clear trade history
+        self.trades_history = []  # CRITICAL FIX: Initialize trades_history
         
         # IMPORTANT FIX: Initialize funding rates and accrued funding
         self.funding_rates = {asset: 0.0 for asset in self.assets}
@@ -1975,14 +1976,16 @@ class InstitutionalPerpetualEnv(gym.Env):
                     else:
                         portfolio_return = -0.1  # Cap negative return at -10%
             
-            # IMPROVED: More sophisticated return scaling with asymmetric payoffs
-            # Use a non-linear scaling to encourage small wins and discourage large losses
+            # IMPROVED: More balanced reward structure with linear scaling and tiered incentives
             if portfolio_return > 0:
-                # For positive returns: reward sqrt(return) to encourage consistent small wins
-                base_reward = np.sqrt(portfolio_return) * 10.0
+                # Linear scaling for moderate returns, with bonus for exceptional returns
+                if portfolio_return < 0.005:  # Under 0.5%
+                    base_reward = portfolio_return * 15.0
+                else:  # 0.5% or higher
+                    base_reward = (0.005 * 15.0) + ((portfolio_return - 0.005) * 25.0)
             else:
-                # For negative returns: penalize quadratically to discourage large losses
-                base_reward = -np.sqrt(abs(portfolio_return)) * 7.0  # Reduced from 10.0 to 7.0 - less punishment
+                # For negative returns: slightly reduced penalty
+                base_reward = -np.sqrt(abs(portfolio_return)) * 6.0
             
             # Risk-adjusted components with more emphasis on risk management
             sharpe = risk_metrics.get('sharpe_ratio', 0)
@@ -3475,9 +3478,15 @@ class InstitutionalPerpetualEnv(gym.Env):
             
             # For verbose logging
             if self.verbose:
-                logger.info(f"Leverage calculation for signal {signal:.2f}: base={base_leverage:.2f}, vol_scale={vol_scale:.2f}, regime_scale={regime_scale:.2f}, final={final_leverage:.2f}x")
+                logger.info(f"Leverage calculation for signal {signal:.2f}: base={base_leverage:.2f}, vol_scale={vol_scale:.2f}, regime_scale={regime_scale:.2f}, final={effective_leverage:.2f}x")
                 if direction < 0:
                     logger.info(f"Short position: direction={direction}, leverage={effective_leverage:.2f}x")
+            
+            # CRITICAL FIX: Enforce minimum leverage of 1.0x for backtesting consistency
+            if effective_leverage > 0 and effective_leverage < 1.0:
+                effective_leverage = 1.0
+                if self.verbose:
+                    logger.info(f"Enforcing minimum leverage of 1.0x for {asset} (was {final_leverage:.2f}x)")
             
             return effective_leverage * direction
             
