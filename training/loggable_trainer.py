@@ -128,7 +128,7 @@ class LoggableTrainer(Trainer):
             data_collator: Data collator
             train_dataset: Training dataset
             eval_dataset: Evaluation dataset
-            tokenizer: Tokenizer
+            tokenizer: Tokenizer (deprecated, will be used as processing_class)
             model_init: Model initialization function
             compute_metrics: Metrics computation function
             callbacks: List of callbacks
@@ -136,14 +136,14 @@ class LoggableTrainer(Trainer):
             log_gradients: Whether to log gradients
             log_every_n_steps: Frequency of gradient logging
         """
-        # Initialize parent class
+        # Initialize parent class with tokenizer as processing_class to prevent deprecation warning
         super().__init__(
             model=model,
             args=args,
             data_collator=data_collator,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,  # Use tokenizer as processing_class
             model_init=model_init,
             compute_metrics=compute_metrics,
             callbacks=callbacks,
@@ -163,10 +163,10 @@ class LoggableTrainer(Trainer):
         self.steps_since_last_log = 0
         self.loss_since_last_log = 0.0
     
-    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
+    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval, prediction_loss_only=None, step=None):
         """Override to add more detailed logging"""
         # Call parent implementation
-        output = super()._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+        output = super()._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval, prediction_loss_only, step)
         
         # Track loss and performance
         if self.control.should_log:
@@ -227,10 +227,10 @@ class LoggableTrainer(Trainer):
             
         return output
     
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items_in_batch=None):
         """Override training step to track performance metrics"""
         # Call parent implementation
-        loss = super().training_step(model, inputs)
+        loss = super().training_step(model, inputs, num_items_in_batch)
         
         # Update counters
         self.steps_since_last_log += 1

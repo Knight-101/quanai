@@ -115,7 +115,7 @@ class TradingLLM:
                 "token": True,  # Enable token-based authentication for gated models
             }
             
-            # Enable Flash Attention 2 for faster training if supported
+            
             if self.use_flash_attn:
                 try:
                     model_kwargs["attn_implementation"] = "flash_attention_2"
@@ -131,7 +131,13 @@ class TradingLLM:
             
             # Enable gradient checkpointing for memory efficiency if requested
             if self.use_gradient_checkpointing:
-                self.model.gradient_checkpointing_enable()
+                # Set use_cache=False when using gradient checkpointing
+                if hasattr(self.model.config, "use_cache"):
+                    self.model.config.use_cache = False
+                    logger.info("Disabled model cache for gradient checkpointing compatibility")
+                
+                # Enable gradient checkpointing with explicit use_reentrant parameter
+                self.model.gradient_checkpointing_enable(use_reentrant=False)
                 logger.info("Gradient checkpointing enabled for memory efficiency")
             
             # Configure generation parameters optimized for Llama-3
@@ -202,7 +208,8 @@ class TradingLLM:
             if self.load_in_8bit or self.load_in_4bit:
                 self.model = prepare_model_for_kbit_training(
                     self.model,
-                    use_gradient_checkpointing=self.use_gradient_checkpointing
+                    use_gradient_checkpointing=self.use_gradient_checkpointing,
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
                 )
             
             # Apply LoRA to model

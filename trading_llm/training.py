@@ -196,7 +196,7 @@ class TradingTrainer:
             per_device_train_batch_size=self.train_dataloader.batch_size,
             per_device_eval_batch_size=self.val_dataloader.batch_size if self.val_dataloader else self.train_dataloader.batch_size,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
-            eval_steps=self.eval_steps,
+            eval_steps=self.eval_steps if self.val_dataloader else None,
             save_steps=self.save_steps,
             logging_steps=self.logging_steps,
             learning_rate=self.learning_rate,
@@ -213,7 +213,10 @@ class TradingTrainer:
             load_best_model_at_end=True if self.val_dataloader else False,
             metric_for_best_model="eval_loss" if self.val_dataloader else None,
             greater_is_better=False if self.val_dataloader else None,
-            logging_first_step=True
+            logging_first_step=True,
+            # Use eval_strategy instead of evaluation_strategy (deprecated)
+            eval_strategy="steps" if self.val_dataloader else "no",
+            save_strategy="steps",
         )
         
         # Create trainer

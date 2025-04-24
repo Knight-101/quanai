@@ -636,9 +636,24 @@ class TradingDatasetGenerator:
                         continue
                     
                     # Skip if action is too close to neutral
-                    action_value = action[0] if isinstance(action, np.ndarray) and len(action) > 0 else 0.0
+                    action_value = action[0] if isinstance(action, np.ndarray) and len(action) > 0 else action
                     if abs(action_value) < min_action_threshold:
                         continue
+                    
+                    # Calculate leverage and direction based on action value (matches the trading environment logic)
+                    # This is critical for correct LLM training data
+                    signal_strength = abs(action_value)
+                    direction = 1 if action_value > 0 else (-1 if action_value < 0 else 0)
+                    
+                    # Calculate leverage similar to the trading environment's _get_target_leverage method
+                    min_leverage = 1.0
+                    max_leverage = 5.0  # Conservative default
+                    leverage = min_leverage + (max_leverage - min_leverage) * (signal_strength ** 1.5)
+                    leverage = max(1.0, min(leverage, max_leverage))
+                    
+                    # Create action vector that includes direction, signal strength, and calculated leverage
+                    # Format: [direction, action_value, leverage]
+                    formatted_action = [float(direction), float(action_value), float(leverage)]
                     
                     # Extract technical indicators for the last candle (safely)
                     tech_indicators = {}
@@ -678,11 +693,9 @@ class TradingDatasetGenerator:
                         observation_list = observation.tolist()
                     except (AttributeError, TypeError):
                         observation_list = [float(x) for x in observation]
-                        
-                    try:
-                        action_list = action.tolist()
-                    except (AttributeError, TypeError):
-                        action_list = [float(x) for x in action]
+                    
+                    # Store the formatted action list (direction, raw_action, leverage)
+                    action_list = formatted_action
                     
                     sample = {
                         'symbol': symbol,
@@ -1007,34 +1020,53 @@ class TradingDatasetGenerator:
         Generate a natural language explanation for a trading decision
         
         Args:
-            observation: Flat observation array from the environment
-            action: Action array from the RL policy (containing leverage values)
+            observation: Observation array from the environment
+            action: Action array from the RL policy (values in range [-1,1] that determine direction and signal strength)
             technical_indicators: Dictionary of technical indicators
             
         Returns:
             Natural language explanation of the trading decision
         """
         try:
-            # Determine action type based on leverage value
-            # Assuming action is a leverage value where:
+            # Process action value from RL model
+            action_value = float(action[0]) if isinstance(action, np.ndarray) and len(action) > 0 else float(action)
+            
+            # Determine action type and direction based on signal value
+            # In the trading environment, the sign of the action indicates direction:
             # - Positive values = Long position
             # - Negative values = Short position
             # - Near zero values = Hold/no position
-            action_value = action[0] if isinstance(action, np.ndarray) else action
+            signal_strength = abs(action_value)
+            direction = 1 if action_value > 0 else (-1 if action_value < 0 else 0)
             
-            if action_value > 0.1:
-                action_type = "buy"
-            elif action_value < -0.1:
-                action_type = "sell"
-            else:
+            # Determine trade decision based on signal strength threshold (matches the environment's threshold)
+            signal_threshold = 0.1  # Same as environment's default signal_threshold
+            
+            if signal_strength < signal_threshold:
                 action_type = "hold"
+                # No direction for hold
+                direction = 0
+            else:
+                action_type = "buy" if direction > 0 else "sell"
+            
+            # Calculate leverage based on signal strength - matching the environment's _get_target_leverage logic
+            if signal_strength < signal_threshold:
+                leverage = 0.0
+            else:
+                # Base leverage calculation (simplified version of what the environment does)
+                min_leverage = 1.0
+                max_leverage = 5.0  # Conservative value, actual trading env uses higher values
+                
+                # Calculate base leverage using similar scaling as the trading environment
+                leverage = min_leverage + (max_leverage - min_leverage) * (signal_strength ** 1.5)
+                leverage = max(1.0, min(leverage, max_leverage))  # Ensure leverage is at least 1.0 and at most max_leverage
             
             # Format technical indicators for explanation
             tech_indicators_str = ""
             if technical_indicators:
                 # Select just a few important indicators to include in the explanation
                 important_indicators = {}
-                indicator_preference = ['RSI_14', 'MACD', 'SMA_10', 'SMA_20', 'BB_upper', 'BB_lower']
+                indicator_preference = ['RSI_14', 'MACD', 'SMA_10', 'SMA_20', 'SMA_50', 'BB_upper', 'BB_lower']
                 
                 # First add preferred indicators if they exist
                 for ind in indicator_preference:
@@ -1063,32 +1095,39 @@ class TradingDatasetGenerator:
             # Create explanation templates based on action type
             templates = {
                 "buy": [
-                    "Based on the recent price movement and {indicators}, I'm going long with a leverage of {leverage:.2f}x. The market seems to be in an uptrend.",
-                    "The technical indicators {indicators} suggest bullish momentum. I'm taking a long position with {leverage:.2f}x leverage.",
-                    "I'm entering a long position with {leverage:.2f}x leverage as the {indicators} indicate potential upside.",
-                    "The market conditions look favorable for a long position. Using {leverage:.2f}x leverage based on {indicators}."
+                    "Based on the recent price movement and RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}, I'm going long with a leverage of {leverage:.2f}x. The market seems to be in an uptrend.",
+                    "The technical indicators RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} suggest bullish momentum. I'm taking a long position with {leverage:.2f}x leverage.",
+                    "I'm entering a long position with {leverage:.2f}x leverage as the RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} indicate potential upside.",
+                    "The market conditions look favorable for a long position. Using {leverage:.2f}x leverage based on RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}."
                 ],
                 "sell": [
-                    "Based on the recent price movement and {indicators}, I'm going short with a leverage of {leverage:.2f}x. The market seems to be in a downtrend.",
-                    "The technical indicators {indicators} suggest bearish momentum. I'm taking a short position with {leverage:.2f}x leverage.",
-                    "I'm entering a short position with {leverage:.2f}x leverage as the {indicators} indicate potential downside.",
-                    "The market conditions look unfavorable. Using {leverage:.2f}x leverage to short based on {indicators}."
+                    "Based on the recent price movement and RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}, I'm going short with a leverage of {leverage:.2f}x. The market seems to be in a downtrend.",
+                    "The technical indicators RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} suggest bearish momentum. I'm taking a short position with {leverage:.2f}x leverage.",
+                    "I'm entering a short position with {leverage:.2f}x leverage as the RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} indicate potential downside.",
+                    "The market conditions look unfavorable. Using {leverage:.2f}x leverage to short based on RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}."
                 ],
                 "hold": [
-                    "Based on the current market conditions and {indicators}, I'm holding my position as there's no clear directional signal.",
-                    "The technical indicators {indicators} are mixed. I'm maintaining a neutral position for now.",
-                    "I'm staying neutral as the {indicators} don't provide a strong directional bias.",
-                    "Market conditions don't favor a strong directional bet right now based on {indicators}. Maintaining a neutral stance."
+                    "Based on the current market conditions and RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}, I'm holding my position as there's no clear directional signal.",
+                    "The technical indicators RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} are mixed. I'm maintaining a neutral position for now.",
+                    "I'm staying neutral as the RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} don't provide a strong directional bias.",
+                    "Market conditions don't favor a strong directional bet right now based on RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}. Maintaining a neutral stance."
                 ]
             }
+            
+            # Get indicator values with safe defaults
+            rsi_val = technical_indicators.get('RSI_14', 50.0) if technical_indicators else 50.0
+            macd_val = technical_indicators.get('MACD', 0.0) if technical_indicators else 0.0
+            sma20_val = technical_indicators.get('SMA_20', 0.0) if technical_indicators else 0.0
             
             # Select a random template for the action type
             template = random.choice(templates[action_type])
             
             # Format template with actual values
             explanation = template.format(
-                leverage=abs(action_value),
-                indicators=tech_indicators_str or "current market conditions"
+                leverage=leverage,
+                rsi=rsi_val,
+                macd=macd_val,
+                sma20=sma20_val
             )
             
             return explanation
