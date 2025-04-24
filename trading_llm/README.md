@@ -46,7 +46,7 @@ python -m trading_llm.train_llm generate \
     --rl-model /path/to/your/rl_model.zip \
     --market-data /path/to/market_data.parquet \
     --output-dir ./data/trading_llm_dataset \
-    --num-samples 5000
+    --num-samples 1000
 ```
 
 ### 2. Train the LLM

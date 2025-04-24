@@ -12,95 +12,172 @@ from pathlib import Path
 import pandas as pd
 import torch
 from typing import Optional
+import json
+import numpy as np
+from stable_baselines3 import PPO
+import traceback
 
-from trading_llm.dataset import TradingDatasetGenerator
+from trading_llm.dataset import TradingDatasetGenerator, create_dataloaders
 from trading_llm.training import train_llm_model, TrainingArgs
-from trading_llm.inference import RLLMExplainer, generate_market_commentary, MarketCommentaryGenerator
+from trading_llm.inference import RLLMExplainer, generate_market_commentary, MarketCommentaryGenerator, extract_trading_signals
 from trading_llm.model import TradingLLM
 from trading_llm.chatbot import load_market_chatbot
 from trading_llm.utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
+def load_multi_asset_data():
+    """
+    Load and combine market data from BTC, ETH, and SOL into a single multi-asset dataset.
+    
+    Returns:
+        DataFrame with combined market data for all assets
+    """
+    logger.info("Loading and combining multi-asset data...")
+    
+    # Hardcoded paths for the three assets
+    btc_path = "market_data/binance_BTCUSDT_5m.parquet"
+    eth_path = "market_data/binance_ETHUSDT_5m.parquet"
+    sol_path = "market_data/binance_SOLUSDT_5m.parquet"
+    
+    # Ensure all paths exist
+    for path in [btc_path, eth_path, sol_path]:
+        if not os.path.exists(path):
+            logger.error(f"Market data file not found: {path}")
+            raise FileNotFoundError(f"Market data file not found: {path}")
+    
+    try:
+        # Load individual files
+        btc = pd.read_parquet(btc_path)
+        btc['asset'] = 'BTC'
+        eth = pd.read_parquet(eth_path)
+        eth['asset'] = 'ETH'
+        sol = pd.read_parquet(sol_path)
+        sol['asset'] = 'SOL'
+        
+        # Ensure all have the same structure
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        for df, asset in [(btc, 'BTC'), (eth, 'ETH'), (sol, 'SOL')]:
+            # Convert all column names to lowercase
+            df.columns = df.columns.str.lower()
+            # Check for required columns
+            missing = [col for col in required_columns if col not in df.columns]
+            if missing:
+                raise ValueError(f"Missing required columns in {asset} data: {missing}")
+        
+        # Determine common columns (excluding 'asset' which we just added)
+        common_cols = list(set(btc.columns) & set(eth.columns) & set(sol.columns))
+        common_cols.remove('asset')  # Remove asset since we'll add it back
+        common_cols = ['asset'] + common_cols  # Add asset as the first column
+        
+        # Combine datasets using common columns
+        combined = pd.concat([
+            btc[common_cols], 
+            eth[common_cols], 
+            sol[common_cols]
+        ])
+        
+        # Sort by timestamp if available
+        if 'timestamp' in combined.columns:
+            combined.sort_values('timestamp', inplace=True)
+        
+        # Save combined dataset to a temporary file
+        os.makedirs('combined_data', exist_ok=True)
+        combined_path = 'combined_data/multi_asset_data.parquet'
+        combined.to_parquet(combined_path)
+        
+        logger.info(f"Created combined dataset with {len(combined)} rows from BTC, ETH, and SOL data")
+        logger.info(f"Saved to {combined_path}")
+        
+        return combined_path
+    
+    except Exception as e:
+        logger.error(f"Error combining market data: {str(e)}")
+        raise
+
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Trading LLM CLI")
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    parser = argparse.ArgumentParser(description="Trading LLM Training and Inference")
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    subparsers.required = True
+    
+    # Common arguments
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
+    parser.add_argument("--log-file", help="Log file path")
     
     # Dataset generation command
     generate_parser = subparsers.add_parser("generate", help="Generate training dataset")
     generate_parser.add_argument("--rl-model", required=True, help="Path to trained RL model")
-    generate_parser.add_argument("--market-data", required=True, help="Path to market data file")
+    # Use combined dataset by default
+    generate_parser.add_argument("--market-data", default="auto", help="Path to market data file or 'auto' to use combined multi-asset data")
     generate_parser.add_argument("--output-dir", required=True, help="Output directory for dataset")
-    generate_parser.add_argument("--num-samples", type=int, default=10000, help="Number of samples to generate")
+    generate_parser.add_argument("--num-samples", type=int, default=1000, help="Number of samples to generate")
     generate_parser.add_argument("--split-ratio", type=float, default=0.9, help="Train/eval split ratio")
     generate_parser.add_argument("--window-size", type=int, default=100, help="Window size for market data")
     generate_parser.add_argument("--templates", help="Path to custom templates file")
     
     # Training command
     train_parser = subparsers.add_parser("train", help="Train LLM model")
-    train_parser.add_argument("--base-model", required=True, help="Base model name or path")
+    train_parser.add_argument("--base-model", required=True, help="Base model to fine-tune")
     train_parser.add_argument("--train-data", required=True, help="Path to training data")
-    train_parser.add_argument("--eval-data", help="Path to evaluation data (optional)")
+    train_parser.add_argument("--eval-data", help="Path to evaluation data")
     train_parser.add_argument("--output-dir", required=True, help="Output directory for trained model")
-    train_parser.add_argument("--num-epochs", type=int, default=5, help="Number of training epochs")
+    train_parser.add_argument("--num-epochs", type=int, default=3, help="Number of training epochs")
     train_parser.add_argument("--batch-size", type=int, default=8, help="Training batch size")
     train_parser.add_argument("--learning-rate", type=float, default=2e-4, help="Learning rate")
-    train_parser.add_argument("--gradient-accumulation-steps", type=int, default=4, help="Gradient accumulation steps")
-    train_parser.add_argument("--lora-r", type=int, default=32, help="LoRA attention dimension")
-    train_parser.add_argument("--lora-alpha", type=int, default=64, help="LoRA alpha parameter")
-    train_parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout")
-    train_parser.add_argument("--warmup-ratio", type=float, default=0.1, help="Warmup ratio")
-    train_parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
+    train_parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Gradient accumulation steps")
     train_parser.add_argument("--max-steps", type=int, help="Maximum number of training steps")
-    train_parser.add_argument("--fp16", action="store_true", help="Use FP16 training")
-    train_parser.add_argument("--bf16", action="store_true", help="Use BF16 training")
+    train_parser.add_argument("--lora-r", type=int, default=8, help="LoRA r parameter")
+    train_parser.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha parameter")
+    train_parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout")
+    train_parser.add_argument("--warmup-ratio", type=float, default=0.03, help="Warmup ratio")
+    train_parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
+    train_parser.add_argument("--fp16", action="store_true", help="Use FP16 precision")
+    train_parser.add_argument("--bf16", action="store_true", help="Use BF16 precision")
     train_parser.add_argument("--use-wandb", action="store_true", help="Use Weights & Biases for logging")
-    train_parser.add_argument("--wandb-project", help="W&B project name")
+    train_parser.add_argument("--wandb-project", default="trading_llm", help="W&B project name")
     train_parser.add_argument("--wandb-entity", help="W&B entity")
-    train_parser.add_argument("--early-stopping", type=int, default=3, help="Early stopping patience")
+    train_parser.add_argument("--early-stopping", type=int, help="Early stopping patience")
     train_parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Inference command
     infer_parser = subparsers.add_parser("infer", help="Run inference")
-    infer_parser.add_argument("--rl-model", required=True, help="Path to trained RL model")
-    infer_parser.add_argument("--llm-model", required=True, help="Path to trained LLM model")
-    infer_parser.add_argument("--market-data", required=True, help="Path to market data file")
+    infer_parser.add_argument("--rl-model", required=True, help="Path to RL model")
+    infer_parser.add_argument("--llm-model", required=True, help="Path to LLM model")
+    infer_parser.add_argument("--base-model", help="Base model for LLM (if needed)")
+    infer_parser.add_argument("--market-data", default="auto", help="Path to market data file or 'auto' to use combined multi-asset data")
+    infer_parser.add_argument("--input-file", help="Input file with observations")
     infer_parser.add_argument("--output-file", help="Output file for explanations")
-    infer_parser.add_argument("--base-model", help="Base model if using LoRA adapters")
-    infer_parser.add_argument("--input-file", help="Path to input file with observations")
     
     # Market commentary command
     commentary_parser = subparsers.add_parser("commentary", help="Generate market commentary")
-    commentary_parser.add_argument("--llm-model", required=True, help="Path to trained LLM model")
-    commentary_parser.add_argument("--market-data", required=True, help="Path to market data file")
-    commentary_parser.add_argument("--output-file", help="Output file for commentary")
-    commentary_parser.add_argument("--base-model", help="Base model if using LoRA adapters")
-    commentary_parser.add_argument("--symbol", help="Market symbol for single commentary")
-    commentary_parser.add_argument("--symbols-file", help="File with list of symbols for multi-market summary")
+    commentary_parser.add_argument("--llm-model", required=True, help="Path to LLM model")
+    commentary_parser.add_argument("--base-model", help="Base model for LLM (if needed)")
+    commentary_parser.add_argument("--market-data", default="auto", help="Path to market data file or 'auto' to use combined multi-asset data")
+    commentary_parser.add_argument("--symbol", help="Symbol to generate commentary for")
+    commentary_parser.add_argument("--symbols-file", help="File with list of symbols")
     commentary_parser.add_argument("--lookback-days", type=int, default=30, help="Number of days to look back")
-    commentary_parser.add_argument("--max-tokens", type=int, default=750, help="Maximum tokens for generation")
-    commentary_parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for generation")
+    commentary_parser.add_argument("--max-tokens", type=int, default=1024, help="Maximum tokens to generate")
+    commentary_parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    commentary_parser.add_argument("--output-file", help="Output file for commentary")
     
     # Chat command
-    chat_parser = subparsers.add_parser("chat", help="Run interactive market chatbot")
-    chat_parser.add_argument("--llm-model", required=True, help="Path to trained LLM model")
-    chat_parser.add_argument("--market-data", help="Path to market data file (optional)")
-    chat_parser.add_argument("--rl-model", help="Path to trained RL model (optional)")
-    chat_parser.add_argument("--max-history", type=int, default=5, help="Maximum conversation history length")
-    chat_parser.add_argument("--system-prompt", help="Custom system prompt (optional)")
-    chat_parser.add_argument("--base-model", help="Base model if using LoRA adapters")
-    
-    # Common arguments
-    for subparser in [generate_parser, train_parser, infer_parser, commentary_parser, chat_parser]:
-        subparser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-                              help="Logging level")
-        subparser.add_argument("--log-file", help="Path to log file")
+    chat_parser = subparsers.add_parser("chat", help="Start interactive chatbot")
+    chat_parser.add_argument("--llm-model", required=True, help="Path to LLM model")
+    chat_parser.add_argument("--base-model", help="Base model for LLM (if needed)")
+    chat_parser.add_argument("--rl-model", help="Path to RL model (optional)")
+    chat_parser.add_argument("--market-data", default="auto", help="Path to market data file or 'auto' to use combined multi-asset data")
+    chat_parser.add_argument("--max-history", type=int, default=5, help="Maximum conversation history")
+    chat_parser.add_argument("--system-prompt", help="System prompt for the chatbot")
     
     return parser.parse_args()
 
 def load_market_data(path: str):
     """Load market data from CSV or Parquet file."""
+    # If auto mode is specified, generate combined data
+    if path == "auto":
+        path = load_multi_asset_data()
+    
     extension = os.path.splitext(path)[1].lower()
     if extension == '.csv':
         data = pd.read_csv(path)
@@ -125,16 +202,25 @@ def main():
     
     if args.command == "generate":
         logger.info("Generating training dataset")
+        
+        # Handle auto market data option
+        market_data_path = args.market_data
+        if market_data_path == "auto":
+            market_data_path = load_multi_asset_data()
+            logger.info(f"Using auto-generated combined market data: {market_data_path}")
+        
         generator = TradingDatasetGenerator(
             rl_model_path=args.rl_model,
-            market_data_path=args.market_data,
+            market_data_path=market_data_path,
             output_dir=args.output_dir,
             template_path=args.templates
         )
+        
         generator.generate_dataset(
             num_samples=args.num_samples, 
             window_size=args.window_size,
-            train_ratio=args.split_ratio
+            val_split=1.0 - args.split_ratio,
+            min_action_threshold=0.1  # Default threshold for filtering neutral actions
         )
         
     elif args.command == "train":
@@ -166,6 +252,13 @@ def main():
         
     elif args.command == "infer":
         logger.info("Running inference")
+        
+        # Handle auto market data option
+        market_data_path = args.market_data
+        if market_data_path == "auto":
+            market_data_path = load_multi_asset_data()
+            logger.info(f"Using auto-generated combined market data: {market_data_path}")
+        
         explainer = RLLMExplainer(
             rl_model_path=args.rl_model,
             llm_model_path=args.llm_model,
@@ -174,12 +267,11 @@ def main():
         
         # Load market data if provided
         raw_ohlcv = None
-        if args.market_data:
-            raw_ohlcv = load_market_data(args.market_data)
+        if market_data_path != "auto":
+            raw_ohlcv = load_market_data(market_data_path)
         
         # Load observations from file if provided
         if args.input_file:
-            import json
             with open(args.input_file, 'r') as f:
                 observations = json.load(f)
                 
@@ -199,7 +291,7 @@ def main():
                 print(f"Explanation: {results[0]['explanation']}")
         else:
             # Generate explanations from market data
-            explanations = explainer.explain_trading_decisions(args.market_data)
+            explanations = explainer.explain_trading_decisions(market_data_path)
             
             if args.output_file:
                 with open(args.output_file, 'w') as f:
@@ -213,6 +305,12 @@ def main():
     elif args.command == "commentary":
         logger.info("Generating market commentary")
         
+        # Handle auto market data option
+        market_data_path = args.market_data
+        if market_data_path == "auto":
+            market_data_path = load_multi_asset_data()
+            logger.info(f"Using auto-generated combined market data: {market_data_path}")
+        
         # Initialize commentary generator
         generator = MarketCommentaryGenerator(
             llm_model_path=args.llm_model,
@@ -221,13 +319,13 @@ def main():
         
         # Load market data
         market_data = {}
-        extension = os.path.splitext(args.market_data)[1].lower()
+        extension = os.path.splitext(market_data_path)[1].lower()
         if extension == '.csv':
             # Single market data file
-            market_data = {args.symbol or "default": pd.read_csv(args.market_data).iloc[-args.lookback_days:]}
+            market_data = {args.symbol or "default": pd.read_csv(market_data_path).iloc[-args.lookback_days:]}
         elif extension in ['.parquet', '.pq']:
             # Single market data file
-            market_data = {args.symbol or "default": pd.read_parquet(args.market_data).iloc[-args.lookback_days:]}
+            market_data = {args.symbol or "default": pd.read_parquet(market_data_path).iloc[-args.lookback_days:]}
         else:
             logger.error(f"Unsupported market data format: {extension}")
             sys.exit(1)
@@ -286,6 +384,12 @@ def main():
     elif args.command == "chat":
         logger.info("Starting interactive market chatbot")
         
+        # Handle auto market data option
+        market_data_path = args.market_data
+        if market_data_path == "auto":
+            market_data_path = load_multi_asset_data()
+            logger.info(f"Using auto-generated combined market data: {market_data_path}")
+        
         # Load the chatbot
         chatbot = load_market_chatbot(
             model_path=args.llm_model,
@@ -295,23 +399,19 @@ def main():
         )
         
         # Load market data if provided
-        if args.market_data:
-            market_data = load_market_data(args.market_data)
+        if market_data_path != "auto":
+            market_data = load_market_data(market_data_path)
             chatbot.update_market_data(market_data)
             print(f"Loaded market data with {len(market_data)} records")
         
         # Load RL model and get trading signals if provided
-        if args.rl_model and args.market_data:
-            from stable_baselines3 import PPO
-            from trading_llm.inference import extract_trading_signals
-            
+        if args.rl_model and market_data_path != "auto":
             model = PPO.load(args.rl_model)
             signals = extract_trading_signals(model, market_data)
             chatbot.update_trading_signals(signals)
             print("Loaded trading signals from RL model")
             
             # Calculate basic performance metrics
-            import numpy as np
             returns = np.diff(market_data['close'].values) / market_data['close'].values[:-1]
             portfolio_performance = {
                 "total_return": f"{np.sum(returns * np.array([s['position'] for s in signals.values()][:-1])):.4f}",
@@ -348,7 +448,7 @@ def main():
                 
             except Exception as e:
                 logger.error(f"Error in chat: {e}")
-                print(f"\nAn error occurred: {e}")
+                traceback.print_exc()  # Print full traceback for debugging
     
     else:
         logger.error(f"Unknown command: {args.command}")

@@ -29,7 +29,7 @@ python -m trading_llm.train_llm generate \
   --rl-model /path/to/your/rl_model.zip \
   --market-data /path/to/market_data.parquet \
   --output-dir ./data/trading_dataset \
-  --num-samples 10000 \
+  --num-samples 1000 \
   --split-ratio 0.9
 ```
 

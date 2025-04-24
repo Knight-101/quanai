@@ -1951,7 +1951,7 @@ class InstitutionalPerpetualEnv(gym.Env):
     def _calculate_risk_adjusted_reward(self, total_pnl: float, risk_metrics: Dict) -> float:
         """Calculate reward based on PnL and risk-adjusted metrics"""
         try:
-            # CRITICAL FIX: Improved portfolio return calculation
+            # Portfolio return calculation
             portfolio_value = risk_metrics.get('portfolio_value', self.balance)
             previous_value = portfolio_value - total_pnl  # Value before this step
             
@@ -1961,7 +1961,7 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Calculate return as percentage of previous portfolio value
             portfolio_return = total_pnl / previous_value
             
-            # CRITICAL FIX: Add sanity checks for unrealistic returns
+            # Sanity checks for unrealistic returns - maintain these safety checks
             if abs(portfolio_return) > 0.1:  # >10% return in a single step is suspicious
                 if abs(portfolio_return) > 0.5:  # >50% return is extremely unrealistic
                     # Apply very severe penalty for extremely unrealistic returns
@@ -1976,119 +1976,120 @@ class InstitutionalPerpetualEnv(gym.Env):
                     else:
                         portfolio_return = -0.1  # Cap negative return at -10%
             
-            # IMPROVED: More balanced reward structure with linear scaling and tiered incentives
+            # IMPROVED: More symmetric treatment of profits and losses
             if portfolio_return > 0:
-                # Linear scaling for moderate returns, with bonus for exceptional returns
+                # For positive returns: Apply progressive scaling to reward larger returns
                 if portfolio_return < 0.005:  # Under 0.5%
-                    base_reward = portfolio_return * 15.0
+                    base_reward = portfolio_return * 20.0  # Increased multiplier (was 15.0)
                 else:  # 0.5% or higher
-                    base_reward = (0.005 * 15.0) + ((portfolio_return - 0.005) * 25.0)
+                    base_reward = (0.005 * 20.0) + ((portfolio_return - 0.005) * 30.0)  # Increased multiplier (was 25.0)
             else:
-                # For negative returns: slightly reduced penalty
-                base_reward = -np.sqrt(abs(portfolio_return)) * 6.0
+                # For negative returns: More linear punishment, less severe for small losses
+                if abs(portfolio_return) < 0.005:  # Small losses under 0.5%
+                    base_reward = portfolio_return * 15.0  # Linear scaling for small losses
+                else:
+                    # Use linear with some dampening for larger losses
+                    base_reward = (-0.005 * 15.0) + ((portfolio_return + 0.005) * 20.0)
             
             # Risk-adjusted components with more emphasis on risk management
             sharpe = risk_metrics.get('sharpe_ratio', 0)
             sortino = risk_metrics.get('sortino_ratio', 0)
             calmar = risk_metrics.get('calmar_ratio', 0)
             
-            # CRITICAL FIX: Add sanity checks for risk metrics
+            # Sanity checks for risk metrics
             sharpe = np.clip(sharpe, -5, 5)
             sortino = np.clip(sortino, -5, 5)
             calmar = np.clip(calmar, -5, 5)
             
-            # IMPROVED: Weighted risk metrics with more emphasis on downside protection
+            # Risk metrics reward - unchanged proportions
             risk_reward = sharpe * 0.3 + sortino * 0.4 + calmar * 0.3
             
-            # ENHANCED: Dynamic risk penalties based on market regime
-            # Apply stronger penalties in high volatility regimes
+            # Dynamic risk penalties based on market regime
             volatility_scale = 1.0
             if 'volatility' in risk_metrics:
-                # Higher vol = stricter penalties
                 vol_percentile = risk_metrics.get('volatility_percentile', 0.5)
-                volatility_scale = 1.0 + vol_percentile
+                volatility_scale = 1.0 + vol_percentile * 0.5  # Reduced impact of volatility (was vol_percentile)
             
-            # CRITICAL FIX: Penalize excessive risk more aggressively, scaled by volatility
+            # Initialize penalties
             leverage_penalty = 0.0
             concentration_penalty = 0.0
             
-            # Calculate account-wide leverage limits from risk engine
+            # Calculate account limits
             account_max_leverage = self.risk_engine.risk_limits.account_max_leverage if self.risk_engine else 5.0
             position_max_leverage = self.max_leverage
             
-            # Penalize high leverage relative to account limits - more strict
+            # IMPROVED: More lenient leverage penalties - only penalize when closer to limits
             current_leverage = risk_metrics.get('leverage_utilization', 0)
-            if current_leverage > account_max_leverage * 0.5:  # Start penalizing at 50% of max
+            if current_leverage > account_max_leverage * 0.7:  # Higher threshold (was 0.5)
                 leverage_ratio = current_leverage / account_max_leverage
-                leverage_penalty = (leverage_ratio - 0.5) * 2.0 * volatility_scale
+                leverage_penalty = (leverage_ratio - 0.7) * 1.5 * volatility_scale  # Reduced multiplier (was 2.0)
             
-            # Penalize high concentration
+            # IMPROVED: More lenient concentration penalties
             max_concentration = self.risk_engine.risk_limits.position_concentration if self.risk_engine else 0.4
             current_concentration = risk_metrics.get('max_concentration', 0)
             if current_concentration > max_concentration * 0.5:  # Start penalizing at 50% of limit
                 concentration_ratio = current_concentration / max_concentration
-                concentration_penalty = (concentration_ratio - 0.5) * 3.0 * volatility_scale
+                concentration_penalty = (concentration_ratio - 0.5) * 2.0 * volatility_scale
             
-            # IMPROVED: Drawdown penalty with nonlinear scaling
+            # IMPROVED: Less punishing drawdown penalty
             max_drawdown = abs(risk_metrics.get('max_drawdown', 0))
-            # Use a quadratic penalty that increases sharply as drawdown grows
-            drawdown_penalty = min(max_drawdown * max_drawdown * 20.0, 2.0)
+            # Reduced quadratic scaling and lower cap
+            drawdown_penalty = min(max_drawdown * max_drawdown * 12.0, 1.5)  # Reduced from 20.0 multiplier, 2.0 cap
             
-            # IMPROVED: Stronger trading activity incentive with regime awareness
+            # Trading activity incentive with regime awareness
             trade_count = len([t for t in self.trades if t['timestamp'] == self.current_step])
             
             # Trading incentive depends on market regime
-            # In trending markets, reward fewer larger trades
-            # In range-bound markets, reward more frequent smaller trades
             market_regime = getattr(self, 'market_regime', 0.5)  # Default to middle
             
-            # Adjust trading incentive based on regime
+            # IMPROVED: Enhanced trading incentives
             if market_regime > 0.7:  # Strong trend
                 # In trending markets: reward fewer, larger trades
                 if trade_count == 0:
-                    trading_incentive = -0.02
+                    trading_incentive = -0.01  # Reduced penalty (was -0.02)
                 elif trade_count == 1:
-                    trading_incentive = 0.04  # Reward single decisive trade
+                    trading_incentive = 0.05  # Increased reward (was 0.04)
                 else:
-                    trading_incentive = 0.04 - (trade_count - 1) * 0.01  # Penalize too many trades
+                    trading_incentive = 0.05 - (trade_count - 1) * 0.01
             else:  # Range-bound or weak trend
                 # In range-bound markets: reward more frequent trading
                 if trade_count == 0:
-                    trading_incentive = -0.03  # Stronger penalty for inaction
+                    trading_incentive = -0.015  # Reduced penalty (was -0.03)
                 elif 1 <= trade_count <= 3:
-                    trading_incentive = 0.02 * trade_count  # Reward multiple trades
+                    trading_incentive = 0.03 * trade_count  # Increased reward (was 0.02)
                 else:
-                    trading_incentive = 0.06 - (trade_count - 3) * 0.01  # Diminishing returns
+                    trading_incentive = 0.09 - (trade_count - 3) * 0.01  # Increased reward (was 0.06)
             
-            # ENHANCED: Dynamic balance penalties based on drawdown
+            # IMPROVED: More lenient balance penalties with time decay
             balance_penalty = 0.0
             portfolio_value_ratio = portfolio_value / self.initial_balance
             
+            # Apply time decay to balance penalties - reduce impact as episode progresses
+            time_decay_factor = max(0.5, 1.0 - (self.current_step / (len(self.df) * 0.8)))
+            
             if portfolio_value_ratio < 0.5:  # Lost more than 50%
-                balance_penalty = 1.0 + (0.5 - portfolio_value_ratio) * 3.0  # Stronger penalty
+                balance_penalty = (1.0 + (0.5 - portfolio_value_ratio) * 2.0) * time_decay_factor  # Reduced multiplier (was 3.0)
             elif portfolio_value_ratio < 0.7:  # Lost 30-50%
-                balance_penalty = 0.5 + (0.7 - portfolio_value_ratio) * 1.0  # Moderate penalty
+                balance_penalty = (0.4 + (0.7 - portfolio_value_ratio) * 0.8) * time_decay_factor  # Reduced values
             elif portfolio_value_ratio < 0.9:  # Lost 10-30%
-                balance_penalty = (0.9 - portfolio_value_ratio) * 0.3  # Light penalty
+                balance_penalty = ((0.9 - portfolio_value_ratio) * 0.2) * time_decay_factor  # Reduced multiplier (was 0.3)
                 
-            # ENHANCED: Add bonus for maintaining balance above initial
+            # ENHANCED: Stronger bonus for balance growth
             balance_bonus = 0.0
             if portfolio_value_ratio > 1.05:  # 5% above initial
-                # Add increasing bonus for better performance using log scale
-                # This rewards early gains more than later gains
-                balance_bonus = np.log10(portfolio_value_ratio) * 1.5
+                # Enhanced bonus with higher scaling
+                balance_bonus = np.log10(portfolio_value_ratio) * 2.0  # Increased from 1.5
             
-            # Combine all components with adjusted weights
-            # Base formula: reward = pnl_reward + risk_metrics - risk_penalties + incentives - penalties
+            # IMPROVED: Balance the weights between rewards and penalties
             reward = (
-                base_reward * 0.4 +                    # 40% weight to P&L
-                risk_reward * 0.3 +                    # 30% to risk-adjusted metrics
-                trading_incentive * 0.1 +              # 10% to trading activity
-                balance_bonus * 0.1 -                  # 10% to balance growth bonus
-                leverage_penalty * 0.25 -              # 25% to leverage penalty
-                concentration_penalty * 0.15 -         # 15% to concentration penalty
-                drawdown_penalty * 0.3 -               # 30% to drawdown penalty
-                balance_penalty * 0.2                  # 20% to balance penalty
+                base_reward * 0.45 +                   # Increased from 0.4
+                risk_reward * 0.25 +                   # Reduced from 0.3
+                trading_incentive * 0.15 +             # Increased from 0.1
+                balance_bonus * 0.15 -                 # Increased from 0.1
+                leverage_penalty * 0.2 -               # Reduced from 0.25
+                concentration_penalty * 0.1 -          # Reduced from 0.15
+                drawdown_penalty * 0.2 -               # Reduced from 0.3
+                balance_penalty * 0.15                 # Reduced from 0.2
             )
             
             # Bound the reward to prevent extreme values
@@ -2110,20 +2111,54 @@ class InstitutionalPerpetualEnv(gym.Env):
             # Add holding time bonus/penalty
             reward += holding_reward
             
-            # ENHANCED: Encourage exploration by punishing static behavior
+            # IMPROVED: More contextual penalty for having no positions
+            # Only penalize when market conditions are favorable for trading
             if risk_metrics.get('positions_count', 0) == 0:
-                # Penalize having no positions (encourage taking positions)
-                reward -= 0.01
+                market_volatility = risk_metrics.get('volatility', 0.01)
+                market_trend_strength = getattr(self, 'market_regime', 0.5)
+                
+                # Scale penalty based on market conditions - higher in favorable conditions
+                if market_volatility > 0.01 and market_trend_strength > 0.6:
+                    # Good trading conditions but no position
+                    no_position_penalty = 0.008  # Reduced from flat 0.01
+                else:
+                    # Lower penalty in unfavorable conditions
+                    no_position_penalty = 0.003
+                
+                reward -= no_position_penalty
             
-            # ENHANCED: If we've been inactive too long, increase the penalty
+            # IMPROVED: More gradual inactivity penalty
             if self.consecutive_no_trade_steps > 50:
-                reward -= 0.1  # Strong penalty for extended inactivity
+                # Calculate a scaled penalty that increases gradually
+                inactivity_steps = min(200, self.consecutive_no_trade_steps - 50)
+                inactivity_penalty = 0.05 * (inactivity_steps / 150)  # Scales from 0 to 0.05
+                reward -= inactivity_penalty  # Reduced and graduated (was flat 0.1)
             
-            # Apply risk limits penalties
+            # IMPROVED: More proportional risk violation penalties
+            violation_count = 0
+            total_violation_penalty = 0.0
+            
             for violation, value in risk_metrics.items():
                 if violation.endswith('_violation') and value:
-                    # Apply stronger penalties for risk violations
-                    reward -= 0.5
+                    violation_count += 1
+                    
+                    # Apply penalty based on violation type
+                    if 'leverage' in violation:
+                        # Leverage violations are serious but shouldn't be catastrophic
+                        total_violation_penalty += 0.3
+                    elif 'drawdown' in violation:
+                        # Drawdown violations are very serious
+                        total_violation_penalty += 0.4
+                    elif 'concentration' in violation:
+                        # Concentration violations are moderate
+                        total_violation_penalty += 0.2
+                    else:
+                        # Other violations get a standard penalty
+                        total_violation_penalty += 0.25
+            
+            # Cap the total violation penalty
+            total_violation_penalty = min(total_violation_penalty, 0.8)
+            reward -= total_violation_penalty
             
             # Bound the reward to prevent extreme values
             reward = np.clip(reward, -10.0, 10.0)
