@@ -28,7 +28,7 @@ class TradingLLM:
     
     def __init__(
         self,
-        model_name: str = "mistralai/Mistral-7B-v0.1",
+        model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
@@ -36,6 +36,7 @@ class TradingLLM:
         load_in_8bit: bool = False,
         load_in_4bit: bool = True,
         use_flash_attn: bool = True,
+        use_gradient_checkpointing: bool = True,
         cache_dir: Optional[str] = None,
     ):
         """
@@ -50,6 +51,7 @@ class TradingLLM:
             load_in_8bit: Whether to load in 8-bit precision
             load_in_4bit: Whether to load in 4-bit precision
             use_flash_attn: Whether to use flash attention
+            use_gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency
             cache_dir: Directory to cache models
         """
         self.model_name = model_name
@@ -60,6 +62,7 @@ class TradingLLM:
         self.load_in_8bit = load_in_8bit
         self.load_in_4bit = load_in_4bit
         self.use_flash_attn = use_flash_attn
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         self.cache_dir = cache_dir
         self.is_lora_applied = False
         
@@ -94,9 +97,13 @@ class TradingLLM:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name, 
                 cache_dir=self.cache_dir,
-                use_fast=True
+                use_fast=True,
+                token=True  # Enable token-based authentication for gated models
             )
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Make sure we have pad token for proper batching
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.padding_side = "right"
             
             # Load model with quantization
@@ -105,17 +112,29 @@ class TradingLLM:
                 "quantization_config": quantization_config,
                 "torch_dtype": torch.bfloat16,
                 "cache_dir": self.cache_dir,
+                "token": True,  # Enable token-based authentication for gated models
             }
             
+            # Enable Flash Attention 2 for faster training if supported
             if self.use_flash_attn:
-                model_kwargs["attn_implementation"] = "flash_attention_2"
+                try:
+                    model_kwargs["attn_implementation"] = "flash_attention_2"
+                    logger.info("Using Flash Attention 2 for faster training")
+                except Exception as e:
+                    logger.warning(f"Flash Attention 2 not available: {e}. Using default attention.")
                 
+            # Load the model
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 **model_kwargs
             )
             
-            # Configure generation parameters
+            # Enable gradient checkpointing for memory efficiency if requested
+            if self.use_gradient_checkpointing:
+                self.model.gradient_checkpointing_enable()
+                logger.info("Gradient checkpointing enabled for memory efficiency")
+            
+            # Configure generation parameters optimized for Llama-3
             self.generation_config = GenerationConfig(
                 temperature=0.7,
                 top_p=0.9,
@@ -145,17 +164,29 @@ class TradingLLM:
         try:
             logger.info("Applying LoRA adapters to model")
             
-            # Default target modules for Mistral
+            # Default target modules for Llama-3
             if target_modules is None:
-                target_modules = [
-                    "q_proj", 
-                    "k_proj", 
-                    "v_proj", 
-                    "o_proj",
-                    "gate_proj", 
-                    "up_proj", 
-                    "down_proj"
-                ]
+                if "llama" in self.model_name.lower():
+                    target_modules = [
+                        "q_proj", 
+                        "k_proj", 
+                        "v_proj", 
+                        "o_proj",
+                        "gate_proj", 
+                        "up_proj", 
+                        "down_proj"
+                    ]
+                else:
+                    # Default for other models like Mistral
+                    target_modules = [
+                        "q_proj", 
+                        "k_proj", 
+                        "v_proj", 
+                        "o_proj",
+                        "gate_proj", 
+                        "up_proj", 
+                        "down_proj"
+                    ]
             
             # Configure LoRA
             lora_config = LoraConfig(
@@ -169,7 +200,10 @@ class TradingLLM:
             
             # Prepare model for training if using quantization
             if self.load_in_8bit or self.load_in_4bit:
-                self.model = prepare_model_for_kbit_training(self.model)
+                self.model = prepare_model_for_kbit_training(
+                    self.model,
+                    use_gradient_checkpointing=self.use_gradient_checkpointing
+                )
             
             # Apply LoRA to model
             self.model = get_peft_model(self.model, lora_config)

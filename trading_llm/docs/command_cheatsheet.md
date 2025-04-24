@@ -35,13 +35,13 @@ python -m trading_llm.train_llm generate \
 ```bash
 # Basic training
 python -m trading_llm.train_llm train \
-  --base-model mistralai/Mistral-7B-v0.1 \
+  --base-model meta-llama/Meta-Llama-3-8B-Instructt \
   --train-data ./data/trading_dataset/train_data.json \
   --output-dir ./models/trading_llm
 
 # Full training with all parameters
 python -m trading_llm.train_llm train \
-  --base-model mistralai/Mistral-7B-v0.1 \
+  --base-model meta-llama/Meta-Llama-3-8B-Instructt \
   --train-data ./data/trading_dataset/train_data.json \
   --eval-data ./data/trading_dataset/eval_data.json \
   --output-dir ./models/trading_llm \

@@ -24,7 +24,7 @@ The training process automatically logs metrics to stdout and to TensorBoard if 
 ```bash
 # Run training with output visible
 python -m trading_llm.train_llm train \
-  --base-model mistralai/Mistral-7B-v0.1 \
+  --base-model meta-llama/Meta-Llama-3-8B-Instructt \
   --train-data ./data/trading_dataset/train_data.json \
   --output-dir ./models/trading_llm
 ```

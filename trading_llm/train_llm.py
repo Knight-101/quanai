@@ -18,8 +18,8 @@ from stable_baselines3 import PPO
 import traceback
 
 from trading_llm.dataset import TradingDatasetGenerator, create_dataloaders
-from trading_llm.training import train_llm_model, TrainingArgs
-from trading_llm.inference import RLLMExplainer, generate_market_commentary, MarketCommentaryGenerator, extract_trading_signals
+from trading_llm.training import TradingTrainer
+from trading_llm.inference import RLLMExplainer, extract_trading_signals, MarketCommentaryGenerator
 from trading_llm.model import TradingLLM
 from trading_llm.chatbot import load_market_chatbot
 from trading_llm.utils import setup_logging
@@ -29,31 +29,39 @@ logger = logging.getLogger(__name__)
 def load_multi_asset_data():
     """
     Load and combine market data from BTC, ETH, and SOL into a single multi-asset dataset.
+    If original files are not found, generate synthetic data for testing.
     
     Returns:
-        DataFrame with combined market data for all assets
+        Path to the parquet file with combined market data for all assets
     """
     logger.info("Loading and combining multi-asset data...")
     
     # Hardcoded paths for the three assets
-    btc_path = "market_data/binance_BTCUSDT_5m.parquet"
-    eth_path = "market_data/binance_ETHUSDT_5m.parquet"
-    sol_path = "market_data/binance_SOLUSDT_5m.parquet"
+    btc_path = "data/market_data/binance_BTCUSDT_5m.parquet"
+    eth_path = "data/market_data/binance_ETHUSDT_5m.parquet"
+    sol_path = "data/market_data/binance_SOLUSDT_5m.parquet"
     
-    # Ensure all paths exist
-    for path in [btc_path, eth_path, sol_path]:
+    
+    # Check if files exist, generate synthetic data if not
+    missing_files = []
+    for path, symbol in [(btc_path, 'BTC'), (eth_path, 'ETH'), (sol_path, 'SOL')]:
         if not os.path.exists(path):
-            logger.error(f"Market data file not found: {path}")
-            raise FileNotFoundError(f"Market data file not found: {path}")
+            missing_files.append((path, symbol))
+    
+    if missing_files:
+        logger.warning(f"Market data files not found. Generating synthetic data for testing.")
+        # Generate synthetic data for missing files
+        for path, symbol in missing_files:
+            _generate_synthetic_data(path, symbol)
     
     try:
         # Load individual files
         btc = pd.read_parquet(btc_path)
-        btc['asset'] = 'BTC'
+        btc['symbol'] = 'BTC'
         eth = pd.read_parquet(eth_path)
-        eth['asset'] = 'ETH'
+        eth['symbol'] = 'ETH'
         sol = pd.read_parquet(sol_path)
-        sol['asset'] = 'SOL'
+        sol['symbol'] = 'SOL'
         
         # Ensure all have the same structure
         required_columns = ['open', 'high', 'low', 'close', 'volume']
@@ -65,10 +73,11 @@ def load_multi_asset_data():
             if missing:
                 raise ValueError(f"Missing required columns in {asset} data: {missing}")
         
-        # Determine common columns (excluding 'asset' which we just added)
+        # Determine common columns (excluding 'symbol' which we just added)
         common_cols = list(set(btc.columns) & set(eth.columns) & set(sol.columns))
-        common_cols.remove('asset')  # Remove asset since we'll add it back
-        common_cols = ['asset'] + common_cols  # Add asset as the first column
+        if 'symbol' in common_cols:
+            common_cols.remove('symbol')  # Remove symbol since we'll add it back
+        common_cols = ['symbol'] + common_cols  # Add symbol as the first column
         
         # Combine datasets using common columns
         combined = pd.concat([
@@ -82,8 +91,7 @@ def load_multi_asset_data():
             combined.sort_values('timestamp', inplace=True)
         
         # Save combined dataset to a temporary file
-        os.makedirs('combined_data', exist_ok=True)
-        combined_path = 'combined_data/multi_asset_data.parquet'
+        combined_path = 'data/market_data/multi_asset_data.parquet'
         combined.to_parquet(combined_path)
         
         logger.info(f"Created combined dataset with {len(combined)} rows from BTC, ETH, and SOL data")
@@ -94,6 +102,76 @@ def load_multi_asset_data():
     except Exception as e:
         logger.error(f"Error combining market data: {str(e)}")
         raise
+
+def _generate_synthetic_data(path: str, symbol: str):
+    """
+    Generate synthetic OHLCV data for testing
+    
+    Args:
+        path: Path to save the synthetic data
+        symbol: Symbol name (BTC, ETH, SOL)
+    """
+    logger.info(f"Generating synthetic data for {symbol} at {path}")
+    
+    # Starting price based on symbol
+    base_prices = {
+        'BTC': 40000,
+        'ETH': 2000,
+        'SOL': 100
+    }
+    base_price = base_prices.get(symbol, 1000)
+    
+    # Generate timestamps - last 30 days, 5 minute intervals
+    end_time = pd.Timestamp.now()
+    start_time = end_time - pd.Timedelta(days=30)
+    timestamps = pd.date_range(start=start_time, end=end_time, freq='5T')
+    
+    # Initialize price series with some randomness
+    np.random.seed(42 + sum(ord(c) for c in symbol))  # Different seed for each symbol
+    price_changes = np.random.normal(0, 0.002, len(timestamps))
+    price_series = np.cumprod(1 + price_changes) * base_price
+    
+    # Generate OHLCV data
+    data = []
+    for i, timestamp in enumerate(timestamps):
+        # Reference price for this candle
+        ref_price = price_series[i]
+        
+        # Generate candle data with some randomness
+        high_pct = np.random.uniform(0, 0.005)
+        low_pct = np.random.uniform(0, 0.005)
+        open_pct = np.random.uniform(-0.003, 0.003)
+        
+        high = ref_price * (1 + high_pct)
+        low = ref_price * (1 - low_pct)
+        open_price = ref_price * (1 + open_pct)
+        close = ref_price
+        
+        # Ensure high >= max(open, close) and low <= min(open, close)
+        high = max(high, open_price, close)
+        low = min(low, open_price, close)
+        
+        # Generate volume with some randomness
+        volume = np.random.lognormal(10, 1) * (base_price / 1000)
+        
+        # Add row
+        data.append({
+            'timestamp': timestamp.value // 10**9,  # Convert to Unix timestamp
+            'open': open_price,
+            'high': high,
+            'low': low,
+            'close': close,
+            'volume': volume
+        })
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(data)
+    
+    # Save to parquet file
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_parquet(path)
+    
+    logger.info(f"Generated synthetic data for {symbol} with {len(df)} rows")
 
 def parse_args():
     """Parse command line arguments."""
@@ -225,30 +303,71 @@ def main():
         
     elif args.command == "train":
         logger.info("Training LLM model")
-        training_args = TrainingArgs(
-            base_model=args.base_model,
-            train_data_path=args.train_data,
-            eval_data_path=args.eval_data,
-            output_dir=args.output_dir,
-            num_epochs=args.num_epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
+        
+        # Load the training and evaluation datasets
+        train_path = args.train_data
+        eval_path = args.eval_data
+        
+        if not os.path.exists(train_path):
+            logger.error(f"Training data file not found: {train_path}")
+            sys.exit(1)
+            
+        if eval_path and not os.path.exists(eval_path):
+            logger.warning(f"Evaluation data file not found: {eval_path}")
+            eval_path = None
+        
+        # Initialize the model
+        model = TradingLLM(
+            model_name=args.base_model,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
+            load_in_4bit=args.bf16,  # Use BF16 for 4-bit quantization
+            load_in_8bit=not args.bf16 and args.fp16,  # Use 8-bit only if not using BF16
+        )
+        
+        # Create data loaders
+        train_dataloader, val_dataloader = create_dataloaders(
+            train_data_path=train_path,
+            val_data_path=eval_path,
+            tokenizer=model.tokenizer,
+            batch_size=args.batch_size,
+            max_length=512  # Default max sequence length
+        )
+        
+        # Initialize trainer
+        trainer = TradingTrainer(
+            model=model,
+            tokenizer=model.tokenizer,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            output_dir=args.output_dir,
+            num_epochs=args.num_epochs,
+            learning_rate=args.learning_rate,
             warmup_ratio=args.warmup_ratio,
             weight_decay=args.weight_decay,
-            max_steps=args.max_steps,
-            fp16=args.fp16,
-            bf16=args.bf16,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            early_stopping_patience=args.early_stopping,
             use_wandb=args.use_wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
-            early_stopping_patience=args.early_stopping,
-            seed=args.seed
+            seed=args.seed,
+            fp16=args.fp16,
+            bf16=args.bf16
         )
-        train_llm_model(training_args)
+        
+        # Start training
+        metrics = trainer.train()
+        
+        # Log results
+        logger.info("Training completed successfully")
+        logger.info(f"Model saved to {args.output_dir}")
+        
+        for metric_name, value in metrics.items():
+            logger.info(f"{metric_name}: {value}")
+        
+        # Save the final model
+        model.save_model(args.output_dir)
         
     elif args.command == "infer":
         logger.info("Running inference")

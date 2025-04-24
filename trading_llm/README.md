@@ -55,7 +55,7 @@ Fine-tune a language model to explain trading decisions:
 
 ```bash
 python -m trading_llm.train_llm train \
-    --base-model mistralai/Mistral-7B-v0.1 \
+    --base-model meta-llama/Meta-Llama-3-8B-Instructt \
     --train-data ./data/trading_llm_dataset/train_data.json \
     --val-data ./data/trading_llm_dataset/val_data.json \
     --output-dir ./models/trading_llm \
@@ -74,7 +74,7 @@ Use the trained model to explain RL trading decisions:
 python -m trading_llm.train_llm infer \
     --rl-model /path/to/your/rl_model.zip \
     --llm-model ./models/trading_llm \
-    --base-model mistralai/Mistral-7B-v0.1 \
+    --base-model meta-llama/Meta-Llama-3-8B-Instructt \
     --market-data /path/to/latest_market_data.parquet
 ```
 
@@ -85,7 +85,7 @@ Generate a comprehensive market analysis:
 ```bash
 python -m trading_llm.train_llm commentary \
     --llm-model ./models/trading_llm \
-    --base-model mistralai/Mistral-7B-v0.1 \
+    --base-model meta-llama/Meta-Llama-3-8B-Instructt \
     --market-data /path/to/market_data.parquet \
     --symbol "BTC/USD" \
     --output-file ./reports/btc_analysis.txt
@@ -102,7 +102,7 @@ from trading_llm import RLLMExplainer
 explainer = RLLMExplainer(
     rl_model_path="/path/to/your/rl_model.zip",
     llm_model_path="./models/trading_llm",
-    llm_base_model="mistralai/Mistral-7B-v0.1"
+    llm_base_model="meta-llama/Meta-Llama-3-8B-Instructt"
 )
 
 # Example observation from your trading environment
@@ -141,7 +141,7 @@ You can adjust various parameters when initializing the TradingLLM:
 from trading_llm import TradingLLM
 
 model = TradingLLM(
-    model_name="mistralai/Mistral-7B-v0.1",  # Base model
+    model_name="meta-llama/Meta-Llama-3-8B-Instructt",  # Base model
     lora_r=16,                             # LoRA rank parameter
     lora_alpha=32,                         # LoRA alpha parameter
     lora_dropout=0.05,                     # LoRA dropout rate
@@ -159,7 +159,7 @@ For more control over the training process:
 from trading_llm import TradingLLM, create_dataloaders, TradingTrainer
 
 # Initialize model
-model = TradingLLM(model_name="mistralai/Mistral-7B-v0.1")
+model = TradingLLM(model_name="meta-llama/Meta-Llama-3-8B-Instructt")
 model.apply_lora()  # Apply LoRA adapters
 
 # Create dataloaders
