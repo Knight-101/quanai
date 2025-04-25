@@ -49,26 +49,51 @@ class RLStateExtractor:
             logger.error(f"Error loading RL model: {str(e)}")
             raise
     
-    def predict(self, observation: Dict[str, np.ndarray]) -> Tuple[float, Dict[str, Any]]:
+    def predict(self, observation: Union[Dict[str, np.ndarray], np.ndarray]) -> Tuple[float, Dict[str, Any]]:
         """
         Predict action using RL model
         
         Args:
-            observation: Observation dictionary
+            observation: Observation dictionary or array
             
         Returns:
             Tuple of (action, extra_data)
         """
         try:
-            action, _states = self.model.predict(observation, deterministic=True)
+            # Convert numpy array to tensor if needed
+            from gymnasium import spaces
+            
+            # Determine device that the model is using
+            model_device = next(self.model.policy.parameters()).device
+            logger.info(f"Model is on device: {model_device}")
+            
+            if isinstance(observation, np.ndarray) and isinstance(self.model.observation_space, spaces.Box):
+                # Convert numpy array to torch tensor and move to correct device
+                observation = torch.tensor(observation, dtype=torch.float32).to(model_device)
+            elif isinstance(observation, dict) and isinstance(self.model.observation_space, spaces.Dict):
+                # Convert all numpy arrays in the dict to torch tensors on correct device
+                for key, value in observation.items():
+                    if isinstance(value, np.ndarray):
+                        observation[key] = torch.tensor(value, dtype=torch.float32).to(model_device)
+            
+            # Use no_grad to save memory
+            with torch.no_grad():
+                action, _states = self.model.predict(observation, deterministic=False)
+            
+            # Move action to CPU before returning
+            if isinstance(action, torch.Tensor):
+                action = action.cpu()  # Move to CPU but keep as tensor
             
             # Extract action probabilities if available
             extra_data = {}
             if hasattr(self.model, "policy") and hasattr(self.model.policy, "get_distribution"):
                 distribution = self.model.policy.get_distribution(observation)
                 if hasattr(distribution, "mean") and hasattr(distribution, "stddev"):
-                    extra_data["action_mean"] = distribution.mean.detach().cpu().numpy()
-                    extra_data["action_stddev"] = distribution.stddev.detach().cpu().numpy()
+                    # Move tensors to CPU
+                    mean = distribution.mean.detach().cpu()
+                    stddev = distribution.stddev.detach().cpu()
+                    extra_data["action_mean"] = mean
+                    extra_data["action_stddev"] = stddev
             
             return action, extra_data
         except Exception as e:
@@ -182,6 +207,16 @@ class RLLMExplainer:
             # Predict action using RL model
             action, extra_data = self.rl_state_extractor.predict(observation)
             
+            # Ensure any cuda tensors are moved to CPU
+            if isinstance(action, torch.Tensor):
+                action = action.cpu().numpy()
+                
+            # Process any tensors in extra_data
+            if extra_data:
+                for key, value in extra_data.items():
+                    if isinstance(value, torch.Tensor):
+                        extra_data[key] = value.cpu().numpy()
+            
             # Prepare market context
             market_context = self.rl_state_extractor.prepare_market_context(observation, raw_ohlcv)
             
@@ -190,10 +225,13 @@ class RLLMExplainer:
             if raw_ohlcv is not None:
                 indicators = self.rl_state_extractor.indicator_processor.calculate_indicators(raw_ohlcv)
             
+            # Ensure action is a scalar
+            action_value = float(action) if isinstance(action, (np.ndarray, list)) else float(action)
+            
             # Format prompt for LLM
             prompt = self.llm.format_prompt(
                 market_context=market_context,
-                action=action,
+                action=action_value,
                 indicators=indicators
             )
             
@@ -258,6 +296,208 @@ class RLLMExplainer:
             results.append(result)
         
         return results
+
+    def explain_trading_decisions(
+        self,
+        market_data_path: str,
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        max_samples: int = 20  # Limit number of samples to prevent memory issues
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate trading decision explanations from market data file
+        
+        Args:
+            market_data_path: Path to the market data file
+            max_tokens: Maximum tokens for explanation
+            temperature: Temperature for generation
+            max_samples: Maximum number of samples to process (to prevent memory issues)
+            
+        Returns:
+            List of dictionaries with predictions and explanations
+        """
+        try:
+            # Load market data
+            if market_data_path.endswith('.csv'):
+                market_data = pd.read_csv(market_data_path)
+            elif market_data_path.endswith('.parquet'):
+                market_data = pd.read_parquet(market_data_path)
+            else:
+                raise ValueError(f"Unsupported market data format: {market_data_path}")
+                
+            # Convert column names to lowercase
+            market_data.columns = market_data.columns.str.lower()
+            
+            # Prepare market data using same approach as training
+            from gymnasium import spaces
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            
+            # Check required columns
+            for col in required_cols:
+                if col not in market_data.columns:
+                    raise ValueError(f"Required column {col} not found in market data")
+            
+            # Prepare and normalize data similar to extract_trading_signals
+            data = market_data.copy()
+            if 'timestamp' in data.columns:
+                data = data.set_index('timestamp')
+            
+            # Normalize data (same as in extract_trading_signals)
+            for col in required_cols:
+                if col == 'volume':
+                    # Log transform volume
+                    data[col] = np.log(data[col] + 1)
+                
+                # Standardize
+                mean, std = data[col].mean(), data[col].std()
+                data[col] = (data[col] - mean) / (std + 1e-8)
+            
+            # Detect observation space type
+            is_box_space = isinstance(self.rl_state_extractor.model.observation_space, spaces.Box)
+            
+            # For Box space, get the exact expected shape
+            if is_box_space:
+                expected_shape = self.rl_state_extractor.model.observation_space.shape
+                expected_size = expected_shape[0] if expected_shape else 78  # Default to 78 if shape is not available
+                
+                # Calculate exactly how many rows we need for the expected size
+                rows_needed = expected_size // len(required_cols)
+                if expected_size % len(required_cols) != 0:
+                    rows_needed += 1  # Round up if there's a remainder
+                
+                logger.info(f"Model expects observation shape {expected_shape}, using {rows_needed} rows")
+            else:
+                # For Dict space, use default window size
+                rows_needed = 30
+            
+            # Generate observations from data
+            observations = []
+            indices = []
+            
+            # Process with stride to limit number of explanations
+            stride = max(30, len(data) // max_samples)  # Ensure we don't process too many samples
+            
+            # Determine model device for tensor creation
+            import torch
+            model_device = next(self.rl_state_extractor.model.policy.parameters()).device
+            
+            # Create observations with appropriate format
+            for i in range(rows_needed, len(data), stride):
+                # Get window of data, using exactly the number of rows needed for the expected shape
+                window = data.iloc[i-rows_needed:i]
+                
+                # Create observation based on space type
+                if is_box_space:
+                    # Flatten and ensure exact shape match
+                    flattened = window[required_cols].values.flatten()
+                    
+                    # Adjust size if needed to match exactly what model expects
+                    if len(flattened) != expected_size:
+                        logger.info(f"Adjusting observation from {len(flattened)} to {expected_size} elements")
+                        if len(flattened) > expected_size:
+                            # Truncate if too large
+                            flattened = flattened[:expected_size]
+                        else:
+                            # Pad with zeros if too small
+                            padding = np.zeros(expected_size - len(flattened))
+                            flattened = np.concatenate([flattened, padding])
+                    
+                    # Create tensor directly on correct device
+                    obs = torch.tensor(flattened, dtype=torch.float32).to(model_device)
+                else:
+                    # Use dict for Dict spaces
+                    obs = {
+                        "market": torch.tensor(window[required_cols].values, dtype=torch.float32).to(model_device)
+                    }
+                
+                observations.append(obs)
+                indices.append(i)
+                
+                # Limit number of samples to prevent memory issues
+                if len(observations) >= max_samples:
+                    logger.info(f"Limiting to {max_samples} samples to prevent memory issues")
+                    break
+            
+            # Generate explanations for observations
+            explanations = []
+            
+            for i, (obs, idx) in enumerate(zip(observations, indices)):
+                try:
+                    # Predict action using RL model
+                    with torch.no_grad():  # Use no_grad to reduce memory usage
+                        action, extra_data = self.rl_state_extractor.predict(obs)
+                    
+                    # Move tensors to CPU and convert to numpy to free GPU memory
+                    if isinstance(action, torch.Tensor):
+                        action = action.cpu().numpy()
+                        
+                    # Also ensure any values in extra_data are moved to CPU
+                    if extra_data and isinstance(extra_data, dict):
+                        for key, value in extra_data.items():
+                            if isinstance(value, torch.Tensor):
+                                extra_data[key] = value.cpu().numpy()
+                    
+                    # Get original (non-normalized) window for context
+                    window_start = max(0, idx - rows_needed)
+                    raw_ohlcv = market_data.iloc[window_start:idx]
+                    
+                    # Create market context using original data
+                    temp_obs = {"market": raw_ohlcv[required_cols].values}
+                    market_context = self.rl_state_extractor.prepare_market_context(temp_obs, raw_ohlcv)
+                    
+                    # Calculate indicators on raw data
+                    indicators = self.rl_state_extractor.indicator_processor.calculate_indicators(raw_ohlcv)
+                    
+                    # Ensure action is a scalar for prompt formatting
+                    action_value = float(action) if isinstance(action, (np.ndarray, list)) else float(action)
+                    
+                    # Format prompt
+                    prompt = self.llm.format_prompt(
+                        market_context=market_context,
+                        action=action_value,
+                        indicators=indicators
+                    )
+                    
+                    # Generate explanation
+                    expl_text = self.llm.generate_explanation(
+                        prompt=prompt,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature
+                    )
+                    
+                    # Get timestamp for the explanation
+                    timestamp = data.index[idx] if hasattr(data.index, 'values') and not data.index.equals(pd.RangeIndex(len(data))) else idx
+                    
+                    # Ensure action is a float for action_text formatting
+                    action_float = float(action_value) if isinstance(action_value, (np.ndarray, list)) else float(action_value)
+                    
+                    # Format action text
+                    action_text = "BUY" if action_float > 0.2 else ("SELL" if action_float < -0.2 else "HOLD")
+                    
+                    # Format explanation
+                    explanation = f"Timestamp: {timestamp}\n"
+                    explanation += f"Action: {action_text} (score: {action_float:.4f})\n"
+                    explanation += f"Explanation: {expl_text}\n"
+                    
+                    explanations.append(explanation)
+                    
+                    # Free memory
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    
+                except Exception as e:
+                    # Handle individual observation errors
+                    logger.error(f"Error processing observation {i}: {str(e)}")
+                    timestamp = data.index[idx] if hasattr(data.index, 'values') and not data.index.equals(pd.RangeIndex(len(data))) else idx
+                    explanations.append(f"Timestamp: {timestamp}\nAction: HOLD (score: 0.0000)\nExplanation: Error: {str(e)}\n")
+                    
+                    # Free memory on error
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            return explanations
+            
+        except Exception as e:
+            logger.error(f"Error in explain_trading_decisions: {str(e)}")
+            return [f"Error processing market data: {str(e)}"]
 
 
 class MarketCommentaryGenerator:
@@ -334,8 +574,35 @@ class MarketCommentaryGenerator:
         market_context["day_open"] = window['open'].iloc[-1]
         market_context["day_close"] = window['close'].iloc[-1]
         
-        # Build prompt
-        prompt = f"""<s>[INST] Generate a professional market commentary for {symbol} based on the following data:
+        # Format support/resistance and patterns for display
+        support_levels = indicators['support_resistance'].get('support', ['N/A'])[0] if indicators['support_resistance'].get('support') else 'N/A'
+        resistance_levels = indicators['support_resistance'].get('resistance', ['N/A'])[0] if indicators['support_resistance'].get('resistance') else 'N/A'
+        patterns = ', '.join(indicators['patterns']) if indicators['patterns'] else 'None detected'
+        
+        # Try a much simpler prompt for testing
+        simple_prompt = f"""<s>[INST]
+Write a market analysis for {symbol} at price ${market_context['price']:.2f} with RSI {indicators['rsi']:.2f}.
+[/INST]"""
+
+        # Generate commentary with simple prompt and safer parameters
+        logger.info(f"Generating commentary for {symbol} with temperature {temperature}")
+        try:
+            # Try simple prompt first
+            logger.info("Attempting generation with simple prompt")
+            commentary = self.llm.generate_explanation(
+                prompt=simple_prompt,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=0.95,  # Higher top_p
+                repetition_penalty=1.03  # Lower penalty
+            )
+            
+            if not commentary or len(commentary) < 50:
+                logger.warning("Simple prompt failed, trying full prompt with adjusted parameters")
+                
+                # Build full prompt with clear instructions
+                full_prompt = f"""<s>[INST]
+You are a professional market analyst with expertise in cryptocurrency markets. Generate a detailed market commentary for {symbol} based on the following data:
 
 Price Information:
 - Current price: {market_context['price']:.2f}
@@ -356,21 +623,34 @@ Technical Indicators:
 Market Patterns and Trend:
 - Current trend: {indicators['trend']}
 - Volatility: {indicators['volatility']}
-- Detected patterns: {', '.join(indicators['patterns']) if indicators['patterns'] else 'None'}
-- Support levels: {indicators['support_resistance'].get('support', ['None'])[0] if indicators['support_resistance'].get('support') else 'None'}
-- Resistance levels: {indicators['support_resistance'].get('resistance', ['None'])[0] if indicators['support_resistance'].get('resistance') else 'None'}
+- Support level: {support_levels}
+- Resistance level: {resistance_levels}
 
-Write a detailed but concise market commentary that a professional trader would find useful. Include an analysis of price action, technical indicators, and potential future scenarios. [/INST]
-"""
+Write a concise market analysis.
+[/INST]"""
+                
+                # Try with different parameters
+                commentary = self.llm.generate_explanation(
+                    prompt=full_prompt,
+                    max_new_tokens=max_tokens,
+                    temperature=0.9,  # Higher temperature for more creativity
+                    top_p=0.92,
+                    repetition_penalty=1.02  # Lower penalty
+                )
+        except Exception as e:
+            logger.error(f"Error in generation: {str(e)}")
+            commentary = ""
         
-        # Generate commentary
-        commentary = self.llm.generate_explanation(
-            prompt=prompt,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=0.9,
-            repetition_penalty=1.15
-        )
+        # Check if commentary is still empty or very short
+        if not commentary or len(commentary) < 50:
+            logger.warning(f"Still generated empty or very short commentary for {symbol}, using fallback text")
+            commentary = f"""Analysis for {symbol}:
+
+Current price is ${market_context['price']:.2f} with a {market_context['price_change']:.2f}% daily change. 
+The RSI is at {indicators['rsi']:.2f}, suggesting {'overbought conditions' if indicators['rsi'] > 70 else 'oversold conditions' if indicators['rsi'] < 30 else 'neutral momentum'}.
+The current trend appears to be {indicators['trend'].lower()} with {indicators['volatility'].lower()} volatility.
+
+Key levels to watch: Support at {support_levels}, resistance at {resistance_levels}."""
         
         return commentary
     
@@ -441,12 +721,17 @@ Write a detailed but concise market commentary that a professional trader would 
         gainers_text = ", ".join([f"{m['symbol']} (+{m['change']:.1f}%)" for m in gainers[:3]])
         losers_text = ", ".join([f"{m['symbol']} ({m['change']:.1f}%)" for m in losers[:3]])
         
-        # Build prompt
-        prompt = f"""<s>[INST] Generate a comprehensive market summary based on the following data:
+        # Overall market direction
+        market_direction = "bullish" if avg_change > 1.0 else "bearish" if avg_change < -1.0 else "neutral"
+        
+        # Build prompt with clear structure and instructions
+        prompt = f"""<s>[INST]
+You are a professional market analyst specializing in cryptocurrency markets. Generate a comprehensive market summary based on the following data:
 
 Market Overview:
-- Number of markets: {len(markets_data)}
+- Number of markets analyzed: {len(markets_data)}
 - Average price change: {avg_change:.2f}%
+- Overall market direction: {market_direction}
 - Average RSI: {avg_rsi:.1f}
 - Top gainers: {gainers_text if gainers else "None"}
 - Top losers: {losers_text if losers else "None"}
@@ -454,10 +739,18 @@ Market Overview:
 Individual Markets:
 {markets_text}
 
-Write a comprehensive market summary that covers the overall market sentiment, noteworthy price movements, technical patterns, and potential trading opportunities. The summary should be professional, concise, and actionable. [/INST]
-"""
+Your task:
+1. Begin with an executive summary of the overall market conditions
+2. Highlight the most significant market movements and explain possible reasons
+3. Identify any market-wide patterns or correlations
+4. Focus on standout assets (both positive and negative performers)
+5. Conclude with an outlook based on the technical data provided
+
+Write a professional, data-driven market summary that would be valuable for traders and investors. Be specific and reference the data provided.
+[/INST]"""
         
         # Generate summary
+        logger.info(f"Generating market summary for {len(markets_data)} symbols with temperature {temperature}")
         summary = self.llm.generate_explanation(
             prompt=prompt,
             max_new_tokens=max_tokens,
@@ -465,6 +758,20 @@ Write a comprehensive market summary that covers the overall market sentiment, n
             top_p=0.9,
             repetition_penalty=1.2
         )
+        
+        # Check if summary is empty or very short
+        if not summary or len(summary) < 100:
+            logger.warning("Generated empty or very short market summary, using fallback text")
+            summary = f"""Market Summary:
+
+The overall market shows an average change of {avg_change:.2f}%, with an average RSI of {avg_rsi:.1f}, indicating a generally {market_direction} sentiment.
+
+Notable performers:
+- Gainers: {gainers_text if gainers else "None above 2%"}
+- Losers: {losers_text if losers else "None below -2%"}
+
+The market currently displays {market_direction} characteristics with most assets showing {'positive' if avg_change > 0 else 'negative'} price action.
+"""
         
         return summary
 
@@ -488,6 +795,7 @@ def extract_trading_signals(
         Dictionary with trading signals for each timestamp
     """
     import numpy as np
+    import torch
     from gymnasium import spaces
     
     logger.info("Extracting trading signals from RL model")
@@ -514,6 +822,10 @@ def extract_trading_signals(
             mean, std = data[col].mean(), data[col].std()
             data[col] = (data[col] - mean) / (std + 1e-8)
     
+    # Determine model device
+    model_device = next(rl_model.policy.parameters()).device
+    logger.info(f"Model is on device: {model_device}")
+    
     # Extract observations from market data
     observations = []
     timestamps = []
@@ -526,20 +838,37 @@ def extract_trading_signals(
         if isinstance(rl_model.observation_space, spaces.Dict):
             # If the model uses a Dict observation space, format accordingly
             obs = {
-                "market": window[required_cols].values,
+                "market": torch.tensor(window[required_cols].values, dtype=torch.float32).to(model_device),
             }
         else:
             # Otherwise, use a flat array
-            obs = window[required_cols].values.flatten()
+            obs = torch.tensor(window[required_cols].values.flatten(), dtype=torch.float32).to(model_device)
         
         observations.append(obs)
         timestamps.append(data.index[i] if not data.index.equals(pd.RangeIndex(len(data))) else i)
     
     # Get actions from model
     actions = []
-    for obs in observations:
-        action, _ = rl_model.predict(obs, deterministic=True)
-        actions.append(float(action))
+    
+    # Use smaller batches to prevent memory issues
+    batch_size = 32
+    
+    for i in range(0, len(observations), batch_size):
+        batch_obs = observations[i:i+batch_size]
+        batch_actions = []
+        
+        for obs in batch_obs:
+            with torch.no_grad():  # Use no_grad to reduce memory usage
+                action, _ = rl_model.predict(obs, deterministic=False)
+                if isinstance(action, torch.Tensor):
+                    action = action.cpu().numpy()
+                batch_actions.append(float(action))
+                
+            # Clear GPU memory after each prediction
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        actions.extend(batch_actions)
     
     # Convert actions to trading signals
     signals = {}

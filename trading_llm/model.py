@@ -136,8 +136,14 @@ class TradingLLM:
                     self.model.config.use_cache = False
                     logger.info("Disabled model cache for gradient checkpointing compatibility")
                 
-                # Enable gradient checkpointing with explicit use_reentrant parameter
-                self.model.gradient_checkpointing_enable(use_reentrant=False)
+                # Enable gradient checkpointing with safer approach for compatibility
+                try:
+                    # Newer transformers versions support use_reentrant
+                    self.model.gradient_checkpointing_enable(use_reentrant=False)
+                except TypeError:
+                    # Fall back to older version without use_reentrant parameter
+                    self.model.gradient_checkpointing_enable()
+                    
                 logger.info("Gradient checkpointing enabled for memory efficiency")
             
             # Configure generation parameters optimized for Llama-3
@@ -263,20 +269,34 @@ class TradingLLM:
             
             # Tokenize input with proper handling of token type IDs
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            input_length = inputs.input_ids.shape[1]
             
             # Generate response
             with torch.no_grad():
+                # Generate with streaming enabled for debugging
+                logger.info(f"Generating with temperature={generation_config.temperature}, max_new_tokens={max_new_tokens}")
                 output = self.model.generate(
                     **inputs,
                     generation_config=generation_config
                 )
             
-            # Decode the response
-            response = self.tokenizer.decode(output[0], skip_special_tokens=True)
+            # Extract only the generated tokens (excluding input tokens)
+            generated_tokens = output[0][input_length:]
             
-            # Extract only the generated part after the prompt
-            prompt_length = len(self.tokenizer.decode(inputs.input_ids[0], skip_special_tokens=True))
-            explanation = response[prompt_length:].strip()
+            # Decode only the generated part
+            explanation = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            
+            # Log token counts for debugging
+            logger.info(f"Input tokens: {input_length}, Generated tokens: {len(generated_tokens)}")
+            logger.info(f"Generated text length: {len(explanation)} chars")
+            
+            # Clean up special tokens that might remain
+            explanation = explanation.replace("</s>", "").strip()
+            
+            # Handle empty responses
+            if not explanation or explanation.isspace():
+                logger.warning("Model generated empty response, falling back to default explanation")
+                return "Analysis not available at this time."
             
             return explanation
         except Exception as e:
@@ -414,7 +434,8 @@ class TradingLLM:
                     indicators_text += f"- {name}: {value}\n"
         
         # Create the prompt
-        prompt = f"""<s>[INST] I'm analyzing the market for trading opportunities.
+        prompt = f"""<s>[INST]
+I'm analyzing the market for trading opportunities.
 
 Here's the {timeframe} market situation:
 - Price: {market_context.get('price', 'N/A')}
@@ -425,6 +446,6 @@ Here's the {timeframe} market situation:
 
 The trading algorithm decided to {action_desc}.
 
-Can you explain why this might be a good decision given the current market conditions? Give a concise explanation based on technical analysis and price action. [/INST]
-"""
+Can you explain why this might be a good decision given the current market conditions? Give a concise explanation based on technical analysis and price action.
+[/INST]"""
         return prompt 

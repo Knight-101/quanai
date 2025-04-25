@@ -1116,7 +1116,7 @@ class InstitutionalBacktester:
                     # Loop until done or max steps
                     while not done:
                         # Get action from model
-                        action, _ = self.model.predict(obs, deterministic=True)
+                        action, _ = self.model.predict(obs, deterministic=False)
                         
                         # Take step
                         obs, reward, done, info = self.env.step(action)
@@ -2103,6 +2103,19 @@ class InstitutionalBacktester:
                 (trend <= up_trend_threshold)
             )
             
+            # MODIFIED: Sort periods by duration (longest first) and limit to max per type
+            MAX_PERIODS_PER_TYPE = 3  # Maximum number of periods per regime type
+            
+            # Calculate duration for sorting
+            def calculate_duration(period):
+                return (period[1] - period[0]).days
+            
+            # Sort by duration and take top MAX_PERIODS_PER_TYPE
+            bull_periods = sorted(bull_periods, key=calculate_duration, reverse=True)[:MAX_PERIODS_PER_TYPE]
+            bear_periods = sorted(bear_periods, key=calculate_duration, reverse=True)[:MAX_PERIODS_PER_TYPE]
+            crisis_periods = sorted(crisis_periods, key=calculate_duration, reverse=True)[:MAX_PERIODS_PER_TYPE]
+            sideways_periods = sorted(sideways_periods, key=calculate_duration, reverse=True)[:MAX_PERIODS_PER_TYPE]
+            
             # Format regimes dictionary
             for i, period in enumerate(bull_periods):
                 regime_id = f"bull_{i+1}"
@@ -2115,7 +2128,8 @@ class InstitutionalBacktester:
                         'trend': 'positive',
                         'volatility': 'moderate',
                         'avg_volatility': volatility.loc[period[0]:period[1]].mean(),
-                        'avg_trend': trend.loc[period[0]:period[1]].mean()
+                        'avg_trend': trend.loc[period[0]:period[1]].mean(),
+                        'duration_days': (period[1] - period[0]).days  # Added duration
                     }
                 }
             
@@ -2130,7 +2144,8 @@ class InstitutionalBacktester:
                         'trend': 'negative',
                         'volatility': 'high',
                         'avg_volatility': volatility.loc[period[0]:period[1]].mean(),
-                        'avg_trend': trend.loc[period[0]:period[1]].mean()
+                        'avg_trend': trend.loc[period[0]:period[1]].mean(),
+                        'duration_days': (period[1] - period[0]).days  # Added duration
                     }
                 }
             
@@ -2145,7 +2160,8 @@ class InstitutionalBacktester:
                         'trend': 'mixed',
                         'volatility': 'very high',
                         'avg_volatility': volatility.loc[period[0]:period[1]].mean(),
-                        'avg_trend': trend.loc[period[0]:period[1]].mean()
+                        'avg_trend': trend.loc[period[0]:period[1]].mean(),
+                        'duration_days': (period[1] - period[0]).days  # Added duration
                     }
                 }
                 
@@ -2160,7 +2176,8 @@ class InstitutionalBacktester:
                         'trend': 'neutral',
                         'volatility': 'low',
                         'avg_volatility': volatility.loc[period[0]:period[1]].mean(),
-                        'avg_trend': trend.loc[period[0]:period[1]].mean()
+                        'avg_trend': trend.loc[period[0]:period[1]].mean(),
+                        'duration_days': (period[1] - period[0]).days  # Added duration
                     }
                 }
             
@@ -2201,7 +2218,20 @@ class InstitutionalBacktester:
         # Get unique regime values
         regime_values = self.data[regime_feature].dropna().unique()
         
+        # MODIFIED: Limit to at most 5 regimes if there are too many
+        MAX_TOTAL_REGIMES = 12
+        
+        # If we have too many regimes, consolidate by focusing on the most common ones
+        if len(regime_values) > MAX_TOTAL_REGIMES:
+            # Count occurrences of each regime value
+            value_counts = self.data[regime_feature].value_counts()
+            # Get the most common regime values
+            regime_values = value_counts.nlargest(MAX_TOTAL_REGIMES).index.values
+            logger.info(f"Limiting analysis to the {MAX_TOTAL_REGIMES} most common regimes out of {len(value_counts)} total")
+        
         regimes = {}
+        regime_data = []
+        
         for regime_value in regime_values:
             # Get rows with this regime value
             regime_mask = self.data[regime_feature] == regime_value
@@ -2224,8 +2254,8 @@ class InstitutionalBacktester:
                     continue
             
             dates = pd.to_datetime(dates)
-            start_date = min(dates).strftime('%Y-%m-%d')
-            end_date = max(dates).strftime('%Y-%m-%d')
+            start_date = min(dates)
+            end_date = max(dates)
             
             # Map numeric regime values to names
             regime_names = {
@@ -2238,16 +2268,32 @@ class InstitutionalBacktester:
             
             regime_name = regime_names.get(regime_value, f"Regime {regime_value}")
             
-            regime_id = f"{regime_name.lower()}_{regime_value}"
-            regimes[regime_id] = {
+            # Store regime data for sorting
+            regime_data.append({
+                'value': regime_value,
                 'name': regime_name,
                 'start_date': start_date,
                 'end_date': end_date,
-                'description': f"{regime_name} market from {start_date} to {end_date}",
+                'duration_days': (end_date - start_date).days,
+                'data_points': len(regime_rows)
+            })
+        
+        # MODIFIED: Sort regimes by duration and take the longest ones
+        # Sort by duration (longest first)
+        regime_data.sort(key=lambda x: x['duration_days'], reverse=True)
+        
+        # Take only up to MAX_TOTAL_REGIMES
+        for i, regime in enumerate(regime_data[:MAX_TOTAL_REGIMES]):
+            regime_id = f"{regime['name'].lower()}_{regime['value']}"
+            regimes[regime_id] = {
+                'name': regime['name'],
+                'start_date': regime['start_date'].strftime('%Y-%m-%d'),
+                'end_date': regime['end_date'].strftime('%Y-%m-%d'),
+                'description': f"{regime['name']} market from {regime['start_date'].strftime('%Y-%m-%d')} to {regime['end_date'].strftime('%Y-%m-%d')}",
                 'characteristics': {
-                    'regime_value': int(regime_value) if isinstance(regime_value, (int, float)) else str(regime_value),
-                    'duration_days': (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days,
-                    'data_points': len(regime_rows)
+                    'regime_value': int(regime['value']) if isinstance(regime['value'], (int, float)) else str(regime['value']),
+                    'duration_days': regime['duration_days'],
+                    'data_points': regime['data_points']
                 }
             }
         
@@ -2306,14 +2352,19 @@ class InstitutionalBacktester:
         current_group = [dates[0]]
         
         for i in range(1, len(dates)):
-            if (dates[i] - dates[i-1]).days <= 7:  # Allow gaps of up to 7 days
+            # MODIFIED: Increased allowed gap between dates from 7 to 21 days
+            # This will merge regimes that are close together
+            if (dates[i] - dates[i-1]).days <= 21:  # Allow gaps of up to 21 days
                 current_group.append(dates[i])
             else:
-                if len(current_group) >= 5:  # Minimum 5 days for a period
+                # MODIFIED: Increased minimum period length from 5 to 21 days
+                # This will eliminate very short regimes
+                if len(current_group) >= 21:  # Minimum 21 days for a period
                     date_groups.append(current_group)
                 current_group = [dates[i]]
         
-        if len(current_group) >= 5:
+        # MODIFIED: Increased minimum period length from 5 to 21 days
+        if len(current_group) >= 21:
             date_groups.append(current_group)
         
         # Convert groups to periods

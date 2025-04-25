@@ -1,0 +1,16 @@
+{
+    "learning_rate": 1.4e-05,
+    "ent_coef": 0.015600000000000001,
+    "batch_size": 1024,
+    "gae_lambda": 0.96,
+    "clip_range": 0.15,
+    "vf_coef": 0.4,
+    "n_epochs": 5,
+    "policy_kwargs": {
+        "features_extractor_kwargs": {
+            "dropout_rate": 0.044,
+            "nhead": 8,
+            "transformer_layers": 3
+        }
+    }
+}

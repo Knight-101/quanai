@@ -26,21 +26,31 @@ from trading_llm.utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
-def load_multi_asset_data():
+def load_multi_asset_data(for_training=False):
     """
     Load and combine market data from BTC, ETH, and SOL into a single multi-asset dataset.
     If original files are not found, generate synthetic data for testing.
     
+    Args:
+        for_training: If True, load 15-year data; otherwise load 100-day data
+        
     Returns:
         Path to the parquet file with combined market data for all assets
     """
     logger.info("Loading and combining multi-asset data...")
     
-    # Hardcoded paths for the three assets
-    btc_path = "data/market_data/binance_BTCUSDT_5m.parquet"
-    eth_path = "data/market_data/binance_ETHUSDT_5m.parquet"
-    sol_path = "data/market_data/binance_SOLUSDT_5m.parquet"
-    
+    if for_training:
+        # Use 15-year data for training
+        logger.info("Using 15-year data for training")
+        btc_path = "data/market_data/binance_BTCUSDT_5m.parquet"
+        eth_path = "data/market_data/binance_ETHUSDT_5m.parquet"
+        sol_path = "data/market_data/binance_SOLUSDT_5m.parquet"
+    else:
+        # Use 100-day data for inference/other tasks
+        logger.info("Using 100-day data for inference")
+        btc_path = "data/BTC_USDT_100days_5m.parquet"
+        eth_path = "data/ETH_USDT_100days_5m.parquet"
+        sol_path = "data/SOL_USDT_100days_5m.parquet"
     
     # Check if files exist, generate synthetic data if not
     missing_files = []
@@ -250,11 +260,11 @@ def parse_args():
     
     return parser.parse_args()
 
-def load_market_data(path: str):
+def load_market_data(path: str, for_training=False):
     """Load market data from CSV or Parquet file."""
     # If auto mode is specified, generate combined data
     if path == "auto":
-        path = load_multi_asset_data()
+        path = load_multi_asset_data(for_training=for_training)
     
     extension = os.path.splitext(path)[1].lower()
     if extension == '.csv':
@@ -278,13 +288,16 @@ def main():
         log_file=args.log_file
     )
     
+    # Set specific modules to DEBUG level for more detailed output
+    logging.getLogger("trading_llm.dataset").setLevel(logging.DEBUG)
+    
     if args.command == "generate":
         logger.info("Generating training dataset")
         
         # Handle auto market data option
         market_data_path = args.market_data
         if market_data_path == "auto":
-            market_data_path = load_multi_asset_data()
+            market_data_path = load_multi_asset_data(for_training=True)
             logger.info(f"Using auto-generated combined market data: {market_data_path}")
         
         generator = TradingDatasetGenerator(
@@ -375,7 +388,7 @@ def main():
         # Handle auto market data option
         market_data_path = args.market_data
         if market_data_path == "auto":
-            market_data_path = load_multi_asset_data()
+            market_data_path = load_multi_asset_data(for_training=False)
             logger.info(f"Using auto-generated combined market data: {market_data_path}")
         
         explainer = RLLMExplainer(
@@ -402,6 +415,12 @@ def main():
             
             # Save results if output file provided
             if args.output_file:
+                # Create directory if it doesn't exist
+                output_dir = os.path.dirname(args.output_file)
+                if output_dir and not os.path.exists(output_dir):
+                    os.makedirs(output_dir, exist_ok=True)
+                    logger.info(f"Created output directory: {output_dir}")
+                
                 with open(args.output_file, 'w') as f:
                     json.dump(results, f, indent=2)
             else:
@@ -427,7 +446,7 @@ def main():
         # Handle auto market data option
         market_data_path = args.market_data
         if market_data_path == "auto":
-            market_data_path = load_multi_asset_data()
+            market_data_path = load_multi_asset_data(for_training=False)
             logger.info(f"Using auto-generated combined market data: {market_data_path}")
         
         # Initialize commentary generator
@@ -471,6 +490,12 @@ def main():
             
             # Save commentary if output file provided
             if args.output_file:
+                # Create directory if it doesn't exist
+                output_dir = os.path.dirname(args.output_file)
+                if output_dir and not os.path.exists(output_dir):
+                    os.makedirs(output_dir, exist_ok=True)
+                    logger.info(f"Created output directory: {output_dir}")
+                
                 with open(args.output_file, 'w') as f:
                     f.write(f"Commentary for {symbol}:\n\n")
                     f.write(commentary)
@@ -493,6 +518,12 @@ def main():
             
             # Save summary if output file provided
             if args.output_file:
+                # Create directory if it doesn't exist
+                output_dir = os.path.dirname(args.output_file)
+                if output_dir and not os.path.exists(output_dir):
+                    os.makedirs(output_dir, exist_ok=True)
+                    logger.info(f"Created output directory: {output_dir}")
+                
                 with open(args.output_file, 'w') as f:
                     f.write("Market Summary:\n\n")
                     f.write(summary)
@@ -506,7 +537,7 @@ def main():
         # Handle auto market data option
         market_data_path = args.market_data
         if market_data_path == "auto":
-            market_data_path = load_multi_asset_data()
+            market_data_path = load_multi_asset_data(for_training=False)
             logger.info(f"Using auto-generated combined market data: {market_data_path}")
         
         # Load the chatbot

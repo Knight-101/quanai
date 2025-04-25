@@ -1455,12 +1455,16 @@ class TradingSystem:
                 # CRITICAL FIX: Add much stronger exploration noise for more steps during evaluation
                 # This is crucial to ensure trades are executed during evaluation
                 if step_count < 50:  # Increased from 30 to 50 steps
-                    # Add stronger noise early in the episode
-                    noise_scale = max(0.8, 1.5 - step_count * 0.02)  # Starts at 1.5, decreases more slowly
-                    # Add bias toward extreme actions to encourage trading
-                    bias = np.random.choice([-0.5, 0.5], size=action.shape)
-                    action = action + bias + np.random.normal(0, noise_scale, size=action.shape)
+                    # Add exploration noise early in the episode
+                    noise_scale = max(0.5, 1.0 - step_count * 0.015)  # Starts at 1.0, decreases more gradually
+                    
+                    # FIXED: Remove bias toward extreme actions
+                    # Use only Gaussian noise for natural exploration without bias
+                    action = action + np.random.normal(0, noise_scale, size=action.shape)
+                    
+                    # Clip actions to valid range
                     action = np.clip(action, -1, 1)
+                    
                     # logger.info(f"Added exploration noise (scale={noise_scale:.2f}) to action: {action}")
                 
                 # Execute step in environment

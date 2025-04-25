@@ -19,6 +19,7 @@ from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import OnBalanceVolumeIndicator, VolumeWeightedAveragePrice
 from sklearn.model_selection import train_test_split
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -258,39 +259,35 @@ class TradingDatasetGenerator:
         Initialize the dataset generator
         
         Args:
-            rl_model_path: Path to trained RL model
-            market_data_path: Path to market data (replacing data_path)
-            output_path: Path to output dataset (deprecated, use output_dir instead)
-            output_dir: Directory to save generated datasets
-            lookback_window: Number of periods to include in each window
+            rl_model_path: Path to RL model
+            market_data_path: Path to market data CSV or parquet file
+            output_path: Path to output directory or filename (deprecated)
+            output_dir: Path to output directory (preferred)
+            lookback_window: Window size for market data
             samples_per_symbol: Number of samples to generate per symbol
-            template_path: Path to custom explanation templates file
+            template_path: Path to custom templates
         """
         self.rl_model_path = rl_model_path
-        self.data_path = market_data_path  # Store internally as data_path for compatibility
-        
-        # Handle output directory (maintain backward compatibility)
-        self.output_path = output_dir if output_dir is not None else output_path
-        
+        self.market_data_path = market_data_path
+        self.output_path = output_path
+        self.output_dir = output_dir or output_path  # Use output_dir if provided, else fall back to output_path
         self.lookback_window = lookback_window
         self.samples_per_symbol = samples_per_symbol
         
-        # Load templates
+        # Load templates (with fallback to default templates)
         self.templates = self._load_templates(template_path)
         
-        logger.info(f"Initialized dataset generator with {len(self.templates)} templates")
-        
-        # Load market data
-        self.market_data = self._load_market_data()
-        
-        # Load RL model
-        self.rl_model = self._load_rl_model()
+        # Add assets list
+        self.assets = []
         
         # Initialize technical indicator processor
         self.indicator_processor = TechnicalIndicatorProcessor()
         
-        # Ensure output directory exists
-        os.makedirs(self.output_path, exist_ok=True)
+        logger.info(f"Initialized TradingDatasetGenerator with model: {rl_model_path}")
+        logger.info(f"Market data: {market_data_path}")
+        logger.info(f"Output path: {self.output_dir}")
+        logger.info(f"Lookback window: {lookback_window}")
+        logger.info(f"Samples per symbol: {samples_per_symbol}")
     
     def _load_templates(self, template_path: Optional[str] = None) -> List[str]:
         """
@@ -335,13 +332,13 @@ class TradingDatasetGenerator:
             DataFrame with market data
         """
         try:
-            logger.info(f"Loading market data from {self.data_path}")
-            extension = os.path.splitext(self.data_path)[1].lower()
+            logger.info(f"Loading market data from {self.market_data_path}")
+            extension = os.path.splitext(self.market_data_path)[1].lower()
             
             if extension == '.csv':
-                df = pd.read_csv(self.data_path)
+                df = pd.read_csv(self.market_data_path)
             elif extension in ['.parquet', '.pq']:
-                df = pd.read_parquet(self.data_path)
+                df = pd.read_parquet(self.market_data_path)
             else:
                 raise ValueError(f"Unsupported file format: {extension}")
             
@@ -403,6 +400,10 @@ class TradingDatasetGenerator:
         Returns:
             Training and validation DataFrames with explanations
         """
+        # Ensure output directory exists
+        os.makedirs(self.output_dir, exist_ok=True)
+        logger.info(f"Ensured output directory exists: {self.output_dir}")
+        
         # Handle parameter compatibility
         lookback = window_size if window_size is not None else lookback_window if lookback_window is not None else self.lookback_window
         policy_path = policy_model_path if policy_model_path is not None else self.rl_model_path
@@ -413,12 +414,12 @@ class TradingDatasetGenerator:
         all_data = []
         
         # Handle both directory of CSV files and single parquet/csv file
-        if os.path.isdir(self.data_path):
+        if os.path.isdir(self.market_data_path):
             # Directory with multiple files
-            for file in os.listdir(self.data_path):
+            for file in os.listdir(self.market_data_path):
                 if file.endswith(".csv"):
                     symbol = file.split(".")[0]
-                    file_path = os.path.join(self.data_path, file)
+                    file_path = os.path.join(self.market_data_path, file)
                     try:
                         market_data = pd.read_csv(file_path)
                         # Add symbol column if not exists
@@ -432,12 +433,12 @@ class TradingDatasetGenerator:
                         logger.error(f"Error processing {file}: {e}")
         else:
             # Single file (parquet or csv)
-            extension = os.path.splitext(self.data_path)[1].lower()
+            extension = os.path.splitext(self.market_data_path)[1].lower()
             try:
                 if extension == '.csv':
-                    market_data = pd.read_csv(self.data_path)
+                    market_data = pd.read_csv(self.market_data_path)
                 elif extension in ['.parquet', '.pq']:
-                    market_data = pd.read_parquet(self.data_path)
+                    market_data = pd.read_parquet(self.market_data_path)
                 else:
                     raise ValueError(f"Unsupported file format: {extension}")
                 
@@ -461,7 +462,7 @@ class TradingDatasetGenerator:
                             logger.error(f"Error processing grouped symbol {symbol}: {e}")
                 else:
                     # Treat as single symbol
-                    symbol = os.path.basename(self.data_path).split('.')[0]
+                    symbol = os.path.basename(self.market_data_path).split('.')[0]
                     # Add symbol column for consistency
                     if 'symbol' not in market_data.columns:
                         market_data['symbol'] = symbol
@@ -471,7 +472,7 @@ class TradingDatasetGenerator:
                         lookback, num_samples, min_action_threshold
                     ))
             except Exception as e:
-                logger.error(f"Error processing file {self.data_path}: {e}")
+                logger.error(f"Error processing file {self.market_data_path}: {e}")
         
         if not all_data:
             logger.error("No data was generated. Check file paths and market data format.")
@@ -484,13 +485,18 @@ class TradingDatasetGenerator:
         train_df, val_df = train_test_split(df, test_size=val_split, random_state=42)
         
         # Save datasets
-        train_path = os.path.join(self.output_path, "train_data.json")
-        val_path = os.path.join(self.output_path, "val_data.json")
+        train_path = os.path.join(self.output_dir, "train_data.json")
+        val_path = os.path.join(self.output_dir, "val_data.json")
+        
+        # Create parent directories if they don't exist
+        os.makedirs(os.path.dirname(train_path), exist_ok=True)
+        os.makedirs(os.path.dirname(val_path), exist_ok=True)
         
         train_df.to_json(train_path, orient='records')
         val_df.to_json(val_path, orient='records')
         
         logger.info(f"Dataset generation complete. Training: {len(train_df)} samples, Validation: {len(val_df)} samples")
+        logger.info(f"Saved to {train_path} and {val_path}")
         
         return train_df, val_df
     
@@ -574,6 +580,20 @@ class TradingDatasetGenerator:
             try:
                 logger.info(f"Loading policy model from {policy_path}")
                 model = PPO.load(policy_path)
+                
+                # FIXED: Extract assets list from environment if possible
+                if hasattr(model, 'env') and hasattr(model.env, 'get_attr'):
+                    try:
+                        # For vectorized environments
+                        self.assets = model.env.get_attr('assets')[0]
+                        logger.info(f"Extracted assets from model environment: {self.assets}")
+                    except:
+                        # Fallback - create assets list from symbol
+                        self.assets = [symbol]
+                else:
+                    # Fallback - create assets list from symbol
+                    self.assets = [symbol]
+                
             except Exception as e:
                 logger.error(f"Failed to load model: {e}")
                 return []
@@ -585,14 +605,204 @@ class TradingDatasetGenerator:
                 logger.warning(f"Not enough data for symbol {symbol}, skipping. Need at least {lookback} rows, found {len(market_data)}")
                 return []
             
-            # Sample random windows for this symbol
-            sample_count = min(num_samples, max_window)
-            start_indices = random.sample(range(max_window), sample_count)
+            # CHANGED: Sample from different market periods to ensure more diverse data
+            # Divide the dataset into time segments and sample from each to ensure diversity
+            # This helps prevent biased sampling from periods where the model consistently gives similar signals
+            logger.info(f"Sampling from different time periods for {symbol} to ensure diverse signals")
             
+            # Number of segments - use at least 5 segments to get different market regimes
+            num_segments = min(10, max(5, num_samples // 50))
+            segment_size = max_window // num_segments
+            
+            # Create a list of indices from different time segments
+            start_indices = []
+            samples_per_segment = min(num_samples * 3 // num_segments + 5, segment_size)
+            
+            # ENHANCED: Calculate volatility for the entire dataset to identify high/low volatility periods
+            # Uses a simple rolling standard deviation of returns as volatility measure
+            logger.info(f"Calculating volatility to ensure sampling from both calm and volatile periods")
+            
+            # Calculate returns (avoid look-ahead bias by ensuring we use data that would be available at decision time)
+            if 'close' in market_data.columns:
+                returns = market_data['close'].pct_change().fillna(0)
+                # Calculate rolling volatility 
+                window_size = min(20, lookback // 2)  # Use smaller window for volatility calc
+                rolling_volatility = returns.rolling(window=window_size).std().fillna(0)
+                
+                # Identify high and low volatility periods
+                volatility_threshold_high = np.percentile(rolling_volatility, 75)  # Top 25% = high volatility
+                volatility_threshold_low = np.percentile(rolling_volatility, 25)   # Bottom 25% = low volatility
+                
+                high_volatility_indices = np.where(rolling_volatility >= volatility_threshold_high)[0]
+                low_volatility_indices = np.where(rolling_volatility <= volatility_threshold_low)[0]
+                
+                # Filter indices to ensure they are valid start indices (not too close to end)
+                high_volatility_indices = [i for i in high_volatility_indices if i < max_window]
+                low_volatility_indices = [i for i in low_volatility_indices if i < max_window]
+                
+                # Sample some high and low volatility periods
+                volatility_samples_target = min(num_samples // 4, 50)  # Target 25% of samples from volatility-based selection
+                
+                if len(high_volatility_indices) > 0:
+                    high_vol_samples = random.sample(
+                        list(high_volatility_indices), 
+                        min(volatility_samples_target, len(high_volatility_indices))
+                    )
+                    start_indices.extend(high_vol_samples)
+                    logger.info(f"Added {len(high_vol_samples)} samples from high volatility periods")
+                
+                if len(low_volatility_indices) > 0:
+                    low_vol_samples = random.sample(
+                        list(low_volatility_indices), 
+                        min(volatility_samples_target, len(low_volatility_indices))
+                    )
+                    start_indices.extend(low_vol_samples)
+                    logger.info(f"Added {len(low_vol_samples)} samples from low volatility periods")
+                
+                # ADDED: Trend-based sampling to capture different market regimes (uptrend, downtrend, sideways)
+                logger.info(f"Identifying market trends to ensure sampling from different market regimes")
+                
+                # Calculate short and long term moving averages to identify trends
+                short_window = min(10, lookback // 4)
+                long_window = min(30, lookback // 2)
+                
+                # Calculate smoothed price using moving averages
+                short_ma = market_data['close'].rolling(window=short_window).mean().fillna(method='bfill')
+                long_ma = market_data['close'].rolling(window=long_window).mean().fillna(method='bfill')
+                
+                # Identify trend periods (uptrend, downtrend, sideways)
+                uptrend_mask = (short_ma > long_ma) & (market_data['close'].pct_change(20).fillna(0) > 0.01)
+                downtrend_mask = (short_ma < long_ma) & (market_data['close'].pct_change(20).fillna(0) < -0.01)
+                sideways_mask = (~uptrend_mask) & (~downtrend_mask)
+                
+                uptrend_indices = np.where(uptrend_mask)[0]
+                downtrend_indices = np.where(downtrend_mask)[0]
+                sideways_indices = np.where(sideways_mask)[0]
+                
+                # Filter indices to ensure they are valid start indices
+                uptrend_indices = [i for i in uptrend_indices if i < max_window]
+                downtrend_indices = [i for i in downtrend_indices if i < max_window]
+                sideways_indices = [i for i in sideways_indices if i < max_window]
+                
+                # Sample from each trend type
+                trend_samples_target = min(num_samples // 6, 30)  # Target ~15% of samples from each trend
+                
+                if len(uptrend_indices) > 0:
+                    uptrend_samples = random.sample(
+                        list(uptrend_indices),
+                        min(trend_samples_target, len(uptrend_indices))
+                    )
+                    start_indices.extend(uptrend_samples)
+                    logger.info(f"Added {len(uptrend_samples)} samples from uptrend periods")
+                
+                if len(downtrend_indices) > 0:
+                    downtrend_samples = random.sample(
+                        list(downtrend_indices),
+                        min(trend_samples_target, len(downtrend_indices))
+                    )
+                    start_indices.extend(downtrend_samples)
+                    logger.info(f"Added {len(downtrend_samples)} samples from downtrend periods")
+                
+                if len(sideways_indices) > 0:
+                    sideways_samples = random.sample(
+                        list(sideways_indices),
+                        min(trend_samples_target, len(sideways_indices))
+                    )
+                    start_indices.extend(sideways_samples)
+                    logger.info(f"Added {len(sideways_samples)} samples from sideways periods")
+            
+            # Continue with regular time-segment based sampling
+            for i in range(num_segments):
+                segment_start = i * segment_size
+                segment_end = segment_start + segment_size
+                
+                # Ensure we don't go beyond dataset bounds
+                if segment_end > max_window:
+                    segment_end = max_window
+                
+                # Sample indices from this segment
+                if segment_end > segment_start:
+                    segment_samples = random.sample(
+                        range(segment_start, segment_end),
+                        min(samples_per_segment, segment_end - segment_start)
+                    )
+                    start_indices.extend(segment_samples)
+            
+            # Remove duplicates while preserving order
+            start_indices = list(dict.fromkeys(start_indices))
+            
+            logger.info(f"Sampled {len(start_indices)} indices across {num_segments} time segments and volatility regimes")
+            
+            # Now do an initial pass to collect model behavior across different time periods
+            # This helps understand the model's behavior distribution
+            logger.info(f"Analyzing model behavior distribution across the dataset...")
+            action_distribution = {"long": 0, "short": 0, "neutral": 0}
+            
+            # Sample every N points to get a quick distribution overview
+            sampling_interval = max(1, len(market_data) // 1000)
+            for i in range(0, len(market_data) - lookback, sampling_interval):
+                try:
+                    # Get window of market data
+                    test_window = market_data.iloc[i:i + lookback].copy().reset_index(drop=True)
+                    
+                    # Create OHLCV-only window for observation preparation
+                    test_obs_window = test_window.copy()
+                    for col in non_numeric_columns:
+                        if col in test_obs_window.columns:
+                            test_obs_window = test_obs_window.drop(columns=[col])
+                    
+                    # Prepare observation from window
+                    test_observation = self._prepare_observation(test_obs_window)
+                    test_observation = np.nan_to_num(test_observation, nan=0.0, posinf=0.0, neginf=0.0)
+                    
+                    # Get model prediction
+                    test_action, _ = model.predict(test_observation, deterministic=False)
+                    test_action = np.nan_to_num(test_action, nan=0.0, posinf=0.0, neginf=0.0)
+                    
+                    # Extract action value
+                    test_action_value = test_action[0] if isinstance(test_action, np.ndarray) and len(test_action) > 0 else test_action
+                    
+                    # Categorize the action
+                    if test_action_value > 0.2:
+                        action_distribution["long"] += 1
+                    elif test_action_value < -0.2:
+                        action_distribution["short"] += 1
+                    else:
+                        action_distribution["neutral"] += 1
+                        
+                except Exception as e:
+                    # Skip errors in test sampling
+                    pass
+            
+            # Log the action distribution
+            total_samples = sum(action_distribution.values())
+            if total_samples > 0:
+                pct_long = action_distribution["long"] / total_samples * 100
+                pct_short = action_distribution["short"] / total_samples * 100
+                pct_neutral = action_distribution["neutral"] / total_samples * 100
+                
+                logger.info(f"Model action distribution for {symbol}:")
+                logger.info(f"  Long: {action_distribution['long']} ({pct_long:.1f}%)")
+                logger.info(f"  Short: {action_distribution['short']} ({pct_short:.1f}%)")
+                logger.info(f"  Neutral: {action_distribution['neutral']} ({pct_neutral:.1f}%)")
+            
+            # Tracking for action diversity
+            long_samples = 0
+            short_samples = 0
+            hold_samples = 0
+            target_per_category = max(num_samples // 3, 10)  # Aim for balanced categories
             successful_samples = 0
+            processed_indices = set()  # Track already used indices
+            
+            # First pass to collect actions and their counts
+            action_values = []
             for start_idx in start_indices:
                 try:
-                    # Get window of market data and create a copy to avoid SettingWithCopyWarning
+                    # Skip if already processed
+                    if start_idx in processed_indices:
+                        continue
+                    
+                    # Get window of market data
                     window = market_data.iloc[start_idx:start_idx + lookback].copy().reset_index(drop=True)
                     
                     # Create OHLCV-only window for observation preparation
@@ -605,118 +815,361 @@ class TradingDatasetGenerator:
                     # Prepare observation from window
                     try:
                         observation = self._prepare_observation(observation_window)
-                        
-                        # Verify observation is a proper numeric array
-                        if not isinstance(observation, np.ndarray) or observation.dtype == np.dtype('O'):
-                            logger.error(f"Invalid observation array type: {type(observation)}, dtype: {observation.dtype}")
-                            # Convert to float64 explicitly
-                            observation = np.array(observation, dtype=np.float64)
-                        
-                        # Verify no NaN or Inf values
                         observation = np.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
                     except Exception as e:
                         logger.error(f"Failed to prepare observation for {symbol} at index {start_idx}: {e}")
                         continue
                     
-                    # Get model prediction with type safety
+                    # Get model prediction
                     try:
-                        action, _ = model.predict(observation, deterministic=True)
-                        
-                        # Verify action is a proper numeric array and convert if needed
-                        if not isinstance(action, np.ndarray) or action.dtype == np.dtype('O'):
-                            logger.warning(f"Invalid action array type: {type(action)}, dtype: {action.dtype}")
-                            # Convert to float64 explicitly
-                            action = np.array(action, dtype=np.float64)
-                            
-                        # Verify no NaN or Inf values
+                        action, _ = model.predict(observation, deterministic=False)
                         action = np.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
-                        
                     except Exception as e:
                         logger.error(f"Failed to predict action for {symbol} at index {start_idx}: {e}")
                         continue
                     
-                    # Skip if action is too close to neutral
-                    action_value = action[0] if isinstance(action, np.ndarray) and len(action) > 0 else action
-                    if abs(action_value) < min_action_threshold:
+                    # FIXED: Process multi-asset actions properly
+                    # The model returns one action per asset, so we need to handle all of them
+                    if isinstance(action, np.ndarray) and len(action) > 1:
+                        # Multiple assets case
+                        asset_actions = []
+                        
+                        # Process each asset action
+                        for i, action_value in enumerate(action):
+                            asset_name = self.assets[i] if i < len(self.assets) else f"Asset_{i}"
+                            
+                            # Ensure the action is a clean float and handle any NaN/Inf values
+                            action_value = float(np.nan_to_num(action_value, nan=0.0, posinf=1.0, neginf=-1.0))
+                            
+                            # Skip if action is too close to neutral
+                            if abs(action_value) < min_action_threshold:
+                                continue
+                                
+                            # Calculate direction following perp_env logic
+                            direction = np.sign(action_value) if abs(action_value) > 1e-8 else 0
+                            
+                            # Calculate leverage using the same method as in perp_env
+                            env_max_leverage = 10.0
+                            signal_threshold = 0.1  # Same as in perp_env
+                            
+                            if abs(action_value) < signal_threshold:
+                                leverage = 0.0  # No position for very small actions
+                            else:
+                                # Get signal strength
+                                signal_strength = abs(action_value)
+                            
+                                # Ensure signal strength is in valid range
+                                signal_strength = max(signal_threshold, min(1.0, signal_strength))
+                                
+                                # Calculate leverage using the quadratic scaling for smoother leverage curve
+                                min_leverage = 1.0
+                                leverage = min_leverage + (env_max_leverage - min_leverage) * (signal_strength ** 1.5)
+                                
+                                # Ensure leverage is between min_leverage and env_max_leverage
+                                leverage = max(min_leverage, min(leverage, env_max_leverage))
+                            
+                            # Apply direction to leverage
+                            signed_leverage = leverage * direction
+                            
+                            # Store processed action
+                            asset_actions.append({
+                                "asset": asset_name,
+                                "action_value": action_value,
+                                "direction": direction,
+                                "leverage": leverage,
+                                "signed_leverage": signed_leverage
+                            })
+                            
+                        # Skip if no significant actions
+                        if not asset_actions:
+                            continue
+                            
+                        # Use the first significant action for category counting
+                        # This helps maintain the balancing system
+                        primary_action = asset_actions[0]
+                        action_value = primary_action["action_value"]
+                        direction = primary_action["direction"]
+                        leverage = primary_action["leverage"]
+                        signed_leverage = primary_action["signed_leverage"]
+                        
+                        # Format multi-asset explanation
+                        multi_asset_explanation = True
+                            
+                    else:
+                        # Single asset case - use existing code
+                        multi_asset_explanation = False
+                        
+                        # Extract action value
+                        action_value = action[0] if isinstance(action, np.ndarray) and len(action) > 0 else action
+                        
+                        # FIXED: Ensure raw_action is the unmodified signal from the model
+                        raw_action = float(action_value)
+                        
+                        # Ensure the action is a clean float and handle any NaN/Inf values
+                        action_value = float(np.nan_to_num(action_value, nan=0.0, posinf=1.0, neginf=-1.0))
+                        
+                        # Debug the raw action value from model
+                        logger.warning(f"Raw model action value for {symbol}: {action_value}")
+                        
+                        # Skip if action is too close to neutral
+                        if abs(action_value) < min_action_threshold:
+                            continue
+                        
+                        # Calculate direction following perp_env logic
+                        # In perp_env, direction = np.sign(signal) if abs(signal) > 1e-8 else 0
+                        direction = np.sign(action_value) if abs(action_value) > 1e-8 else 0
+                        
+                        # Calculate leverage using the same method as in perp_env
+                        # Using _get_target_leverage equivalent implementation
+                        env_max_leverage = 10.0
+                        signal_threshold = 0.1  # Same as in perp_env
+                        
+                        if abs(action_value) < signal_threshold:
+                            leverage = 0.0  # No position for very small actions
+                        else:
+                            # Get signal strength
+                            signal_strength = abs(action_value)
+                        
+                            # Ensure signal strength is in valid range
+                            signal_strength = max(signal_threshold, min(1.0, signal_strength))
+                            
+                            # Calculate leverage using the quadratic scaling for smoother leverage curve
+                            min_leverage = 1.0
+                            leverage = min_leverage + (env_max_leverage - min_leverage) * (signal_strength ** 1.5)
+                            
+                            # Ensure leverage is between min_leverage and env_max_leverage
+                            leverage = max(min_leverage, min(leverage, env_max_leverage))
+                        
+                        # IMPORTANT: Apply direction to leverage like in perp_env
+                        # In perp_env, they use: target_value = direction * effective_leverage * portfolio_value
+                        # So the direction is combined with leverage
+                        signed_leverage = leverage * direction
+                    
+                    # Categorize the action for balancing
+                    action_category = "long" if action_value > 0 else "short" if action_value < 0 else "hold"
+                    
+                    # Skip this window if we're trying to balance categories and already have enough of this type
+                    if action_category == "long" and long_samples >= target_per_category:
+                        # Skip if we already have enough long samples
+                        continue
+                    elif action_category == "short" and short_samples >= target_per_category:
+                        # Skip if we already have enough short samples
+                        continue
+                    elif action_category == "hold" and hold_samples >= target_per_category:
+                        # Skip if we already have enough hold samples
                         continue
                     
-                    # Calculate leverage and direction based on action value (matches the trading environment logic)
-                    # This is critical for correct LLM training data
-                    signal_strength = abs(action_value)
-                    direction = 1 if action_value > 0 else (-1 if action_value < 0 else 0)
+                    # Calculate direction and leverage
+                    direction = 1 if action_value > 0 else -1 if action_value < 0 else 0
                     
-                    # Calculate leverage similar to the trading environment's _get_target_leverage method
-                    min_leverage = 1.0
-                    max_leverage = 5.0  # Conservative default
-                    leverage = min_leverage + (max_leverage - min_leverage) * (signal_strength ** 1.5)
-                    leverage = max(1.0, min(leverage, max_leverage))
+                    # Calculate leverage using the same method as in perp_env
+                    # Using _get_target_leverage equivalent implementation
+                    env_max_leverage = 10.0
+                    signal_threshold = 0.1  # Same as in perp_env
                     
-                    # Create action vector that includes direction, signal strength, and calculated leverage
-                    # Format: [direction, action_value, leverage]
-                    formatted_action = [float(direction), float(action_value), float(leverage)]
+                    if abs(action_value) < signal_threshold:
+                        leverage = 0.0  # No position for very small actions
+                    else:
+                        # Get signal strength
+                        signal_strength = abs(action_value)
+                        
+                        # Ensure signal strength is in valid range
+                        signal_strength = max(signal_threshold, min(1.0, signal_strength))
+                        
+                        # Calculate leverage using the quadratic scaling for smoother leverage curve
+                        min_leverage = 1.0
+                        leverage = min_leverage + (env_max_leverage - min_leverage) * (signal_strength ** 1.5)
+                        
+                        # Ensure leverage is between min_leverage and env_max_leverage
+                        leverage = max(min_leverage, min(leverage, env_max_leverage))
                     
-                    # Extract technical indicators for the last candle (safely)
+                    # Format action to include direction and strength
+                    formatted_action = [float(direction), float(action_value), float(signed_leverage)]
+                    
+                    # Extract technical indicators for the last candle
                     tech_indicators = {}
                     skip_columns = set(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'index', 'symbol', 'asset'])
                     for col in window.columns:
                         if col not in skip_columns:
                             try:
                                 value = window.iloc[-1][col]
-                                # Ensure value is a simple numeric type
                                 if isinstance(value, (int, float, np.number)):
                                     tech_indicators[col] = float(value)
                             except Exception:
                                 pass
                     
-                    # Generate explanation
+                    # Generate explanation based on whether we have multi-asset actions
                     try:
-                        explanation = self._generate_explanation(
-                            observation, 
-                            action, 
-                            tech_indicators
-                        )
+                        if multi_asset_explanation:
+                            # Generate multi-asset explanation
+                            assets_explanations = []
+                            
+                            # Process each asset with significant action
+                            for asset_action in asset_actions:
+                                asset_name = asset_action["asset"]
+                                asset_action_value = asset_action["action_value"]
+                                asset_leverage = asset_action["leverage"]
+                                
+                                # Generate explanation for this asset
+                                asset_explanation = self._generate_explanation(
+                                    observation,
+                                    asset_action_value,
+                                    tech_indicators,
+                                    asset_leverage
+                                )
+                                
+                                # Add to list with asset name
+                                assets_explanations.append(f"{asset_name}: {asset_explanation}")
+                            
+                            # Combine explanations
+                            explanation = "\n\nMulti-Asset Trading Decision:\n" + "\n\n".join(assets_explanations)
+                            
+                            # Format action including all assets
+                            formatted_action = [
+                                [asset_action["asset"], 
+                                 float(asset_action["direction"]), 
+                                 float(asset_action["action_value"]), 
+                                 float(asset_action["signed_leverage"])]
+                                for asset_action in asset_actions
+                            ]
+                        else:
+                            # Single asset explanation - original code
+                            explanation = self._generate_explanation(
+                                observation, 
+                                action_value,  # Pass raw action value instead of array
+                                tech_indicators,
+                                leverage  # Pass calculated leverage directly
+                            )
+                            
+                            # Format action to include direction and strength
+                            formatted_action = [float(direction), float(action_value), float(signed_leverage)]
                     except Exception as e:
                         logger.error(f"Failed to generate explanation for {symbol} at index {start_idx}: {e}")
-                        explanation = f"The model suggests to {'buy' if action_value > 0 else 'sell'} based on current market conditions."
+                        if multi_asset_explanation:
+                            # Default multi-asset explanation
+                            assets_descriptions = []
+                            for asset_action in asset_actions:
+                                asset_name = asset_action["asset"]
+                                action_desc = "buy" if asset_action["direction"] > 0 else "sell"
+                                assets_descriptions.append(f"{asset_name}: The model suggests to {action_desc} based on current market conditions.")
+                            explanation = "\n\n".join(assets_descriptions)
+                            
+                            # Format action including all assets
+                            formatted_action = [
+                                [asset_action["asset"], 
+                                 float(asset_action["direction"]), 
+                                 float(asset_action["action_value"]), 
+                                 float(asset_action["signed_leverage"])]
+                                for asset_action in asset_actions
+                            ]
+                        else:
+                            # Default single-asset explanation
+                            explanation = f"The model suggests to {'buy' if action_value > 0 else 'sell'} based on current market conditions."
+                            formatted_action = [float(direction), float(action_value), float(signed_leverage)]
                     
                     # Create sample with formatted prompts
-                    prompt = f"Given the market data for {symbol}, explain the trading decision: "
+                    if multi_asset_explanation:
+                        # Multi-asset prompt
+                        assets_list = ", ".join([asset_action["asset"] for asset_action in asset_actions])
+                        prompt = f"Given the market data for multiple assets ({assets_list}), explain the multi-asset trading decision: "
+                    else:
+                        # Single-asset prompt
+                        prompt = f"Given the market data for {symbol}, explain the trading decision: "
                     
                     # Timestamp extraction
+                    start_timestamp = None
+                    end_timestamp = None
                     if 'timestamp' in window.columns:
+                        # Get both start and end timestamps for the window
+                        start_timestamp = window.iloc[0]['timestamp']
+                        end_timestamp = window.iloc[-1]['timestamp']
                         timestamp = window.iloc[-1]['timestamp']
                     else:
                         timestamp = f"{symbol}_{start_idx}_{start_idx + lookback}"
                     
-                    # Convert arrays to lists safely
+                    # Convert arrays to lists
                     try:
                         observation_list = observation.tolist()
                     except (AttributeError, TypeError):
                         observation_list = [float(x) for x in observation]
                     
-                    # Store the formatted action list (direction, raw_action, leverage)
-                    action_list = formatted_action
-                    
+                    # Create sample
                     sample = {
                         'symbol': symbol,
                         'timestamp': timestamp,
                         'observation': observation_list,
-                        'action': action_list,
+                        'action': formatted_action,
                         'explanation': explanation,
-                        'prompt': prompt
+                        'prompt': prompt,
+                        # Add detailed period information for debugging
+                        'window_info': {
+                            'start_idx': start_idx,
+                            'end_idx': start_idx + lookback,
+                            'start_timestamp': start_timestamp,
+                            'end_timestamp': end_timestamp,
+                            'window_size': lookback,
+                            'price_start': float(window.iloc[0]['close']),
+                            'price_end': float(window.iloc[-1]['close']),
+                        }
                     }
                     
+                    # Add multi-asset information if applicable
+                    if multi_asset_explanation:
+                        sample['is_multi_asset'] = True
+                        sample['assets'] = [asset_action["asset"] for asset_action in asset_actions]
+                        
+                        # Add additional action details in a more structured format
+                        sample['actions_by_asset'] = {
+                            asset_action["asset"]: {
+                                "action_value": float(asset_action["action_value"]),
+                                "direction": float(asset_action["direction"]),
+                                "leverage": float(asset_action["leverage"]),
+                                "signed_leverage": float(asset_action["signed_leverage"])
+                            }
+                            for asset_action in asset_actions
+                        }
+                    else:
+                        sample['is_multi_asset'] = False
+                        sample['window_info']['action_value'] = float(action_value)
+                        sample['window_info']['leverage'] = float(leverage)
+                    
                     symbol_samples.append(sample)
+                    processed_indices.add(start_idx)  # Mark this index as processed
                     successful_samples += 1
+                    
+                    # Enhanced logging with timestamp info for better debugging
+                    time_info = f"[{start_timestamp} to {end_timestamp}]" if start_timestamp and end_timestamp else f"[idx:{start_idx}-{start_idx+lookback}]"
+                    price_change = ((float(window.iloc[-1]['close']) / float(window.iloc[0]['close'])) - 1.0) * 100
+                    
+                    # Log information based on single or multi-asset
+                    if multi_asset_explanation:
+                        # Create a summary of actions for all assets
+                        actions_summary = ", ".join([
+                            f"{a['asset']}: {'LONG' if a['direction'] > 0 else 'SHORT'} ({a['action_value']:.2f})"
+                            for a in asset_actions
+                        ])
+                        
+                        log_message = f"MULTI-ASSET SAMPLE | #{successful_samples} | {time_info} | price change: {price_change:.2f}% | actions: {actions_summary}"
+                    else:
+                        # Single asset logging (original format)
+                        log_message = f"SAMPLE DATA | #{successful_samples} | {symbol} | {time_info} | price change: {price_change:.2f}% | action: {action_value:.4f} | leverage: {leverage:.2f}x | direction: {'LONG' if action_value > 0 else 'SHORT'}"
+                    
+                    # Update category counters
+                    if action_category == "long":
+                        long_samples += 1
+                    elif action_category == "short":
+                        short_samples += 1
+                    else:
+                        hold_samples += 1
                     
                     # Periodically log progress
                     if successful_samples % 50 == 0:
-                        logger.info(f"Generated {successful_samples} samples for {symbol} so far...")
+                        logger.info(f"Generated {successful_samples} samples for {symbol} so far... (long: {long_samples}, short: {short_samples}, hold: {hold_samples})")
                         
                 except Exception as e:
                     logger.error(f"Error processing window for {symbol} at index {start_idx}: {e}")
             
-            logger.info(f"Generated {len(symbol_samples)} samples for {symbol}")
+            logger.info(f"Generated {len(symbol_samples)} samples for {symbol} with action distribution: long: {long_samples}, short: {short_samples}, hold: {hold_samples}")
             
         except Exception as e:
             logger.error(f"Error processing symbol {symbol}: {e}")
@@ -1013,31 +1466,30 @@ class TradingDatasetGenerator:
     def _generate_explanation(
         self, 
         observation: np.ndarray, 
-        action: np.ndarray, 
-        technical_indicators: Optional[Dict[str, float]] = None
+        action: float, 
+        technical_indicators: Optional[Dict[str, float]] = None,
+        leverage: float = 1.0
     ) -> str:
         """
         Generate a natural language explanation for a trading decision
         
         Args:
             observation: Observation array from the environment
-            action: Action array from the RL policy (values in range [-1,1] that determine direction and signal strength)
+            action: Action value from the RL policy (values in range [-1,1] that determine direction and signal strength)
             technical_indicators: Dictionary of technical indicators
+            leverage: Calculated leverage for the trading decision (not used in explanation generation)
             
         Returns:
-            Natural language explanation of the trading decision
+            Natural language explanation of the trading decision with in-depth analysis
         """
         try:
-            # Process action value from RL model
-            action_value = float(action[0]) if isinstance(action, np.ndarray) and len(action) > 0 else float(action)
-            
             # Determine action type and direction based on signal value
             # In the trading environment, the sign of the action indicates direction:
             # - Positive values = Long position
             # - Negative values = Short position
             # - Near zero values = Hold/no position
-            signal_strength = abs(action_value)
-            direction = 1 if action_value > 0 else (-1 if action_value < 0 else 0)
+            signal_strength = abs(action)
+            direction = 1 if action > 0 else (-1 if action < 0 else 0)
             
             # Determine trade decision based on signal strength threshold (matches the environment's threshold)
             signal_threshold = 0.1  # Same as environment's default signal_threshold
@@ -1049,39 +1501,12 @@ class TradingDatasetGenerator:
             else:
                 action_type = "buy" if direction > 0 else "sell"
             
-            # Calculate leverage based on signal strength - matching the environment's _get_target_leverage logic
-            if signal_strength < signal_threshold:
-                leverage = 0.0
-            else:
-                # Base leverage calculation (simplified version of what the environment does)
-                min_leverage = 1.0
-                max_leverage = 5.0  # Conservative value, actual trading env uses higher values
-                
-                # Calculate base leverage using similar scaling as the trading environment
-                leverage = min_leverage + (max_leverage - min_leverage) * (signal_strength ** 1.5)
-                leverage = max(1.0, min(leverage, max_leverage))  # Ensure leverage is at least 1.0 and at most max_leverage
-            
             # Format technical indicators for explanation
             tech_indicators_str = ""
             if technical_indicators:
-                # Select just a few important indicators to include in the explanation
-                important_indicators = {}
-                indicator_preference = ['RSI_14', 'MACD', 'SMA_10', 'SMA_20', 'SMA_50', 'BB_upper', 'BB_lower']
-                
-                # First add preferred indicators if they exist
-                for ind in indicator_preference:
-                    if ind in technical_indicators:
-                        important_indicators[ind] = technical_indicators[ind]
-                
-                # If we don't have enough, add some other ones
-                if len(important_indicators) < 3:
-                    for ind, val in technical_indicators.items():
-                        if ind not in important_indicators and len(important_indicators) < 3:
-                            important_indicators[ind] = val
-                
                 # Format selected indicators
                 indicator_items = []
-                for indicator, value in important_indicators.items():
+                for indicator, value in technical_indicators.items():
                     # Format the indicator value (round floats to 2 decimal places)
                     if isinstance(value, float):
                         formatted_value = f"{value:.2f}"
@@ -1092,42 +1517,78 @@ class TradingDatasetGenerator:
                 
                 tech_indicators_str = ", ".join(indicator_items)
             
-            # Create explanation templates based on action type
-            templates = {
-                "buy": [
-                    "Based on the recent price movement and RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}, I'm going long with a leverage of {leverage:.2f}x. The market seems to be in an uptrend.",
-                    "The technical indicators RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} suggest bullish momentum. I'm taking a long position with {leverage:.2f}x leverage.",
-                    "I'm entering a long position with {leverage:.2f}x leverage as the RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} indicate potential upside.",
-                    "The market conditions look favorable for a long position. Using {leverage:.2f}x leverage based on RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}."
-                ],
-                "sell": [
-                    "Based on the recent price movement and RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}, I'm going short with a leverage of {leverage:.2f}x. The market seems to be in a downtrend.",
-                    "The technical indicators RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} suggest bearish momentum. I'm taking a short position with {leverage:.2f}x leverage.",
-                    "I'm entering a short position with {leverage:.2f}x leverage as the RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} indicate potential downside.",
-                    "The market conditions look unfavorable. Using {leverage:.2f}x leverage to short based on RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}."
-                ],
-                "hold": [
-                    "Based on the current market conditions and RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}, I'm holding my position as there's no clear directional signal.",
-                    "The technical indicators RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} are mixed. I'm maintaining a neutral position for now.",
-                    "I'm staying neutral as the RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f} don't provide a strong directional bias.",
-                    "Market conditions don't favor a strong directional bet right now based on RSI_14: {rsi:.2f}, MACD: {macd:.2f}, SMA_20: {sma20:.2f}. Maintaining a neutral stance."
-                ]
-            }
-            
             # Get indicator values with safe defaults
             rsi_val = technical_indicators.get('RSI_14', 50.0) if technical_indicators else 50.0
             macd_val = technical_indicators.get('MACD', 0.0) if technical_indicators else 0.0
+            macd_signal_val = technical_indicators.get('MACD_signal', 0.0) if technical_indicators else 0.0
+            macd_hist_val = technical_indicators.get('MACD_hist', 0.0) if technical_indicators else 0.0
             sma20_val = technical_indicators.get('SMA_20', 0.0) if technical_indicators else 0.0
+            sma50_val = technical_indicators.get('SMA_50', 0.0) if technical_indicators else 0.0
+            bb_upper = technical_indicators.get('BB_upper', 0.0) if technical_indicators else 0.0
+            bb_lower = technical_indicators.get('BB_lower', 0.0) if technical_indicators else 0.0
+            price = technical_indicators.get('close', 0.0) if technical_indicators else 0.0
+            volume = technical_indicators.get('volume', 0.0) if technical_indicators else 0.0
+            trend = technical_indicators.get('trend', 'unknown') if technical_indicators else 'unknown'
+            
+            # Create explanation templates based on action type with in-depth analysis
+            # Focus on WHY a position should be taken based on technical analysis
+            templates = {
+                "buy": [
+                    # Comprehensive technical analysis for LONG positions
+                    "After analyzing the current market conditions, I'm recommending a LONG position. The RSI at {rsi:.2f} indicates bullish momentum that hasn't yet reached overbought territory. The MACD line ({macd:.2f}) is above the signal line ({macd_signal:.2f}), confirming positive momentum. Additionally, price has formed support above the SMA-20 ({sma20:.2f}), suggesting a continued uptrend. Volume analysis shows increasing buying pressure, further supporting this bullish outlook.",
+                    
+                    "My analysis points to a strong buying opportunity. The market is showing clear bullish signals with the RSI at {rsi:.2f} indicating strengthening momentum. MACD at {macd:.2f} versus signal line at {macd_signal:.2f} shows a positive crossover, typically a reliable buy signal. Price action is constructive with recent candles closing above both SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}), confirming the uptrend. The Bollinger Bands show expansion with price pushing toward the upper band ({bb_upper:.2f}), indicating potential for continued upside movement.",
+                    
+                    "I recommend going LONG based on multiple confluence factors. First, the market structure shows higher lows forming an ascending pattern. The RSI at {rsi:.2f} indicates bullish momentum without being overextended. The MACD histogram ({macd_hist:.2f}) is positive and expanding, showing accelerating upward momentum. Price is trading above key moving averages with SMA-20 ({sma20:.2f}) crossing above SMA-50 ({sma50:.2f}), a classic bullish signal. Market is in a confirmed {trend} trend, with price finding support at the previous resistance levels, suggesting further upside potential.",
+                    
+                    "Technical analysis strongly favors a LONG position. The price has broken above a key resistance level and is now retesting it as support. The RSI reading of {rsi:.2f} shows bullish momentum that isn't yet overextended, while the MACD ({macd:.2f}) shows a positive crossover, confirming bullish momentum. Price is trading above both the SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}), with the shorter-term average trending upward. The recent price action shows strong buying pressure with bullish candlestick patterns and above-average volume, indicating institutional interest in pushing prices higher.",
+                    
+                    "Market analysis indicates it's time to go LONG. We're seeing a bullish momentum shift with the RSI at {rsi:.2f} showing strength without being overbought. The MACD indicator is bullish with the MACD line ({macd:.2f}) above the signal line ({macd_signal:.2f}) and the histogram ({macd_hist:.2f}) expanding positively. Price is trading comfortably above the SMA-20 ({sma20:.2f}) which is now sloping upward. Additionally, price has just bounced off the lower Bollinger Band ({bb_lower:.2f}) and is heading toward the middle band, indicating positive mean reversion with upside potential. The overall {trend} trend remains intact, supporting a bullish outlook.",
+                    
+                    "Based on comprehensive chart analysis, I recommend taking a LONG position. The market is forming a bullish continuation pattern with the RSI at {rsi:.2f} showing momentum acceleration. MACD analysis shows the MACD line ({macd:.2f}) above the signal line ({macd_signal:.2f}) with a widening histogram ({macd_hist:.2f}), confirming increasing bullish momentum. Price is trading above both the SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}), with the moving averages aligned in a bullish configuration. Volume analysis shows accumulation on up-moves and decreased volume on pullbacks, a classic sign of bullish continuation."
+                ],
+                "sell": [
+                    # Comprehensive technical analysis for SHORT positions
+                    "After analyzing the current market conditions, I'm recommending a SHORT position. The RSI at {rsi:.2f} indicates bearish momentum and possible overbought conditions. The MACD line ({macd:.2f}) is below the signal line ({macd_signal:.2f}), confirming negative momentum. Additionally, price has broken below the SMA-20 ({sma20:.2f}), suggesting a potential trend reversal. Volume analysis shows increasing selling pressure, further supporting this bearish outlook.",
+                    
+                    "My analysis points to a strong selling opportunity. The market is showing clear bearish signals with the RSI at {rsi:.2f} indicating weakening momentum. MACD at {macd:.2f} versus signal line at {macd_signal:.2f} shows a negative crossover, typically a reliable sell signal. Price action is deteriorating with recent candles closing below both SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}), confirming the downtrend. The Bollinger Bands show expansion with price pushing toward the lower band ({bb_lower:.2f}), indicating potential for continued downside movement.",
+                    
+                    "I recommend going SHORT based on multiple confluence factors. First, the market structure shows lower highs forming a descending pattern. The RSI at {rsi:.2f} indicates bearish momentum and possible divergence from price. The MACD histogram ({macd_hist:.2f}) is negative and expanding, showing accelerating downward momentum. Price is trading below key moving averages with SMA-20 ({sma20:.2f}) crossing below SMA-50 ({sma50:.2f}), a classic bearish signal. Market is in a confirmed {trend} trend, with price finding resistance at the previous support levels, suggesting further downside potential.",
+                    
+                    "Technical analysis strongly favors a SHORT position. The price has broken below a key support level and is now retesting it as resistance. The RSI reading of {rsi:.2f} shows bearish momentum that's accelerating, while the MACD ({macd:.2f}) shows a negative crossover, confirming bearish momentum. Price is trading below both the SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}), with the shorter-term average trending downward. The recent price action shows strong selling pressure with bearish candlestick patterns and above-average volume, indicating institutional interest in pushing prices lower.",
+                    
+                    "Market analysis indicates it's time to go SHORT. We're seeing a bearish momentum shift with the RSI at {rsi:.2f} showing weakness and potential for continued decline. The MACD indicator is bearish with the MACD line ({macd:.2f}) below the signal line ({macd_signal:.2f}) and the histogram ({macd_hist:.2f}) expanding negatively. Price is trading uncomfortably below the SMA-20 ({sma20:.2f}) which is now sloping downward. Additionally, price has just rejected the upper Bollinger Band ({bb_upper:.2f}) and is heading toward the middle band, indicating negative mean reversion with downside potential. The overall {trend} trend has shifted bearish, supporting a negative outlook.",
+                    
+                    "Based on comprehensive chart analysis, I recommend taking a SHORT position. The market is forming a bearish continuation pattern with the RSI at {rsi:.2f} showing momentum deterioration. MACD analysis shows the MACD line ({macd:.2f}) below the signal line ({macd_signal:.2f}) with a widening histogram ({macd_hist:.2f}), confirming increasing bearish momentum. Price is trading below both the SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}), with the moving averages aligned in a bearish configuration. Volume analysis shows distribution on down-moves and decreased volume on bounces, a classic sign of bearish continuation."
+                ],
+                "hold": [
+                    # Comprehensive analysis for HOLD positions
+                    "After careful analysis of current market conditions, I recommend maintaining a NEUTRAL position. The RSI at {rsi:.2f} is in mid-range, showing no clear directional momentum. The MACD line ({macd:.2f}) and signal line ({macd_signal:.2f}) are close together, indicating indecision in the market. Price is oscillating around the SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}), showing a lack of clear trend. With these mixed signals, it's prudent to wait for a more definitive setup before taking a directional position.",
+                    
+                    "Based on technical analysis, I suggest staying NEUTRAL at this time. The market is showing conflicting signals with the RSI at {rsi:.2f} in the middle range. The MACD histogram ({macd_hist:.2f}) is flat, showing minimal momentum in either direction. Price is trading between key support and resistance levels without clear breakout signals. The Bollinger Bands are contracting, indicating decreasing volatility and potential for a range-bound market in the near term. Better to preserve capital and wait for a higher-probability setup to emerge.",
+                    
+                    "My analysis indicates a HOLD position is appropriate. The market is in a consolidation phase with the RSI at {rsi:.2f} showing neither overbought nor oversold conditions. MACD analysis shows the MACD line ({macd:.2f}) and signal line ({macd_signal:.2f}) are intertwined without clear direction. Price is moving sideways between established support and resistance levels, with the SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}) flattening out. The current {trend} lacks conviction, and volume is below average, suggesting a period of accumulation or distribution before the next directional move. Better to conserve capital and wait for clarity.",
+                    
+                    "Technical indicators suggest maintaining a NEUTRAL stance. The market lacks directional conviction with the RSI at {rsi:.2f} hovering in the middle range. The MACD shows minimal momentum with the MACD line ({macd:.2f}) and signal line ({macd_signal:.2f}) moving close together. Price action is characterized by smaller-range candles with price trading within a defined range. The moving averages SMA-20 ({sma20:.2f}) and SMA-50 ({sma50:.2f}) are flattening and converging, typical of a consolidating market. With this technical picture, it's prudent to stand aside until a clearer trading opportunity presents itself."
+                ]
+            }
             
             # Select a random template for the action type
             template = random.choice(templates[action_type])
             
             # Format template with actual values
             explanation = template.format(
-                leverage=leverage,
                 rsi=rsi_val,
                 macd=macd_val,
-                sma20=sma20_val
+                macd_signal=macd_signal_val,
+                macd_hist=macd_hist_val,
+                sma20=sma20_val,
+                sma50=sma50_val,
+                bb_upper=bb_upper,
+                bb_lower=bb_lower,
+                price=price,
+                volume=volume,
+                trend=trend
             )
             
             return explanation

@@ -609,7 +609,7 @@ class RealTimeTrader:
             obs = self.env.reset()
             
             # Get model prediction (action)
-            action, _ = self.model.predict(obs, deterministic=True)
+            action, _ = self.model.predict(obs, deterministic=False)
             
             # Log the raw action vector
             logger.info(f"Raw action vector: {action}")
