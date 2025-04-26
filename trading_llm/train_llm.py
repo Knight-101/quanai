@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
-Main CLI entry point for the Trading LLM system.
+Training and inference utilities for the Trading LLM system.
 """
 
 import argparse
+import json
 import logging
 import os
+import random
 import sys
-from pathlib import Path
+import time
+import traceback
+from datetime import datetime
+from typing import Dict, List, Optional, Any, Tuple, Union
 
+import numpy as np
 import pandas as pd
 import torch
-from typing import Optional
-import json
-import numpy as np
-from stable_baselines3 import PPO
-import traceback
+import yaml
+from peft import PeftModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 from trading_llm.dataset import TradingDatasetGenerator, create_dataloaders
 from trading_llm.training import TradingTrainer
 from trading_llm.inference import RLLMExplainer, extract_trading_signals, MarketCommentaryGenerator
 from trading_llm.model import TradingLLM
-from trading_llm.chatbot import load_market_chatbot
+from trading_llm.chatbot import MarketChatbot
 from trading_llm.utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -185,6 +189,8 @@ def _generate_synthetic_data(path: str, symbol: str):
 
 def parse_args():
     """Parse command line arguments."""
+    DEFAULT_LLM_MODEL_PATH = "models/llm/llm_model.pt"
+    DEFAULT_BASE_MODEL = "models/llm/base_model.pt"
     parser = argparse.ArgumentParser(description="Trading LLM Training and Inference")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     subparsers.required = True
@@ -236,6 +242,7 @@ def parse_args():
     infer_parser.add_argument("--market-data", default="auto", help="Path to market data file or 'auto' to use combined multi-asset data")
     infer_parser.add_argument("--input-file", help="Input file with observations")
     infer_parser.add_argument("--output-file", help="Output file for explanations")
+    infer_parser.add_argument("--assets", "--asset-names", nargs="+", help="Specific asset names to explain")
     
     # Market commentary command
     commentary_parser = subparsers.add_parser("commentary", help="Generate market commentary")
@@ -257,6 +264,17 @@ def parse_args():
     chat_parser.add_argument("--market-data", default="auto", help="Path to market data file or 'auto' to use combined multi-asset data")
     chat_parser.add_argument("--max-history", type=int, default=5, help="Maximum conversation history")
     chat_parser.add_argument("--system-prompt", help="System prompt for the chatbot")
+    
+    # Explain subcommand
+    explain_parser = subparsers.add_parser('explain', help='Generate natural language explanations for trading decisions')
+    explain_parser.add_argument('--market-data', '-m', required=True, help='Path to market data file or directory (accepts .csv, .parquet)')
+    explain_parser.add_argument('--llm-model', '-l', default=DEFAULT_LLM_MODEL_PATH, help='Path to LLM model or model name')
+    explain_parser.add_argument('--base-model', '-b', default=DEFAULT_BASE_MODEL, help='Base model name (if loading LoRA adapter)')
+    explain_parser.add_argument('--output-file', '-o', help='Output file for generated explanations')
+    explain_parser.add_argument('--use-fallback', action='store_true', help='Use fallback explanations if LLM fails')
+    explain_parser.add_argument('--no-fallback', dest='use_fallback', action='store_false', help='Do not use fallback explanations')
+    explain_parser.add_argument('--asset-names', nargs='+', help='Specific asset names to explain')
+    explain_parser.set_defaults(use_fallback=True)
     
     return parser.parse_args()
 
@@ -391,10 +409,44 @@ def main():
             market_data_path = load_multi_asset_data(for_training=False)
             logger.info(f"Using auto-generated combined market data: {market_data_path}")
         
+        # Load the RL model if path is provided
+        rl_model = None
+        if hasattr(args, 'rl_model') and args.rl_model:
+            try:
+                from stable_baselines3 import PPO
+                logger.info(f"Loading RL model from {args.rl_model}")
+                rl_model = PPO.load(args.rl_model)
+                logger.info("RL model loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load RL model from {args.rl_model}: {str(e)}")
+                logger.warning("Falling back to synthetic actions for trading signals")
+        
+        # Load the LLM model using the appropriate method
+        llm_model = None
+        try:
+            from trading_llm.model import TradingLLM
+            logger.info(f"Loading LLM model from {args.llm_model}")
+            
+            if args.base_model:
+                # Use load_from_pretrained for LoRA adapter
+                llm_model = TradingLLM.load_from_pretrained(
+                    model_dir=args.llm_model,
+                    base_model=args.base_model
+                )
+            else:
+                # Use direct initialization for complete model
+                llm_model = TradingLLM(model_name=args.llm_model)
+                
+            logger.info("LLM model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load LLM model: {str(e)}")
+            logger.warning("Using base LLM model without fine-tuning")
+            llm_model = TradingLLM(model_name=args.base_model)
+        
         explainer = RLLMExplainer(
-            rl_model_path=args.rl_model,
-            llm_model_path=args.llm_model,
-            llm_base_model=args.base_model
+            model=llm_model,
+            asset_names=args.assets,
+            rl_model=rl_model
         )
         
         # Load market data if provided
@@ -429,7 +481,11 @@ def main():
                 print(f"Explanation: {results[0]['explanation']}")
         else:
             # Generate explanations from market data
-            explanations = explainer.explain_trading_decisions(market_data_path)
+            explanations = explainer.explain_trading_decisions(
+                market_data_path,
+                use_fallback=args.use_fallback if hasattr(args, 'use_fallback') else True,
+                asset_names=args.assets if hasattr(args, 'assets') else None
+            )
             
             if args.output_file:
                 with open(args.output_file, 'w') as f:
@@ -540,12 +596,34 @@ def main():
             market_data_path = load_multi_asset_data(for_training=False)
             logger.info(f"Using auto-generated combined market data: {market_data_path}")
         
+        # Load the LLM model using the appropriate method
+        llm_model = None
+        try:
+            from trading_llm.model import TradingLLM
+            logger.info(f"Loading LLM model from {args.llm_model}")
+            
+            if args.base_model:
+                # Use load_from_pretrained for LoRA adapter
+                llm_model = TradingLLM.load_from_pretrained(
+                    model_dir=args.llm_model,
+                    base_model=args.base_model
+                )
+            else:
+                # Use direct initialization for complete model
+                llm_model = TradingLLM(model_name=args.llm_model)
+                
+            logger.info("LLM model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load LLM model: {str(e)}")
+            logger.warning("Using base LLM model without fine-tuning")
+            from trading_llm.model import TradingLLM
+            llm_model = TradingLLM(model_name=args.base_model or "meta-llama/Meta-Llama-3-8B-Instruct")
+        
         # Load the chatbot
-        chatbot = load_market_chatbot(
-            model_path=args.llm_model,
+        chatbot = MarketChatbot(
+            llm_model=llm_model,
             max_history=args.max_history,
-            system_prompt=args.system_prompt,
-            device="auto"
+            system_prompt=args.system_prompt
         )
         
         # Load market data if provided
@@ -556,21 +634,68 @@ def main():
         
         # Load RL model and get trading signals if provided
         if args.rl_model and market_data_path != "auto":
-            model = PPO.load(args.rl_model)
-            signals = extract_trading_signals(model, market_data)
-            chatbot.update_trading_signals(signals)
-            print("Loaded trading signals from RL model")
+            try:
+                from stable_baselines3 import PPO
+                from gymnasium import spaces
+                
+                logger.info(f"Loading RL model from {args.rl_model}")
+                model = PPO.load(args.rl_model)
+                
+                # Log RL model observation space details for debugging
+                if hasattr(model, 'observation_space'):
+                    if isinstance(model.observation_space, spaces.Dict):
+                        logger.info(f"RL model uses Dict observation space: {model.observation_space}")
+                    else:
+                        logger.info(f"RL model observation space shape: {model.observation_space.shape}")
+                        logger.info(f"RL model observation space: {model.observation_space}")
+                
+                # Log market data info for debugging
+                logger.info(f"Market data shape: {market_data.shape}")
+                logger.info(f"Market data columns: {market_data.columns.tolist()}")
+                
+                # Verify required columns
+                required_cols = ['open', 'high', 'low', 'close', 'volume']
+                missing_cols = [col for col in required_cols if col not in market_data.columns.str.lower()]
+                if missing_cols:
+                    logger.error(f"Missing required columns: {missing_cols}")
+                    # Convert columns to lowercase if needed
+                    market_data.columns = market_data.columns.str.lower()
+                    
+                # Extract trading signals with better error handling
+                signals = extract_trading_signals(model, market_data)
+                chatbot.update_trading_signals(signals)
+                print("Loaded trading signals from RL model")
+                
+                # Calculate basic performance metrics
+                returns = np.diff(market_data['close'].values) / market_data['close'].values[:-1]
+                positions = np.array([s['position'] for s in signals.values()])
+                
+                # Ensure arrays have matching lengths before calculations
+                if len(returns) != len(positions[:-1]):
+                    logger.warning(f"Length mismatch: returns ({len(returns)}) vs positions ({len(positions[:-1])})")
+                    
+                    # Adjust the shorter array to match the longer one's length
+                    if len(returns) > len(positions[:-1]):
+                        # Truncate returns to match positions length
+                        logger.info(f"Truncating returns array from {len(returns)} to {len(positions[:-1])}")
+                        returns = returns[-len(positions[:-1]):]
+                    else:
+                        # Truncate positions to match returns length
+                        logger.info(f"Truncating positions array from {len(positions[:-1])} to {len(returns)}")
+                        positions = positions[:len(returns)+1]
+                
+                # Now calculate performance metrics
+                portfolio_performance = {
+                    "total_return": f"{np.sum(returns * positions[:-1]):.4f}",
+                    "sharpe_ratio": f"{np.mean(returns) / np.std(returns):.4f}",
+                    "win_rate": f"{np.mean([s['confidence'] > 0.5 for s in signals.values()]):.4f}"
+                }
+                chatbot.update_portfolio_performance(portfolio_performance)
+            except Exception as e:
+                logger.error(f"Error loading RL model: {str(e)}")
+                logger.error(traceback.format_exc())  # Print full traceback for debugging
+                print(f"Failed to load RL model: {str(e)}")
             
-            # Calculate basic performance metrics
-            returns = np.diff(market_data['close'].values) / market_data['close'].values[:-1]
-            portfolio_performance = {
-                "total_return": f"{np.sum(returns * np.array([s['position'] for s in signals.values()][:-1])):.4f}",
-                "sharpe_ratio": f"{np.mean(returns) / np.std(returns):.4f}",
-                "win_rate": f"{np.mean([s['confidence'] > 0.5 for s in signals.values()]):.4f}"
-            }
-            chatbot.update_portfolio_performance(portfolio_performance)
-            print("Calculated portfolio performance metrics")
-        
         print("\nTrading Assistant Chatbot")
         print("Type 'exit', 'quit', or 'q' to end the conversation")
         print("Type 'reset' to reset the conversation history")

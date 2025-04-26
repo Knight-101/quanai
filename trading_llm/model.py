@@ -5,6 +5,8 @@ Trading LLM Model - Integrates Mistral-7B with RL trading model
 import os
 import torch
 import logging
+import pandas as pd
+import numpy as np
 from typing import Dict, Any, Optional, Union, List
 from transformers import (
     AutoModelForCausalLM, 
@@ -23,7 +25,10 @@ logger = logging.getLogger(__name__)
 
 class TradingLLM:
     """
-    Explanation model for RL trading decisions using Mistral-7B with LoRA fine-tuning
+    Trading Language Model for generating explanations and commentary about trading decisions.
+    
+    This class handles the language model used for explaining RL trading decisions
+    and providing market commentary based on technical indicators.
     """
     
     def __init__(
@@ -38,6 +43,7 @@ class TradingLLM:
         use_flash_attn: bool = True,
         use_gradient_checkpointing: bool = True,
         cache_dir: Optional[str] = None,
+        local_path: Optional[str] = None,
     ):
         """
         Initialize the Trading LLM model
@@ -52,7 +58,7 @@ class TradingLLM:
             load_in_4bit: Whether to load in 4-bit precision
             use_flash_attn: Whether to use flash attention
             use_gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency
-            cache_dir: Directory to cache models
+            local_path: Optional local path for models
         """
         self.model_name = model_name
         self.lora_r = lora_r
@@ -74,6 +80,454 @@ class TradingLLM:
         # Load model and tokenizer
         self._load_model()
         
+    def generate_explanation(
+        self,
+        observation,
+        market_data,
+        action,
+        decision=None,
+        max_tokens=100,
+        temperature=0.7,
+        top_p=0.9,
+        repetition_penalty=1.0,
+        do_sample=None,
+        asset_name=None
+    ):
+        """
+        Generate a natural language explanation for a trading decision.
+        
+        Args:
+            observation: Observation vector from the environment
+            market_data: Market data dataframe with technical indicators
+            action: Action value from policy
+            decision: Trading decision label (optional)
+            max_tokens: Maximum tokens to generate
+            temperature: Temperature for generation sampling
+            top_p: Top-p probability for nucleus sampling
+            repetition_penalty: Penalty for repetition
+            do_sample: Whether to use sampling instead of greedy decoding
+            asset_name: Name of the asset being analyzed
+            
+        Returns:
+            Generated explanation string
+        """
+        try:
+            # Create generation config
+            gen_config = {
+                "max_new_tokens": max_tokens,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+            }
+            
+            # Apply user-provided generation parameters or use defaults
+            if temperature is not None:
+                gen_config["temperature"] = temperature
+            else:
+                gen_config["temperature"] = 0.85  # Default
+                
+            if top_p is not None:
+                gen_config["top_p"] = top_p
+            else:
+                gen_config["top_p"] = 0.92  # Default
+                
+            if repetition_penalty is not None:
+                gen_config["repetition_penalty"] = repetition_penalty
+            else:
+                gen_config["repetition_penalty"] = 1.1  # Default
+                
+            if do_sample is not None:
+                gen_config["do_sample"] = do_sample
+            else:
+                gen_config["do_sample"] = True  # Default
+                
+            # Format prompt for explanation
+            prompt = self.format_prompt(
+                observation=observation,
+                market_data=market_data,
+                action=action,
+                decision=decision,
+                asset_name=asset_name
+            )
+            
+            # Print formatted prompt for debugging
+            logger.debug(f"Formatted prompt: {prompt}")
+            
+            # Tokenize input
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            input_len = inputs.input_ids.shape[1]
+            logger.debug(f"Input length: {input_len} tokens")
+            
+            # Generate explanation
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    **gen_config
+                )
+                
+            # Extract only the generated tokens (skip input tokens)
+            generated_tokens = outputs[0, input_len:]
+            logger.debug(f"Generated token count: {len(generated_tokens)}")
+            
+            # Log raw token IDs and their decoded values (don't skip special tokens)
+            logger.debug(f"Raw token IDs: {generated_tokens.tolist()}")
+            raw_decoded = self.tokenizer.decode(generated_tokens, skip_special_tokens=False)
+            logger.debug(f"Raw decoded (with special tokens): '{raw_decoded}'")
+            
+            # If only 1-2 tokens generated (likely just EOS), retry with more aggressive settings
+            if len(generated_tokens) <= 2:
+                logger.warning("Only 1-2 tokens generated, retrying with more aggressive settings")
+                
+                # More aggressive configuration
+                aggressive_config = {
+                    "temperature": 1.0,  # Higher temperature for more variability
+                    "top_p": 0.95,  # Broader selection of tokens
+                    "repetition_penalty": 1.05,  # Discourage repetition
+                    "do_sample": True,  # Force sampling
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "max_new_tokens": max_tokens
+                }
+                
+                # Nudge the prompt to encourage explanation
+                nudged_prompt = prompt + "\nPlease provide a detailed explanation for this trading decision:\n"
+                
+                # Tokenize input with nudged prompt
+                nudged_inputs = self.tokenizer(nudged_prompt, return_tensors="pt").to(self.device)
+                nudged_input_len = nudged_inputs.input_ids.shape[1]
+                
+                # Generate with aggressive settings
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **nudged_inputs,
+                        **aggressive_config
+                    )
+                
+                # Extract only the generated tokens
+                generated_tokens = outputs[0, nudged_input_len:]
+                logger.debug(f"Retry generated token count: {len(generated_tokens)}")
+                logger.debug(f"Retry raw token IDs: {generated_tokens.tolist()}")
+            
+            # Decode generated text
+            generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            logger.debug(f"Generated text length: {len(generated_text)} characters")
+            
+            if not generated_text.strip():
+                return "Analysis not available at this time."
+                
+            return generated_text
+            
+        except Exception as e:
+            logger.error(f"Error generating explanation: {str(e)}")
+            return "Analysis not available at this time."
+
+    def format_prompt(
+        self,
+        observation,
+        market_data,
+        action,
+        decision=None,
+        asset_name=None
+    ):
+        """
+        Format a prompt for the language model to explain a trading decision.
+        
+        Args:
+            observation: Observation vector from the environment
+            market_data: Market data with technical indicators
+            action: Action value from policy
+            decision: Trading decision label (optional)
+            asset_name: Name of the asset being analyzed
+            
+        Returns:
+            Formatted prompt string
+        """
+        try:
+            # Record timestamp for consistency check
+            timestamp = None
+            if isinstance(market_data, pd.DataFrame) and 'timestamp' in market_data.columns:
+                timestamp = market_data['timestamp'].iloc[-1]
+                logger.debug(f"Using market data from timestamp: {timestamp}")
+            
+            # Format action and decision info
+            original_decision = decision
+            if decision is None:
+                # Use standardized mapping logic for consistency with RLLMExplainer
+                if action > 0.6:
+                    decision = "BUY (Strong)"
+                elif action > 0.2:
+                    decision = "BUY (Moderate)"
+                elif action > 0:
+                    decision = "BUY (Light)"
+                elif action < -0.6:
+                    decision = "SELL (Strong)"
+                elif action < -0.2:
+                    decision = "SELL (Moderate)"
+                elif action < 0:
+                    decision = "SELL (Light)"
+                else:
+                    decision = "HOLD"
+                logger.debug(f"Mapped action {action:.4f} to decision: {decision}")
+            else:
+                # Log if decision was provided externally
+                logger.debug(f"Using provided decision '{decision}' for action {action:.4f}")
+                
+            # Verify action and decision alignment
+            expected_decision = None
+            if action > 0.6:
+                expected_decision = "BUY (Strong)"
+            elif action > 0.2:
+                expected_decision = "BUY (Moderate)"
+            elif action > 0:
+                expected_decision = "BUY (Light)"
+            elif action < -0.6:
+                expected_decision = "SELL (Strong)"
+            elif action < -0.2:
+                expected_decision = "SELL (Moderate)"
+            elif action < 0:
+                expected_decision = "SELL (Light)"
+            else:
+                expected_decision = "HOLD"
+                
+            if decision != expected_decision:
+                logger.warning(f"Decision-action mismatch: decision '{decision}' doesn't match expected '{expected_decision}' for action {action:.4f}")
+                    
+            # Use asset name if provided, otherwise generic "the asset"
+            if asset_name is None:
+                asset_name = "the asset"
+                
+            # Format technical indicators information
+            indicators = ""
+            indicators_states = []
+            indicator_values = {}  # Store indicator values for debugging
+            
+            # RSI
+            if 'rsi' in market_data.columns:
+                rsi_value = market_data['rsi'].iloc[-1]
+                rsi_info = f"RSI is {rsi_value:.2f}"
+                indicator_values['rsi'] = rsi_value
+                
+                # Track the indicator state for consistency check
+                if rsi_value > 70:
+                    rsi_info += " (overbought)"
+                    indicators_states.append("bearish")
+                elif rsi_value < 30:
+                    rsi_info += " (oversold)"
+                    indicators_states.append("bullish")
+                
+                indicators += rsi_info + ". "
+                
+            # MACD
+            if all(col in market_data.columns for col in ['macd', 'macd_signal']):
+                macd = market_data['macd'].iloc[-1]
+                signal = market_data['macd_signal'].iloc[-1]
+                macd_cross = "above" if macd > signal else "below"
+                indicator_values['macd'] = macd
+                indicator_values['macd_signal'] = signal
+                
+                # Track the indicator state for consistency check
+                if macd > signal:
+                    indicators_states.append("bullish")
+                else:
+                    indicators_states.append("bearish")
+                    
+                indicators += f"MACD is {macd:.4f} which is {macd_cross} signal line ({signal:.4f}). "
+                
+            # Bollinger Bands
+            if all(col in market_data.columns for col in ['bb_upper', 'bb_middle', 'bb_lower']):
+                upper = market_data['bb_upper'].iloc[-1]
+                middle = market_data['bb_middle'].iloc[-1]
+                lower = market_data['bb_lower'].iloc[-1]
+                price = market_data['close'].iloc[-1] if 'close' in market_data.columns else None
+                
+                if price is not None:
+                    indicator_values['bb_upper'] = upper
+                    indicator_values['bb_middle'] = middle
+                    indicator_values['bb_lower'] = lower
+                    
+                    if price > upper:
+                        bb_info = f"Price is above upper Bollinger Band ({upper:.2f})"
+                        indicators_states.append("bearish")  # Potential overbought
+                    elif price < lower:
+                        bb_info = f"Price is below lower Bollinger Band ({lower:.2f})"
+                        indicators_states.append("bullish")  # Potential oversold
+                    else:
+                        bb_info = f"Price is within Bollinger Bands (middle: {middle:.2f})"
+                    indicators += bb_info + ". "
+                    
+            # Trend
+            if 'trend' in market_data.columns:
+                trend = market_data['trend'].iloc[-1]
+                indicator_values['trend'] = trend
+                
+                if trend > 0.5:
+                    trend_desc = "strong upward"
+                    indicators_states.append("bullish")
+                elif trend > 0:
+                    trend_desc = "moderate upward"
+                    indicators_states.append("bullish")
+                elif trend < -0.5:
+                    trend_desc = "strong downward"
+                    indicators_states.append("bearish")
+                elif trend < 0:
+                    trend_desc = "moderate downward"
+                    indicators_states.append("bearish")
+                else:
+                    trend_desc = "neutral"
+                indicators += f"Current trend is {trend_desc}. "
+                
+            # Support/Resistance
+            if 'support' in market_data.columns and 'resistance' in market_data.columns:
+                support = market_data['support'].iloc[-1]
+                resistance = market_data['resistance'].iloc[-1]
+                price = market_data['close'].iloc[-1] if 'close' in market_data.columns else None
+                
+                if price is not None:
+                    indicator_values['support'] = support
+                    indicator_values['resistance'] = resistance
+                    
+                    distance_to_support = (price - support) / price * 100 if support > 0 else float('inf')
+                    distance_to_resistance = (resistance - price) / price * 100 if resistance > 0 else float('inf')
+                    
+                    if distance_to_support < 2:
+                        indicators += f"Price is near support level ({support:.2f}). "
+                        indicators_states.append("bullish")  # Near support is potential buy
+                    if distance_to_resistance < 2:
+                        indicators += f"Price is near resistance level ({resistance:.2f}). "
+                        indicators_states.append("bearish")  # Near resistance is potential sell
+                        
+            # Format market context
+            context = ""
+            if 'close' in market_data.columns:
+                price = market_data['close'].iloc[-1]
+                indicator_values['price'] = price
+                context += f"Current price of {asset_name} is {price:.2f}. "
+                
+                # Recent price changes
+                if len(market_data) > 1:
+                    day_change = (price - market_data['close'].iloc[-2]) / market_data['close'].iloc[-2] * 100
+                    indicator_values['price_change_1d'] = day_change
+                    context += f"Price changed {day_change:.2f}% from previous period. "
+                    
+                    # Track recent price change for consistency check
+                    if day_change > 1:
+                        indicators_states.append("bullish")
+                    elif day_change < -1:
+                        indicators_states.append("bearish")
+                    
+                # Longer trends if available
+                if len(market_data) >= 5:
+                    week_change = (price - market_data['close'].iloc[-5]) / market_data['close'].iloc[-5] * 100
+                    indicator_values['price_change_5d'] = week_change
+                    context += f"5-period change is {week_change:.2f}%. "
+                    
+                    # Track longer price change for consistency check
+                    if week_change > 3:
+                        indicators_states.append("bullish")
+                    elif week_change < -3:
+                        indicators_states.append("bearish")
+                    
+            # Add volume info if available
+            if 'volume' in market_data.columns:
+                volume = market_data['volume'].iloc[-1]
+                avg_volume = market_data['volume'].mean() if len(market_data) > 1 else volume
+                vol_ratio = volume / avg_volume
+                indicator_values['volume_ratio'] = vol_ratio
+                
+                if vol_ratio > 1.5:
+                    vol_desc = "significantly higher than average"
+                elif vol_ratio > 1.1:
+                    vol_desc = "higher than average"
+                elif vol_ratio < 0.5:
+                    vol_desc = "significantly lower than average"
+                elif vol_ratio < 0.9:
+                    vol_desc = "lower than average"
+                else:
+                    vol_desc = "around average"
+                    
+                context += f"Trading volume is {vol_desc}. "
+            
+            # Check for potential inconsistency between decision and indicators
+            if indicators_states:
+                bullish_count = indicators_states.count("bullish")
+                bearish_count = indicators_states.count("bearish")
+                decision_sentiment = "bullish" if decision.startswith("BUY") else "bearish" if decision.startswith("SELL") else "neutral"
+                
+                # Compute synthetic action from indicators to check alignment
+                synthetic_components = []
+                
+                # Add components based on the same indicators used above
+                if 'rsi' in indicator_values:
+                    rsi = indicator_values['rsi']
+                    if rsi > 70:
+                        synthetic_components.append(-0.3)  # Bearish
+                    elif rsi < 30:
+                        synthetic_components.append(0.3)   # Bullish
+                    else:
+                        synthetic_components.append(0.3 - ((rsi - 30) / 40) * 0.6)
+                
+                if 'macd' in indicator_values and 'macd_signal' in indicator_values:
+                    macd_diff = indicator_values['macd'] - indicator_values['macd_signal']
+                    synthetic_components.append(min(0.3, max(-0.3, macd_diff * 10)))
+                
+                if 'price_change_5d' in indicator_values:
+                    price_change = indicator_values['price_change_5d']
+                    synthetic_components.append(min(0.5, max(-0.5, price_change * 0.1)))
+                
+                # Calculate synthetic action
+                if synthetic_components:
+                    synthetic_action = sum(synthetic_components) / len(synthetic_components)
+                    synthetic_action = min(0.8, max(-0.8, synthetic_action))
+                    
+                    # Expected decision based on synthetic action
+                    synthetic_decision = None
+                    if synthetic_action > 0.6:
+                        synthetic_decision = "BUY (Strong)"
+                    elif synthetic_action > 0.2:
+                        synthetic_decision = "BUY (Moderate)"
+                    elif synthetic_action > 0:
+                        synthetic_decision = "BUY (Light)"
+                    elif synthetic_action < -0.6:
+                        synthetic_decision = "SELL (Strong)"
+                    elif synthetic_action < -0.2:
+                        synthetic_decision = "SELL (Moderate)"
+                    elif synthetic_action < 0:
+                        synthetic_decision = "SELL (Light)"
+                    else:
+                        synthetic_decision = "HOLD"
+                    
+                    # Log the alignment between actual action and what indicators suggest
+                    if decision != synthetic_decision:
+                        logger.warning(f"Decision-indicator mismatch: decision '{decision}' differs from indicator-based '{synthetic_decision}' (action: {action:.4f}, synthetic: {synthetic_action:.4f})")
+                    
+                if (decision_sentiment == "bullish" and bearish_count > bullish_count) or \
+                   (decision_sentiment == "bearish" and bullish_count > bearish_count):
+                    logger.warning(f"Potential inconsistency: {decision} decision with {bullish_count} bullish vs {bearish_count} bearish indicators")
+                    context += f"Note: This decision may seem counter-trend based on some indicators. "
+                
+            # Construct full prompt
+            prompt = f"""
+You are a professional trading advisor. 
+Based on the following market data for {asset_name}, explain the {decision} trading decision with detailed reasoning.
+
+Market Context:
+{context}
+
+Technical Indicators:
+{indicators}
+
+Your thorough analysis of why this {decision} decision makes sense for {asset_name}:
+"""
+            
+            # Debug indicator values along with the prompt for better troubleshooting
+            logger.debug(f"Indicator values for {asset_name}: {indicator_values}")
+            logger.debug(f"Format prompt: {prompt}")
+            
+            return prompt.strip()
+            
+        except Exception as e:
+            logger.error(f"Error formatting prompt: {str(e)}")
+            return f"Explain why the trading decision for {asset_name} is {decision}."
+    
     def _load_model(self) -> None:
         """Load the base model and tokenizer with appropriate quantization"""
         try:
@@ -129,6 +583,9 @@ class TradingLLM:
                 **model_kwargs
             )
             
+            # Store the model's device for reference
+            self._device = None  # Will be determined on-demand via property
+            
             # Enable gradient checkpointing for memory efficiency if requested
             if self.use_gradient_checkpointing:
                 # Set use_cache=False when using gradient checkpointing
@@ -161,6 +618,21 @@ class TradingLLM:
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
             raise
+
+    @property
+    def device(self) -> torch.device:
+        """
+        Get the device where the model is located.
+        Determines the device on first call and caches the result.
+        
+        Returns:
+            The torch device (e.g., 'cuda:0', 'cpu') where the model is loaded
+        """
+        if self._device is None and self.model is not None:
+            # For model with multiple device assignments, get the first parameter's device
+            self._device = next(self.model.parameters()).device
+            logger.debug(f"Model is on device: {self._device}")
+        return self._device if self._device is not None else torch.device('cpu')
     
     def apply_lora(self, target_modules: Optional[List[str]] = None) -> None:
         """
@@ -230,17 +702,19 @@ class TradingLLM:
             logger.error(f"Error applying LoRA: {str(e)}")
             raise
     
-    def generate_explanation(
+    def generate_text(
         self,
         prompt: str,
         max_new_tokens: int = 512,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        repetition_penalty: Optional[float] = None,
-        do_sample: Optional[bool] = None,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.1,
+        do_sample: bool = True,
+        asset_name: Optional[str] = None,
     ) -> str:
         """
-        Generate trading explanation based on given prompt
+        Generate general text completion based on given prompt.
+        Used by chatbot for interactive conversations.
         
         Args:
             prompt: Input prompt for the model
@@ -249,32 +723,39 @@ class TradingLLM:
             top_p: Top-p sampling parameter
             repetition_penalty: Penalty for repeating tokens
             do_sample: Whether to use sampling
+            asset_name: Name of the asset being discussed (for context awareness)
             
         Returns:
-            Generated explanation text
+            Generated text completion
         """
         try:
-            # Create custom generation config if parameters provided
-            generation_config = self.generation_config
-            if any(param is not None for param in [temperature, top_p, repetition_penalty, do_sample]):
-                generation_config = GenerationConfig(
-                    temperature=temperature if temperature is not None else self.generation_config.temperature,
-                    top_p=top_p if top_p is not None else self.generation_config.top_p,
-                    repetition_penalty=repetition_penalty if repetition_penalty is not None else self.generation_config.repetition_penalty,
-                    do_sample=do_sample if do_sample is not None else self.generation_config.do_sample,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    max_new_tokens=max_new_tokens
-                )
+            # Create generation config
+            generation_config = GenerationConfig(
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                do_sample=do_sample,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                max_new_tokens=max_new_tokens
+            )
             
-            # Tokenize input with proper handling of token type IDs
+            # Add asset name to prompt if provided and not already in prompt
+            if asset_name and asset_name not in prompt:
+                # Include asset name in a non-disruptive way if not already present
+                if "[context]" in prompt.lower() or "current information" in prompt.lower():
+                    # Already has context section - no need to modify
+                    pass
+                else:
+                    # Add a subtle reference to make model aware of the asset
+                    prompt = f"Regarding {asset_name}: {prompt}"
+            
+            # Tokenize input
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
             input_length = inputs.input_ids.shape[1]
             
             # Generate response
             with torch.no_grad():
-                # Generate with streaming enabled for debugging
-                logger.info(f"Generating with temperature={generation_config.temperature}, max_new_tokens={max_new_tokens}")
                 output = self.model.generate(
                     **inputs,
                     generation_config=generation_config
@@ -284,24 +765,17 @@ class TradingLLM:
             generated_tokens = output[0][input_length:]
             
             # Decode only the generated part
-            explanation = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-            
-            # Log token counts for debugging
-            logger.info(f"Input tokens: {input_length}, Generated tokens: {len(generated_tokens)}")
-            logger.info(f"Generated text length: {len(explanation)} chars")
+            response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
             
             # Clean up special tokens that might remain
-            explanation = explanation.replace("</s>", "").strip()
+            response = response.replace("</s>", "").strip()
             
-            # Handle empty responses
-            if not explanation or explanation.isspace():
-                logger.warning("Model generated empty response, falling back to default explanation")
-                return "Analysis not available at this time."
-            
-            return explanation
+            return response
         except Exception as e:
-            logger.error(f"Error generating explanation: {str(e)}")
-            return f"Error generating explanation: {str(e)}"
+            import traceback
+            logger.error(f"Error generating text: {str(e)}")
+            logger.debug(traceback.format_exc())
+            return "I'm sorry, I encountered an error while trying to respond."
     
     def save_model(self, save_dir: str) -> None:
         """
@@ -386,66 +860,4 @@ class TradingLLM:
             return instance
         except Exception as e:
             logger.error(f"Error loading model from {model_dir}: {str(e)}")
-            raise
-            
-    def format_prompt(
-        self, 
-        market_context: Dict[str, Any], 
-        action: float,
-        indicators: Dict[str, Any] = None,
-        timeframe: str = "current"
-    ) -> str:
-        """
-        Format a prompt for the LLM based on market context and action
-        
-        Args:
-            market_context: Dictionary containing market data
-            action: Action value from RL model
-            indicators: Dictionary of technical indicators
-            timeframe: Time context for the analysis
-            
-        Returns:
-            Formatted prompt string
-        """
-        # Determine action description
-        if action > 0.6:
-            action_desc = "enter a strong long position"
-        elif action > 0.2:
-            action_desc = "enter a moderate long position"
-        elif action > 0:
-            action_desc = "enter a small long position"
-        elif action < -0.6:
-            action_desc = "enter a strong short position"
-        elif action < -0.2:
-            action_desc = "enter a moderate short position"
-        elif action < 0:
-            action_desc = "enter a small short position"
-        else:
-            action_desc = "maintain a neutral position"
-            
-        # Format indicators if provided
-        indicators_text = ""
-        if indicators:
-            indicators_text = "Technical indicators:\n"
-            for name, value in indicators.items():
-                if isinstance(value, float):
-                    indicators_text += f"- {name}: {value:.2f}\n"
-                else:
-                    indicators_text += f"- {name}: {value}\n"
-        
-        # Create the prompt
-        prompt = f"""<s>[INST]
-I'm analyzing the market for trading opportunities.
-
-Here's the {timeframe} market situation:
-- Price: {market_context.get('price', 'N/A')}
-- Recent price change: {market_context.get('price_change', 'N/A')}
-- Volume: {market_context.get('volume', 'N/A')}
-- Market volatility: {market_context.get('volatility', 'N/A')}
-{indicators_text}
-
-The trading algorithm decided to {action_desc}.
-
-Can you explain why this might be a good decision given the current market conditions? Give a concise explanation based on technical analysis and price action.
-[/INST]"""
-        return prompt 
+            raise 

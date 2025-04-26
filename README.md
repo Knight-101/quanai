@@ -5990,3 +5990,59 @@ The system now supports extended training for up to 10 million steps with an int
    ```
 
 For complete details on the extended training approach, see [training_schedule.md](training_schedule.md).
+
+## Trading LLM Chatbot
+
+The system includes an interactive chatbot for discussing market conditions, trading decisions, and technical analysis.
+
+### Using the Chatbot
+
+You can interact with the trading chatbot via a simple command-line interface:
+
+```bash
+python -m trading_llm.chatbot --model_path /path/to/your/model --base_model meta-llama/Meta-Llama-3-8B-Instruct --market_data /path/to/market_data.csv
+```
+
+Arguments:
+
+- `--model_path`: Path to the trained LLM model or LoRA adapter (required)
+- `--base_model`: Base model path (required when using LoRA adapters)
+- `--max_history`: Maximum number of message pairs to keep in conversation (default: 5)
+- `--device`: Device to run the model on ('cpu', 'cuda', 'auto')
+- `--market_data`: Optional path to CSV or Parquet market data file
+- `--trading_signals`: Optional path to JSON file with trading signals
+
+### Programmatic Usage
+
+You can also use the chatbot programmatically in your code:
+
+```python
+from trading_llm.chatbot import load_market_chatbot
+import pandas as pd
+
+# Initialize the chatbot
+chatbot = load_market_chatbot(
+    model_path="/path/to/your/model",
+    base_model="meta-llama/Meta-Llama-3-8B-Instruct",
+    max_history=5
+)
+
+# Optionally provide market data
+market_data = pd.read_csv("market_data.csv")
+chatbot.update_market_data(market_data)
+
+# Chat with the bot
+response = chatbot.chat("What do you think about the current market conditions?")
+print(response)
+
+# Reset conversation if needed
+chatbot.reset_conversation()
+```
+
+The chatbot can provide answers about:
+
+- Current market conditions
+- Technical analysis explanations
+- Trading strategy insights
+- Recent trading signals
+- Historical performance

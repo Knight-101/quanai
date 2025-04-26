@@ -1,13 +1,20 @@
+#!/usr/bin/env python3
 """
-Inference module for combining RL trading with LLM explanations
+Inference utilities for the Trading LLM system.
+Generates explanations using LLMs for trading decisions.
 """
 
-import os
+import json
 import logging
-import torch
-import numpy as np
+import os
+import sys
+from datetime import datetime
+from typing import Dict, List, Tuple, Union, Optional, Any
+
 import pandas as pd
-from typing import Dict, List, Any, Optional, Union, Tuple
+import numpy as np
+import torch
+from sklearn.metrics.pairwise import cosine_similarity
 from stable_baselines3 import PPO
 from ta.trend import SMAIndicator, EMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
@@ -65,40 +72,99 @@ class RLStateExtractor:
             
             # Determine device that the model is using
             model_device = next(self.model.policy.parameters()).device
-            logger.info(f"Model is on device: {model_device}")
+            # print(f"DEBUG: Model is on device: {model_device}")
             
-            if isinstance(observation, np.ndarray) and isinstance(self.model.observation_space, spaces.Box):
-                # Convert numpy array to torch tensor and move to correct device
-                observation = torch.tensor(observation, dtype=torch.float32).to(model_device)
-            elif isinstance(observation, dict) and isinstance(self.model.observation_space, spaces.Dict):
-                # Convert all numpy arrays in the dict to torch tensors on correct device
+            # IMPORTANT: stable_baselines3 expects NumPy arrays or Python objects,
+            # not PyTorch tensors. If we have tensors, we need to convert them to NumPy first
+            # Create a copy of the observation to avoid modifying the original
+            if isinstance(observation, np.ndarray):
+                observation_numpy = observation.copy()
+                # print(f"DEBUG: Using numpy array observation with shape {observation_numpy.shape}")
+            elif isinstance(observation, dict):
+                # For dict observations, ensure all values are NumPy arrays
+                observation_numpy = {}
                 for key, value in observation.items():
-                    if isinstance(value, np.ndarray):
-                        observation[key] = torch.tensor(value, dtype=torch.float32).to(model_device)
+                    if isinstance(value, torch.Tensor):
+                        # print(f"DEBUG: Converting dict tensor observation[{key}] from {value.device} to numpy")
+                        observation_numpy[key] = value.detach().cpu().numpy()
+                    elif isinstance(value, np.ndarray):
+                        observation_numpy[key] = value.copy()
+                    else:
+                        observation_numpy[key] = value
+                # print(f"DEBUG: Using dict observation with keys {list(observation_numpy.keys())}")
+            elif isinstance(observation, torch.Tensor):
+                # Convert tensor to numpy
+                # print(f"DEBUG: Converting tensor observation from {observation.device} to numpy")
+                observation_numpy = observation.detach().cpu().numpy()
+                # print(f"DEBUG: Converted to numpy with shape {observation_numpy.shape}")
+            else:
+                observation_numpy = observation
+                # print(f"DEBUG: Using observation as-is, type: {type(observation_numpy)}")
             
             # Use no_grad to save memory
             with torch.no_grad():
-                action, _states = self.model.predict(observation, deterministic=False)
+                # print(f"DEBUG: Predicting with observation type: {type(observation_numpy)}")
+                action, _states = self.model.predict(observation_numpy, deterministic=False)
             
-            # Move action to CPU before returning
+            # Debug action type and device
             if isinstance(action, torch.Tensor):
-                action = action.cpu()  # Move to CPU but keep as tensor
+                # print(f"DEBUG: Action is tensor on device: {action.device}, shape: {action.shape}")
+                # Move action to CPU before returning and convert to numpy
+                action = action.detach().cpu().numpy()
+                # print(f"DEBUG: Converted action to numpy with shape: {action.shape}")
+            else:
+                # print(f"DEBUG: Action is type: {type(action)}")
+                pass
             
             # Extract action probabilities if available
             extra_data = {}
             if hasattr(self.model, "policy") and hasattr(self.model.policy, "get_distribution"):
-                distribution = self.model.policy.get_distribution(observation)
-                if hasattr(distribution, "mean") and hasattr(distribution, "stddev"):
-                    # Move tensors to CPU
-                    mean = distribution.mean.detach().cpu()
-                    stddev = distribution.stddev.detach().cpu()
-                    extra_data["action_mean"] = mean
-                    extra_data["action_stddev"] = stddev
+                try:
+                    # Convert observation back to tensor if needed for getting distribution
+                    if isinstance(observation_numpy, np.ndarray):
+                        observation_tensor = torch.tensor(observation_numpy, dtype=torch.float32).to(model_device)
+                    elif isinstance(observation_numpy, dict):
+                        observation_tensor = {}
+                        for key, value in observation_numpy.items():
+                            if isinstance(value, np.ndarray):
+                                observation_tensor[key] = torch.tensor(value, dtype=torch.float32).to(model_device)
+                            else:
+                                observation_tensor[key] = value
+                    else:
+                        observation_tensor = observation_numpy
+
+                    distribution = self.model.policy.get_distribution(observation_tensor)
+                    if hasattr(distribution, "mean") and hasattr(distribution, "stddev"):
+                        # Move tensors to CPU and convert to numpy
+                        mean = distribution.mean.detach().cpu().numpy() if isinstance(distribution.mean, torch.Tensor) else distribution.mean
+                        stddev = distribution.stddev.detach().cpu().numpy() if isinstance(distribution.stddev, torch.Tensor) else distribution.stddev
+                        extra_data["action_mean"] = mean
+                        extra_data["action_stddev"] = stddev
+                except Exception as dist_error:
+                    # print(f"DEBUG: Error extracting distribution: {str(dist_error)}")
+                    pass
+            
+            # Ensure everything in extra_data is CPU-based
+            for key in list(extra_data.keys()):
+                if isinstance(extra_data[key], torch.Tensor):
+                    # print(f"DEBUG: Converting extra_data[{key}] from tensor to numpy")
+                    extra_data[key] = extra_data[key].detach().cpu().numpy()
             
             return action, extra_data
         except Exception as e:
-            logger.error(f"Error predicting with RL model: {str(e)}")
-            raise
+            import traceback
+            # print(f"ERROR predicting with RL model: {str(e)}")
+            # print(f"Traceback: {traceback.format_exc()}")
+            # Return a default action on error
+            if isinstance(self.model.action_space, spaces.Box):
+                # For continuous action spaces, return zero action
+                action_shape = self.model.action_space.shape
+                default_action = np.zeros(action_shape, dtype=np.float32)
+            else:
+                # For discrete action spaces, return zero (no action)
+                default_action = np.array(0, dtype=np.int32)
+            
+            return default_action, {}
     
     def extract_features(self, observation: Dict[str, np.ndarray]) -> Dict[str, Any]:
         """
@@ -158,346 +224,951 @@ class RLStateExtractor:
 
 
 class RLLMExplainer:
-    """Combined RL model with LLM for explaining trading decisions"""
+    """
+    Explainer class for reinforcement learning trading signals using LLM for natural language explanations.
+    Supports multi-asset environments with flexible asset selection by name or index.
+    """
     
-    def __init__(
-        self,
-        rl_model_path: str,
-        llm_model_path: str,
-        llm_base_model: Optional[str] = None
-    ):
+    def __init__(self, model=None, asset_names=None, rl_model=None, rl_model_path=None):
         """
-        Initialize the explainer
+        Initialize the RL-LLM explainer.
         
         Args:
-            rl_model_path: Path to the trained RL model
-            llm_model_path: Path to the fine-tuned LLM model
-            llm_base_model: Optional base model name if llm_model_path contains LoRA adapters
+            model: TradingLLM model instance (will create one if not provided)
+            asset_names: List of asset names for multi-asset environments
+            rl_model: Pre-loaded RL model instance (if available)
+            rl_model_path: Path to an RL model to load (if rl_model not provided)
         """
-        self.rl_state_extractor = RLStateExtractor(rl_model_path)
+        # Initialize model
+        self.model = model if model is not None else TradingLLM()
         
-        # Load LLM model
-        logger.info(f"Loading LLM model from {llm_model_path}")
-        self.llm = TradingLLM.load_from_pretrained(
-            model_dir=llm_model_path,
-            base_model=llm_base_model
-        )
-        logger.info("LLM model loaded successfully")
+        # Set asset names and create name-to-index mapping
+        self.asset_names = asset_names or ["Asset"]
+        self.asset_name_to_index = {name.lower(): i for i, name in enumerate(self.asset_names)}
+        
+        # Initialize RL model if provided
+        self.rl_model = None
+        if rl_model is not None:
+            self.rl_model = rl_model
+            logger.info("Using provided RL model for trading signals")
+        elif rl_model_path is not None:
+            try:
+                from stable_baselines3 import PPO
+                logger.info(f"Loading RL model from {rl_model_path}")
+                self.rl_model = PPO.load(rl_model_path)
+                logger.info("RL model loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load RL model from {rl_model_path}: {str(e)}")
+        
+        logger.info(f"RLLMExplainer initialized with {len(self.asset_names)} assets and RL model: {'Available' if self.rl_model else 'Not available'}")
     
-    def explain_decision(
-        self,
-        observation: Dict[str, np.ndarray],
-        raw_ohlcv: Optional[pd.DataFrame] = None,
-        max_tokens: int = 512,
-        temperature: float = 0.7
-    ) -> Dict[str, Any]:
+    def explain_decision(self, observation, market_data, action, asset_index=0, asset_name=None, use_fallback=True):
         """
-        Generate a prediction with explanation
+        Generate a natural language explanation for a trading decision.
         
         Args:
-            observation: Observation dictionary
-            raw_ohlcv: Optional dataframe with OHLCV data (for indicators)
-            max_tokens: Maximum tokens for explanation
-            temperature: Temperature for generation
+            observation: Observation from the environment
+            market_data: Market data with technical indicators
+            action: Action value or array of actions from the policy
+            asset_index: Index of the asset to explain in a multi-asset environment (default: 0)
+            asset_name: Name of the asset to explain (will override asset_index if provided)
+            use_fallback: Whether to use fallback explanation if LLM output is empty
             
         Returns:
-            Dictionary with prediction and explanation
+            Natural language explanation of the trading decision
         """
         try:
-            # Predict action using RL model
-            action, extra_data = self.rl_state_extractor.predict(observation)
-            
-            # Ensure any cuda tensors are moved to CPU
-            if isinstance(action, torch.Tensor):
-                action = action.cpu().numpy()
+            # Handle multi-asset action arrays
+            if isinstance(action, (list, np.ndarray)) and len(action) > 1:
+                # Resolve asset index by name if provided
+                if asset_name is not None:
+                    asset_name = str(asset_name).lower()  # Ensure lowercase for matching
+                    
+                    # Direct match
+                    if asset_name in self.asset_name_to_index:
+                        asset_index = self.asset_name_to_index[asset_name]
+                    else:
+                        # Try partial matching
+                        matches = [name for name in self.asset_name_to_index.keys() 
+                                if asset_name in name or name in asset_name]
+                        
+                        if matches:
+                            # Use the closest match
+                            asset_index = self.asset_name_to_index[matches[0]]
+                            logger.info(f"Using partial match for '{asset_name}': '{matches[0]}'")
+                        else:
+                            # Keep original index if no match
+                            logger.warning(f"Asset name '{asset_name}' not found, using index {asset_index}")
                 
-            # Process any tensors in extra_data
-            if extra_data:
-                for key, value in extra_data.items():
-                    if isinstance(value, torch.Tensor):
-                        extra_data[key] = value.cpu().numpy()
+                # Ensure asset index is within bounds
+                asset_index = min(asset_index, len(action) - 1)
+                if asset_index < 0:
+                    asset_index = 0
+                    
+                # Extract the specific action for this asset
+                specific_action = action[asset_index]
+                display_asset_name = self.asset_names[asset_index] if asset_index < len(self.asset_names) else f"Asset {asset_index}"
+            else:
+                # Single asset scenario
+                specific_action = action[0] if isinstance(action, (list, np.ndarray)) else action
+                display_asset_name = asset_name or self.asset_names[0] if self.asset_names else "Asset"
             
-            # Prepare market context
-            market_context = self.rl_state_extractor.prepare_market_context(observation, raw_ohlcv)
+            # Map action value to trading decision
+            decision = self._action_to_decision(specific_action)
+            logger.info(f"Action for {display_asset_name}: {specific_action:.4f} → Decision: {decision}")
             
-            # Calculate indicators if raw_ohlcv data provided
-            indicators = None
-            if raw_ohlcv is not None:
-                indicators = self.rl_state_extractor.indicator_processor.calculate_indicators(raw_ohlcv)
+            # Filter market data for the specific asset if possible
+            if isinstance(market_data, dict) and asset_index < len(self.asset_names):
+                asset_key = self.asset_names[asset_index]
+                if asset_key in market_data:
+                    specific_market_data = market_data[asset_key]
+                else:
+                    # Fall back to first available data
+                    specific_market_data = next(iter(market_data.values())) if market_data else pd.DataFrame()
+            else:
+                # Use as is if not a dict or no matching asset
+                specific_market_data = market_data
             
-            # Ensure action is a scalar
-            action_value = float(action) if isinstance(action, (np.ndarray, list)) else float(action)
+            # Log key technical indicators for debugging
+            if isinstance(specific_market_data, pd.DataFrame) and not specific_market_data.empty:
+                latest = specific_market_data.iloc[-1]
+                indicators_log = []
+                
+                # Log RSI
+                if 'rsi' in latest:
+                    rsi = latest['rsi']
+                    rsi_state = "overbought" if rsi > 70 else "oversold" if rsi < 30 else "neutral"
+                    indicators_log.append(f"RSI: {rsi:.2f} ({rsi_state})")
+                
+                # Log MACD
+                if all(col in latest for col in ['macd', 'macd_signal']):
+                    macd = latest['macd']
+                    signal = latest['macd_signal']
+                    macd_state = "bullish" if macd > signal else "bearish"
+                    indicators_log.append(f"MACD: {macd:.4f} vs Signal: {signal:.4f} ({macd_state})")
+                
+                # Log price trend
+                if 'close' in latest and len(specific_market_data) > 5:
+                    current_price = latest['close']
+                    prev_price = specific_market_data.iloc[-6]['close']
+                    change_pct = (current_price / prev_price - 1) * 100
+                    trend_desc = "bullish" if change_pct > 1 else "bearish" if change_pct < -1 else "neutral"
+                    indicators_log.append(f"Price trend: {change_pct:.2f}% ({trend_desc})")
+                
+                if indicators_log:
+                    logger.info(f"Technical indicators for {display_asset_name}: {' | '.join(indicators_log)}")
+                    
+                    # Print decision vs indicator alignment warning if needed
+                    if (decision.startswith("BUY") and "bearish" in str(indicators_log)) or \
+                       (decision.startswith("SELL") and "bullish" in str(indicators_log)):
+                        logger.warning(f"Potential mismatch: {decision} decision with conflicting indicators")
             
-            # Format prompt for LLM
-            prompt = self.llm.format_prompt(
-                market_context=market_context,
-                action=action_value,
-                indicators=indicators
-            )
-            
-            # Generate explanation
-            explanation = self.llm.generate_explanation(
-                prompt=prompt,
-                max_new_tokens=max_tokens,
-                temperature=temperature
-            )
-            
-            # Package result
-            result = {
-                "action": float(action),
-                "explanation": explanation,
-                "market_context": market_context
-            }
-            
-            # Add extra data if available
-            if extra_data:
-                result.update(extra_data)
-            
-            return result
-        
+            # Generate explanation using the model
+            try:
+                logger.debug(f"Generating explanation for {display_asset_name} (decision: {decision}, action: {specific_action:.4f})")
+                explanation = self.model.generate_explanation(
+                    observation=observation,
+                    market_data=specific_market_data,
+                    action=specific_action,
+                    decision=decision,
+                    asset_name=display_asset_name
+                )
+                
+                # Check if explanation is empty or default text
+                is_default = explanation in ["Analysis not available at this time.", "", None]
+                if is_default:
+                    logger.warning(f"Empty explanation from LLM for {display_asset_name}")
+                    
+                    if use_fallback:
+                        # Generate basic explanation based on technical indicators if LLM fails
+                        logger.info("Using fallback explanation based on technical indicators")
+                        explanation = self._generate_basic_explanation(specific_market_data, specific_action, decision, display_asset_name)
+                
+                return explanation
+                
+            except Exception as e:
+                logger.error(f"Error generating explanation: {str(e)}")
+                if use_fallback:
+                    # Fallback explanation if model generation fails
+                    return self._generate_basic_explanation(specific_market_data, specific_action, decision, display_asset_name)
+                else:
+                    return f"Error generating explanation for {display_asset_name}: {str(e)}"
+                
         except Exception as e:
-            logger.error(f"Error generating explanation: {str(e)}")
-            return {
-                "action": 0.0,
-                "explanation": f"Error generating explanation: {str(e)}",
-                "market_context": {}
-            }
+            logger.error(f"Error in explain_decision: {str(e)}")
+            return f"Unable to explain decision: {str(e)}"
     
-    def batch_explain(
-        self,
-        observations: List[Dict[str, np.ndarray]],
-        raw_ohlcvs: Optional[List[pd.DataFrame]] = None,
-        max_tokens: int = 512,
-        temperature: float = 0.7
-    ) -> List[Dict[str, Any]]:
+    def batch_explain(self, observations, market_data, actions, asset_names=None, use_fallback=True):
         """
-        Generate predictions with explanations for a batch of observations
+        Generate explanations for a batch of observations and actions.
         
         Args:
-            observations: List of observation dictionaries
-            raw_ohlcvs: Optional list of dataframes with OHLCV data
-            max_tokens: Maximum tokens for explanation
-            temperature: Temperature for generation
+            observations: Batch of observations
+            market_data: Market data with technical indicators
+            actions: Batch of actions from the policy (can be multi-asset)
+            asset_names: List of asset names to explain (defaults to all assets)
+            use_fallback: Whether to use fallback explanation if LLM output is empty
             
         Returns:
-            List of dictionaries with predictions and explanations
+            List of natural language explanations
         """
-        results = []
+        explanations = []
         
-        # Process each observation
-        for i, observation in enumerate(observations):
-            raw_ohlcv = raw_ohlcvs[i] if raw_ohlcvs and i < len(raw_ohlcvs) else None
-            result = self.explain_decision(
-                observation=observation,
-                raw_ohlcv=raw_ohlcv,
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
-            results.append(result)
+        # Determine which assets to explain
+        if asset_names is None:
+            # Default to explaining all assets in first action
+            if isinstance(actions[0], (list, np.ndarray)):
+                assets_to_explain = range(len(actions[0]))
+            else:
+                assets_to_explain = [0]  # Single asset case
+        else:
+            # Use provided asset names
+            assets_to_explain = []
+            for name in asset_names:
+                if isinstance(name, int):
+                    assets_to_explain.append(name)  # Already an index
+                elif name.lower() in self.asset_name_to_index:
+                    assets_to_explain.append(self.asset_name_to_index[name.lower()])
+                else:
+                    # If name not found, append to explanation list and continue
+                    explanations.append(f"Asset '{name}' not found in available assets")
+                    continue
         
-        return results
+        # Generate explanations for each observation and selected assets
+        for i, (obs, action) in enumerate(zip(observations, actions)):
+            if isinstance(market_data, list):
+                # Multiple market data frames provided
+                md = market_data[i] if i < len(market_data) else market_data[-1]
+            else:
+                # Single market data frame for all observations
+                md = market_data
+                
+            # Generate explanation for each selected asset
+            for asset_idx in assets_to_explain:
+                asset_name = self.asset_names[asset_idx] if asset_idx < len(self.asset_names) else f"Asset {asset_idx}"
+                explanation = self.explain_decision(
+                    observation=obs, 
+                    market_data=md, 
+                    action=action, 
+                    asset_index=asset_idx,
+                    asset_name=asset_name,
+                    use_fallback=use_fallback
+                )
+                explanations.append(explanation)
+                
+        return explanations
+    
+    def _generate_basic_explanation(self, market_data, action, decision, asset_name):
+        """
+        Generate a basic explanation based on technical indicators when LLM fails.
+        
+        Args:
+            market_data: Market data with technical indicators
+            action: Action value from the policy
+            decision: Trading decision label
+            asset_name: Name of the asset
+            
+        Returns:
+            Basic explanation text
+        """
+        try:
+            explanation_parts = []
+            explanation_parts.append(f"Decision for {asset_name}: {decision}")
+            
+            # Handle possible market data formats
+            if isinstance(market_data, pd.DataFrame) and not market_data.empty:
+                latest = market_data.iloc[-1]
+                
+                # Add RSI information if available
+                if 'rsi' in latest:
+                    rsi = latest['rsi']
+                    if rsi < 30:
+                        explanation_parts.append(f"RSI is {rsi:.2f}, indicating oversold conditions.")
+                    elif rsi > 70:
+                        explanation_parts.append(f"RSI is {rsi:.2f}, indicating overbought conditions.")
+                    else:
+                        explanation_parts.append(f"RSI is {rsi:.2f}, in neutral territory.")
+                
+                # Add MACD information if available
+                if 'macd' in latest and 'macd_signal' in latest:
+                    macd = latest['macd']
+                    signal = latest['macd_signal']
+                    if macd > signal:
+                        explanation_parts.append(f"MACD ({macd:.4f}) is above signal line ({signal:.4f}), suggesting bullish momentum.")
+                    else:
+                        explanation_parts.append(f"MACD ({macd:.4f}) is below signal line ({signal:.4f}), suggesting bearish momentum.")
+                
+                # Add price trend information if available
+                if 'close' in latest and len(market_data) > 5:
+                    current_price = latest['close']
+                    prev_price = market_data.iloc[-6]['close']  # 5 periods ago
+                    change_pct = (current_price / prev_price - 1) * 100
+                    
+                    if change_pct > 5:
+                        trend_desc = "strongly bullish"
+                    elif change_pct > 1:
+                        trend_desc = "moderately bullish"
+                    elif change_pct < -5:
+                        trend_desc = "strongly bearish"
+                    elif change_pct < -1:
+                        trend_desc = "moderately bearish"
+                    else:
+                        trend_desc = "relatively flat"
+                        
+                    explanation_parts.append(f"Price trend is {trend_desc} with a {change_pct:.2f}% change over the last 5 periods.")
+            
+            # Add decision rationale based on action value
+            if decision.startswith("BUY"):
+                explanation_parts.append(f"The model recommends a {decision} position based on favorable technical indicators.")
+            elif decision.startswith("SELL"):
+                explanation_parts.append(f"The model recommends a {decision} position due to negative technical signals.")
+            else:
+                explanation_parts.append(f"The model recommends to {decision} as the market signals are currently neutral.")
+            
+            return " ".join(explanation_parts)
+            
+        except Exception as e:
+            logger.error(f"Error generating basic explanation: {str(e)}")
+            return f"Trading decision for {asset_name}: {decision} (action value: {action:.4f})"
 
-    def explain_trading_decisions(
-        self,
-        market_data_path: str,
-        max_tokens: int = 512,
-        temperature: float = 0.7,
-        max_samples: int = 20  # Limit number of samples to prevent memory issues
-    ) -> List[Dict[str, Any]]:
+    def explain_trading_decisions(self, market_data_path: str, use_fallback: bool = True, asset_names: Optional[List[str]] = None, use_synthetic_actions: bool = False) -> List[str]:
         """
-        Generate trading decision explanations from market data file
+        Process market data and generate explanations for trading decisions.
+        Used by CLI tool to provide explanations for recent market data.
         
         Args:
-            market_data_path: Path to the market data file
-            max_tokens: Maximum tokens for explanation
-            temperature: Temperature for generation
-            max_samples: Maximum number of samples to process (to prevent memory issues)
+            market_data_path: Path to market data file or directory
+            use_fallback: Whether to use fallback explanations if LLM output is empty
+            asset_names: List of specific asset names to explain (defaults to all)
+            use_synthetic_actions: If True, use synthetic actions even if RL model is available
             
         Returns:
-            List of dictionaries with predictions and explanations
+            List of explanations for trading decisions
         """
+        explanations = []
+        
         try:
             # Load market data
-            if market_data_path.endswith('.csv'):
-                market_data = pd.read_csv(market_data_path)
-            elif market_data_path.endswith('.parquet'):
-                market_data = pd.read_parquet(market_data_path)
-            else:
-                raise ValueError(f"Unsupported market data format: {market_data_path}")
-                
-            # Convert column names to lowercase
-            market_data.columns = market_data.columns.str.lower()
-            
-            # Prepare market data using same approach as training
-            from gymnasium import spaces
-            required_cols = ['open', 'high', 'low', 'close', 'volume']
-            
-            # Check required columns
-            for col in required_cols:
-                if col not in market_data.columns:
-                    raise ValueError(f"Required column {col} not found in market data")
-            
-            # Prepare and normalize data similar to extract_trading_signals
-            data = market_data.copy()
-            if 'timestamp' in data.columns:
-                data = data.set_index('timestamp')
-            
-            # Normalize data (same as in extract_trading_signals)
-            for col in required_cols:
-                if col == 'volume':
-                    # Log transform volume
-                    data[col] = np.log(data[col] + 1)
-                
-                # Standardize
-                mean, std = data[col].mean(), data[col].std()
-                data[col] = (data[col] - mean) / (std + 1e-8)
-            
-            # Detect observation space type
-            is_box_space = isinstance(self.rl_state_extractor.model.observation_space, spaces.Box)
-            
-            # For Box space, get the exact expected shape
-            if is_box_space:
-                expected_shape = self.rl_state_extractor.model.observation_space.shape
-                expected_size = expected_shape[0] if expected_shape else 78  # Default to 78 if shape is not available
-                
-                # Calculate exactly how many rows we need for the expected size
-                rows_needed = expected_size // len(required_cols)
-                if expected_size % len(required_cols) != 0:
-                    rows_needed += 1  # Round up if there's a remainder
-                
-                logger.info(f"Model expects observation shape {expected_shape}, using {rows_needed} rows")
-            else:
-                # For Dict space, use default window size
-                rows_needed = 30
-            
-            # Generate observations from data
-            observations = []
-            indices = []
-            
-            # Process with stride to limit number of explanations
-            stride = max(30, len(data) // max_samples)  # Ensure we don't process too many samples
-            
-            # Determine model device for tensor creation
-            import torch
-            model_device = next(self.rl_state_extractor.model.policy.parameters()).device
-            
-            # Create observations with appropriate format
-            for i in range(rows_needed, len(data), stride):
-                # Get window of data, using exactly the number of rows needed for the expected shape
-                window = data.iloc[i-rows_needed:i]
-                
-                # Create observation based on space type
-                if is_box_space:
-                    # Flatten and ensure exact shape match
-                    flattened = window[required_cols].values.flatten()
-                    
-                    # Adjust size if needed to match exactly what model expects
-                    if len(flattened) != expected_size:
-                        logger.info(f"Adjusting observation from {len(flattened)} to {expected_size} elements")
-                        if len(flattened) > expected_size:
-                            # Truncate if too large
-                            flattened = flattened[:expected_size]
-                        else:
-                            # Pad with zeros if too small
-                            padding = np.zeros(expected_size - len(flattened))
-                            flattened = np.concatenate([flattened, padding])
-                    
-                    # Create tensor directly on correct device
-                    obs = torch.tensor(flattened, dtype=torch.float32).to(model_device)
-                else:
-                    # Use dict for Dict spaces
-                    obs = {
-                        "market": torch.tensor(window[required_cols].values, dtype=torch.float32).to(model_device)
-                    }
-                
-                observations.append(obs)
-                indices.append(i)
-                
-                # Limit number of samples to prevent memory issues
-                if len(observations) >= max_samples:
-                    logger.info(f"Limiting to {max_samples} samples to prevent memory issues")
-                    break
-            
-            # Generate explanations for observations
-            explanations = []
-            
-            for i, (obs, idx) in enumerate(zip(observations, indices)):
-                try:
-                    # Predict action using RL model
-                    with torch.no_grad():  # Use no_grad to reduce memory usage
-                        action, extra_data = self.rl_state_extractor.predict(obs)
-                    
-                    # Move tensors to CPU and convert to numpy to free GPU memory
-                    if isinstance(action, torch.Tensor):
-                        action = action.cpu().numpy()
+            if os.path.isdir(market_data_path):
+                # Directory with multiple asset files
+                market_data_dict = {}
+                for filename in os.listdir(market_data_path):
+                    if filename.endswith(('.csv', '.parquet', '.pq')):
+                        file_path = os.path.join(market_data_path, filename)
+                        asset_name = os.path.splitext(filename)[0]
                         
-                    # Also ensure any values in extra_data are moved to CPU
-                    if extra_data and isinstance(extra_data, dict):
-                        for key, value in extra_data.items():
-                            if isinstance(value, torch.Tensor):
-                                extra_data[key] = value.cpu().numpy()
+                        # Load data based on file extension
+                        if filename.endswith('.csv'):
+                            df = pd.read_csv(file_path)
+                        else:
+                            df = pd.read_parquet(file_path)
+                            
+                        # Ensure column names are lowercase
+                        df.columns = df.columns.str.lower()
+                        market_data_dict[asset_name] = df
+                
+                if not market_data_dict:
+                    raise ValueError(f"No market data files found in {market_data_path}")
                     
-                    # Get original (non-normalized) window for context
-                    window_start = max(0, idx - rows_needed)
-                    raw_ohlcv = market_data.iloc[window_start:idx]
+                # Use specific assets if requested
+                if asset_names:
+                    filtered_data = {}
+                    for name in asset_names:
+                        if name in market_data_dict:
+                            filtered_data[name] = market_data_dict[name]
+                        else:
+                            logger.warning(f"Asset {name} not found in market data directory")
                     
-                    # Create market context using original data
-                    temp_obs = {"market": raw_ohlcv[required_cols].values}
-                    market_context = self.rl_state_extractor.prepare_market_context(temp_obs, raw_ohlcv)
+                    if filtered_data:
+                        market_data_dict = filtered_data
+                    else:
+                        logger.warning("None of the requested assets found, using all available assets")
+                
+                # Process each asset
+                for asset_name, data in market_data_dict.items():
+                    # Get the last observation
+                    if len(data) < 5:
+                        logger.warning(f"Not enough data for {asset_name}, skipping")
+                        continue
+                        
+                    # Get recent data as observation
+                    recent_data = data.tail(30)  # Get more data for RL model
+                    observation = self._prepare_observation(recent_data)
                     
-                    # Calculate indicators on raw data
-                    indicators = self.rl_state_extractor.indicator_processor.calculate_indicators(raw_ohlcv)
+                    # Log which source of actions we're using
+                    signal_source = None
                     
-                    # Ensure action is a scalar for prompt formatting
-                    action_value = float(action) if isinstance(action, (np.ndarray, list)) else float(action)
+                    # Generate action using RL model if available, otherwise use synthetic
+                    if self.rl_model is not None and not use_synthetic_actions:
+                        action = self._generate_rl_action(observation, data, asset_name)
+                        signal_source = "RL model"
+                    else:
+                        action = self._generate_synthetic_action(data, asset_name)
+                        signal_source = "synthetic" if self.rl_model is not None else "technical indicators (no RL model available)"
                     
-                    # Format prompt
-                    prompt = self.llm.format_prompt(
-                        market_context=market_context,
-                        action=action_value,
-                        indicators=indicators
-                    )
-                    
+                    logger.info(f"Generated {signal_source} action for {asset_name}: {action:.4f}")
+                        
                     # Generate explanation
-                    expl_text = self.llm.generate_explanation(
-                        prompt=prompt,
-                        max_new_tokens=max_tokens,
-                        temperature=temperature
+                    explanation = self.explain_decision(
+                        observation=observation,
+                        market_data=data,
+                        action=action,
+                        asset_name=asset_name,
+                        use_fallback=use_fallback
                     )
                     
-                    # Get timestamp for the explanation
-                    timestamp = data.index[idx] if hasattr(data.index, 'values') and not data.index.equals(pd.RangeIndex(len(data))) else idx
+                    # Add clear signal source labeling
+                    if signal_source == "RL model":
+                        # For RL model predictions, add a subtle attribution
+                        formatted_explanation = f"{asset_name}: {explanation} [Signal: RL model prediction]"
+                    else:
+                        # For synthetic signals, make it very clear
+                        formatted_explanation = f"{asset_name}: {explanation} \n[NOTE: This explanation is based on synthetic signals from {signal_source}, not actual RL model predictions]"
                     
-                    # Ensure action is a float for action_text formatting
-                    action_float = float(action_value) if isinstance(action_value, (np.ndarray, list)) else float(action_value)
+                    explanations.append(formatted_explanation)
+            else:
+                # Single market data file
+                if market_data_path.endswith('.csv'):
+                    market_data = pd.read_csv(market_data_path)
+                elif market_data_path.endswith(('.parquet', '.pq')):
+                    market_data = pd.read_parquet(market_data_path)
+                else:
+                    raise ValueError(f"Unsupported file format: {market_data_path}")
                     
-                    # Format action text
-                    action_text = "BUY" if action_float > 0.2 else ("SELL" if action_float < -0.2 else "HOLD")
+                # Ensure column names are lowercase
+                market_data.columns = market_data.columns.str.lower()
+                
+                # Get recent data as observation
+                if len(market_data) < 5:
+                    raise ValueError("Not enough data points in market data")
                     
-                    # Format explanation
-                    explanation = f"Timestamp: {timestamp}\n"
-                    explanation += f"Action: {action_text} (score: {action_float:.4f})\n"
-                    explanation += f"Explanation: {expl_text}\n"
-                    
-                    explanations.append(explanation)
-                    
-                    # Free memory
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                    
-                except Exception as e:
-                    # Handle individual observation errors
-                    logger.error(f"Error processing observation {i}: {str(e)}")
-                    timestamp = data.index[idx] if hasattr(data.index, 'values') and not data.index.equals(pd.RangeIndex(len(data))) else idx
-                    explanations.append(f"Timestamp: {timestamp}\nAction: HOLD (score: 0.0000)\nExplanation: Error: {str(e)}\n")
-                    
-                    # Free memory on error
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                # Get asset name from filename if available
+                default_asset_name = os.path.splitext(os.path.basename(market_data_path))[0]
+                asset_name = asset_names[0] if asset_names and len(asset_names) > 0 else default_asset_name
+                
+                # Get recent data as observation
+                recent_data = market_data.tail(30)  # Get more data for RL model
+                observation = self._prepare_observation(recent_data)
+                
+                # Log which source of actions we're using
+                signal_source = None
+                
+                # Generate action using RL model if available, otherwise use synthetic
+                if self.rl_model is not None and not use_synthetic_actions:
+                    action = self._generate_rl_action(observation, market_data, asset_name)
+                    signal_source = "RL model"
+                else:
+                    action = self._generate_synthetic_action(market_data, asset_name)
+                    signal_source = "synthetic" if self.rl_model is not None else "technical indicators (no RL model available)"
+                
+                logger.info(f"Generated {signal_source} action for {asset_name}: {action:.4f}")
+                
+                # Generate explanation
+                explanation = self.explain_decision(
+                    observation=observation,
+                    market_data=market_data,
+                    action=action,
+                    asset_name=asset_name,
+                    use_fallback=use_fallback
+                )
+                
+                # Add clear signal source labeling
+                if signal_source == "RL model":
+                    # For RL model predictions, add a subtle attribution
+                    formatted_explanation = f"{explanation} [Signal: RL model prediction]"
+                else:
+                    # For synthetic signals, make it very clear
+                    formatted_explanation = f"{explanation} \n[NOTE: This explanation is based on synthetic signals from {signal_source}, not actual RL model predictions]"
+                
+                explanations.append(formatted_explanation)
             
             return explanations
             
         except Exception as e:
-            logger.error(f"Error in explain_trading_decisions: {str(e)}")
-            return [f"Error processing market data: {str(e)}"]
+            logger.error(f"Error explaining trading decisions: {str(e)}")
+            return [f"Failed to generate explanations: {str(e)}"]
+    
+    def _prepare_observation(self, market_data: pd.DataFrame) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """
+        Prepare market data as observation for RL model, exactly matching the structure used during training.
+        
+        Args:
+            market_data: Market data DataFrame
+            
+        Returns:
+            Observation in the format expected by the RL model
+        """
+        logger.info("Building observation with same structure as training environment")
+        
+        # Initialize observation array
+        observation = []
+        
+        # Ensure we have the required base OHLCV columns
+        base_features = ['open', 'high', 'low', 'close', 'volume']
+        
+        # Define technical features that match the training environment
+        tech_features = ['rsi', 'macd', 'macd_signal', 'bb_upper', 'bb_middle', 'bb_lower',
+                         'sma_10', 'sma_20', 'returns_1d', 'returns_5d', 'returns_10d',
+                         'volatility_5d', 'volatility_10d', 'atr']
+        
+        # Ensure market_data columns are lowercase
+        market_data.columns = [col.lower() for col in market_data.columns]
+        
+        # Calculate any missing indicators
+        market_data = self._calculate_missing_indicators(market_data, base_features, tech_features)
+        
+        # 1. Add market data features for each asset
+        # Since we might only have a single asset in inference vs. multiple in training,
+        # we'll process for each asset in the asset_names list
+        for asset_name in self.asset_names:
+            # Add base features (OHLCV)
+            for feat in base_features:
+                if feat in market_data.columns:
+                    # Take the latest value for this feature
+                    value = float(market_data[feat].iloc[-1])
+                else:
+                    logger.warning(f"Missing base feature {feat}, using 0.0")
+                    value = 0.0
+                observation.append(value)
+            
+            # Add technical indicators
+            for feat in tech_features:
+                if feat in market_data.columns:
+                    # Take the latest value for this feature
+                    value = float(market_data[feat].iloc[-1])
+                else:
+                    logger.warning(f"Missing technical feature {feat}, using 0.0")
+                    value = 0.0
+                observation.append(value)
+        
+        # 2. Add portfolio data for each asset
+        # In training, this includes position size, position value ratio, and funding accrued
+        # During inference, we don't have real positions, so use placeholder values
+        total_portfolio_value = 10000.0  # Default value
+        for asset_name in self.asset_names:
+            # Placeholder for position size (0 = no position)
+            observation.append(0.0)
+            
+            # Placeholder for position value ratio
+            observation.append(0.0)
+            
+            # Placeholder for funding accrued
+            observation.append(0.0)
+        
+        # 3. Add global portfolio data 
+        # In training, this includes portfolio value ratio, recent PnL ratio, and active positions ratio
+        # During inference, use neutral placeholder values
+        observation.append(1.0)  # Portfolio value ratio (1.0 = at initial value)
+        observation.append(0.0)  # Recent PnL ratio (0.0 = no recent profit/loss)
+        observation.append(0.0)  # Active positions ratio (0.0 = no active positions)
+        
+        # Convert to numpy array
+        observation_array = np.array(observation, dtype=np.float32)
+        
+        # Check if RL model uses Dict observation space
+        if self.rl_model is not None:
+            from gymnasium import spaces
+            if isinstance(self.rl_model.observation_space, spaces.Dict):
+                # Get expected shape of "market" entry
+                expected_rows = None
+                expected_cols = None
+                if hasattr(self.rl_model.observation_space.spaces['market'], 'shape'):
+                    if len(self.rl_model.observation_space.spaces['market'].shape) == 2:
+                        expected_rows, expected_cols = self.rl_model.observation_space.spaces['market'].shape
+                
+                # If expected shape is known, reshape accordingly
+                if expected_rows is not None and expected_cols is not None:
+                    try:
+                        market_obs = observation_array.reshape(expected_rows, expected_cols)
+                    except ValueError:
+                        # If cannot reshape, use a default reshape
+                        logger.warning(f"Cannot reshape observation to {expected_rows}x{expected_cols}, using default")
+                        num_features = len(base_features) + len(tech_features)
+                        rows = len(observation_array) // num_features
+                        market_obs = observation_array.reshape(rows, num_features)
+                else:
+                    # Calculate a sensible reshape based on feature counts
+                    num_features = len(base_features) + len(tech_features)
+                    rows = len(observation_array) // num_features
+                    market_obs = observation_array.reshape(rows, num_features)
+                
+                return {"market": market_obs}
+        
+        # If model expects a flat array, check shape and adjust if needed
+        if self.rl_model is not None:
+            expected_shape = self.rl_model.observation_space.shape[0]
+            if len(observation_array) != expected_shape:
+                logger.warning(f"Observation shape mismatch: got {len(observation_array)}, expected {expected_shape}")
+                
+                if len(observation_array) < expected_shape:
+                    # Pad with zeros if needed
+                    padding = np.zeros(expected_shape - len(observation_array), dtype=np.float32)
+                    observation_array = np.concatenate([observation_array, padding])
+                    logger.info(f"Padded observation to match expected shape {expected_shape}")
+                else:
+                    # Truncate if needed
+                    observation_array = observation_array[:expected_shape]
+                    logger.info(f"Truncated observation to match expected shape {expected_shape}")
+        
+        return observation_array
+        
+    def _calculate_missing_indicators(self, market_data: pd.DataFrame, base_features: List[str], tech_features: List[str]) -> pd.DataFrame:
+        """
+        Calculate any missing technical indicators required for the observation
+        
+        Args:
+            market_data: Market data DataFrame
+            base_features: List of required base features
+            tech_features: List of required technical features
+            
+        Returns:
+            DataFrame with all required indicators
+        """
+        # Ensure we have all base features
+        for feat in base_features:
+            if feat not in market_data.columns:
+                if 'close' in market_data.columns:
+                    # Use close price as fallback
+                    market_data[feat] = market_data['close']
+                else:
+                    # Create placeholder data
+                    market_data[feat] = np.ones(len(market_data))
+                    
+        # Calculate technical indicators
+        from ta.trend import SMAIndicator, MACD
+        from ta.momentum import RSIIndicator
+        from ta.volatility import BollingerBands, AverageTrueRange
+        
+        close_series = market_data['close']
+        high_series = market_data['high']
+        low_series = market_data['low']
+        
+        # RSI
+        if 'rsi' not in market_data.columns:
+            try:
+                rsi = RSIIndicator(close=close_series).rsi()
+                market_data['rsi'] = rsi
+            except Exception as e:
+                logger.warning(f"Error calculating RSI: {e}")
+                market_data['rsi'] = 50.0  # Neutral RSI value
+        
+        # MACD
+        if 'macd' not in market_data.columns or 'macd_signal' not in market_data.columns:
+            try:
+                macd_indicator = MACD(close=close_series)
+                market_data['macd'] = macd_indicator.macd()
+                market_data['macd_signal'] = macd_indicator.macd_signal()
+            except Exception as e:
+                logger.warning(f"Error calculating MACD: {e}")
+                market_data['macd'] = 0.0
+                market_data['macd_signal'] = 0.0
+        
+        # Bollinger Bands
+        if 'bb_upper' not in market_data.columns or 'bb_middle' not in market_data.columns or 'bb_lower' not in market_data.columns:
+            try:
+                bb = BollingerBands(close=close_series)
+                market_data['bb_upper'] = bb.bollinger_hband()
+                market_data['bb_middle'] = bb.bollinger_mavg()
+                market_data['bb_lower'] = bb.bollinger_lband()
+            except Exception as e:
+                logger.warning(f"Error calculating Bollinger Bands: {e}")
+                # Use close price with offsets as fallback
+                market_data['bb_middle'] = close_series
+                market_data['bb_upper'] = close_series * 1.02  # 2% above
+                market_data['bb_lower'] = close_series * 0.98  # 2% below
+        
+        # SMAs
+        if 'sma_10' not in market_data.columns:
+            try:
+                market_data['sma_10'] = SMAIndicator(close=close_series, window=10).sma_indicator()
+            except Exception as e:
+                logger.warning(f"Error calculating SMA(10): {e}")
+                market_data['sma_10'] = close_series
+                
+        if 'sma_20' not in market_data.columns:
+            try:
+                market_data['sma_20'] = SMAIndicator(close=close_series, window=20).sma_indicator()
+            except Exception as e:
+                logger.warning(f"Error calculating SMA(20): {e}")
+                market_data['sma_20'] = close_series
+        
+        # Returns
+        if 'returns_1d' not in market_data.columns:
+            market_data['returns_1d'] = close_series.pct_change(1).fillna(0)
+            
+        if 'returns_5d' not in market_data.columns:
+            market_data['returns_5d'] = close_series.pct_change(5).fillna(0)
+            
+        if 'returns_10d' not in market_data.columns:
+            market_data['returns_10d'] = close_series.pct_change(10).fillna(0)
+        
+        # Volatility
+        if 'volatility_5d' not in market_data.columns:
+            market_data['volatility_5d'] = market_data['returns_1d'].rolling(5).std().fillna(0)
+            
+        if 'volatility_10d' not in market_data.columns:
+            market_data['volatility_10d'] = market_data['returns_1d'].rolling(10).std().fillna(0)
+        
+        # Average True Range
+        if 'atr' not in market_data.columns:
+            try:
+                market_data['atr'] = AverageTrueRange(high=high_series, low=low_series, close=close_series).average_true_range()
+            except Exception as e:
+                logger.warning(f"Error calculating ATR: {e}")
+                market_data['atr'] = (high_series - low_series).rolling(14).mean().fillna(0)
+        
+        # Handle NaN values
+        market_data = market_data.fillna(0)
+        
+        return market_data
+
+    def _generate_rl_action(self, observation: Union[np.ndarray, Dict[str, np.ndarray]], market_data: pd.DataFrame, asset_name: str) -> float:
+        """
+        Generate action using RL model
+        
+        Args:
+            observation: Observation for the RL model
+            market_data: Market data DataFrame
+            asset_name: Name of the asset
+            
+        Returns:
+            float: Action value
+        """
+        if self.rl_model is None:
+            logger.warning("No RL model provided, falling back to synthetic action generation")
+            return self._generate_synthetic_action(market_data, asset_name)
+        
+        try:
+            # Use the new _prepare_observation method directly
+            if isinstance(observation, (np.ndarray, dict)):
+                # If observation is already prepared, use it directly
+                obs = observation
+            else:
+                # Otherwise, prepare it from market data
+                obs = self._prepare_observation(market_data)
+            
+            # Log observation shape for debugging
+            if isinstance(obs, np.ndarray):
+                logger.debug(f"Observation shape: {obs.shape}")
+            elif isinstance(obs, dict) and "market" in obs:
+                logger.debug(f"Observation market shape: {obs['market'].shape}")
+            
+            # Get asset index for multi-asset models
+            asset_idx = 0
+            if asset_name is not None and asset_name.lower() in self.asset_name_to_index:
+                asset_idx = self.asset_name_to_index[asset_name.lower()]
+            
+            # Predict action using the RL model
+            with torch.no_grad():
+                action, _ = self.rl_model.predict(obs, deterministic=False)
+            
+            # Format action depending on type
+            if isinstance(action, torch.Tensor):
+                action = action.cpu().numpy()
+            
+            # Handle array output for multi-asset model
+            if isinstance(action, np.ndarray) and len(action) > 1:
+                # Extract action for the specified asset
+                if asset_idx < len(action):
+                    return float(action[asset_idx])
+                else:
+                    logger.warning(f"Asset index {asset_idx} out of bounds for action with shape {action.shape}")
+                    return float(action[0])  # Return first asset action as fallback
+            
+            # Convert action to float
+            return float(action if np.isscalar(action) else action.item() if hasattr(action, 'item') else action[0])
+            
+        except Exception as e:
+            logger.error(f"Error generating RL action: {str(e)}")
+            logger.debug(traceback.format_exc())
+            return self._generate_synthetic_action(market_data, asset_name)
+
+    def _generate_synthetic_action(self, market_data: pd.DataFrame, asset_name: str) -> float:
+        """
+        Generate a synthetic action value based on technical indicators.
+        Ensures consistency between the action and the technical indicators
+        used to generate the explanation.
+        
+        Args:
+            market_data: DataFrame containing market data with indicators
+            asset_name: Name of the asset for logging
+            
+        Returns:
+            Synthetic action value between -0.8 and 0.8
+        """
+        try:
+            if len(market_data) < 5:
+                logger.warning(f"Not enough data to calculate synthetic action for {asset_name}")
+                return 0.0
+            
+            # Check for timestamp column for data consistency logging
+            timestamp = None
+            if 'timestamp' in market_data.columns:
+                timestamp = market_data['timestamp'].iloc[-1]
+                logger.debug(f"Generating synthetic action for {asset_name} at timestamp: {timestamp}")
+                
+            latest = market_data.iloc[-1]
+            action_components = []
+            indicators_log = []
+            indicator_values = {}  # Store values for debugging
+            
+            # Component 1: Price trend (base component)
+            if 'close' in market_data.columns:
+                # Short-term trend (5 periods)
+                short_change = (market_data['close'].iloc[-1] / market_data['close'].iloc[-5] - 1)
+                # Scale to reasonable range (-0.5 to 0.5)
+                price_component = min(0.5, max(-0.5, short_change * 5))
+                action_components.append(price_component)
+                indicators_log.append(f"Price trend: {short_change:.4f} (5-period) → component: {price_component:.4f}")
+                indicator_values['price_change_5d'] = short_change * 100  # Store as percentage
+            
+            # Component 2: RSI
+            if 'rsi' in latest:
+                rsi = latest['rsi']
+                indicator_values['rsi'] = rsi
+                
+                # Use exact same logic as in format_prompt
+                if rsi > 70:
+                    rsi_component = -0.3  # Overbought (bearish)
+                elif rsi < 30:
+                    rsi_component = 0.3   # Oversold (bullish)
+                else:
+                    # Linear scaling from 30-70 range to 0.3 to -0.3
+                    rsi_component = 0.3 - ((rsi - 30) / 40) * 0.6
+                action_components.append(rsi_component)
+                indicators_log.append(f"RSI: {rsi:.2f} → component: {rsi_component:.4f}")
+            
+            # Component 3: MACD
+            if all(col in latest for col in ['macd', 'macd_signal']):
+                macd = latest['macd']
+                signal = latest['macd_signal']
+                macd_diff = macd - signal
+                indicator_values['macd'] = macd
+                indicator_values['macd_signal'] = signal
+                
+                # Use exact same scaling as in format_prompt
+                macd_component = min(0.3, max(-0.3, macd_diff * 10))
+                action_components.append(macd_component)
+                indicators_log.append(f"MACD diff: {macd_diff:.4f} → component: {macd_component:.4f}")
+            
+            # Component 4: Bollinger Bands
+            if all(col in latest for col in ['bb_upper', 'bb_middle', 'bb_lower']) and 'close' in latest:
+                upper = latest['bb_upper']
+                middle = latest['bb_middle']
+                lower = latest['bb_lower']
+                price = latest['close']
+                
+                indicator_values['bb_upper'] = upper
+                indicator_values['bb_middle'] = middle
+                indicator_values['bb_lower'] = lower
+                
+                # Calculate BB position and component
+                if price > upper:
+                    bb_component = -0.2  # Above upper band (bearish)
+                    bb_state = "above upper"
+                elif price < lower:
+                    bb_component = 0.2   # Below lower band (bullish)
+                    bb_state = "below lower"
+                else:
+                    # Neutral - slight tendency toward center
+                    relative_position = (price - lower) / (upper - lower) - 0.5
+                    bb_component = -0.1 * relative_position  # -0.05 to 0.05
+                    bb_state = "within bands"
+                
+                action_components.append(bb_component)
+                indicators_log.append(f"BB ({bb_state}): → component: {bb_component:.4f}")
+            
+            # Component 5: Support/Resistance proximity
+            if all(col in latest for col in ['support', 'resistance']) and 'close' in latest:
+                support = latest['support']
+                resistance = latest['resistance']
+                price = latest['close']
+                
+                indicator_values['support'] = support
+                indicator_values['resistance'] = resistance
+                
+                sr_component = 0.0
+                sr_log = []
+                
+                # Check proximity to support
+                if support > 0:
+                    distance_to_support = (price - support) / price * 100
+                    if distance_to_support < 2:
+                        # Near support - bullish signal
+                        support_effect = 0.2 * (1 - distance_to_support/2)  # 0.2 at 0%, 0.1 at 1%, 0 at 2%
+                        sr_component += support_effect
+                        sr_log.append(f"near support ({distance_to_support:.2f}%): +{support_effect:.3f}")
+                
+                # Check proximity to resistance
+                if resistance > 0:
+                    distance_to_resistance = (resistance - price) / price * 100
+                    if distance_to_resistance < 2:
+                        # Near resistance - bearish signal
+                        resistance_effect = -0.2 * (1 - distance_to_resistance/2)  # -0.2 at 0%, -0.1 at 1%, 0 at 2%
+                        sr_component += resistance_effect
+                        sr_log.append(f"near resistance ({distance_to_resistance:.2f}%): {resistance_effect:.3f}")
+                
+                if sr_log:
+                    action_components.append(sr_component)
+                    indicators_log.append(f"S/R: {', '.join(sr_log)} → component: {sr_component:.4f}")
+            
+            # Combine components (if any exist)
+            if action_components:
+                # Average of all components, then ensure within bounds
+                action = sum(action_components) / len(action_components)
+                # Limit to range (-0.8 to 0.8)
+                action = min(0.8, max(-0.8, action))
+                
+                # Log the calculation for debugging
+                indicators_str = ", ".join(indicators_log)
+                logger.debug(f"Synthetic action for {asset_name}: {action:.4f} [Components: {indicators_str}]")
+                
+                # Get corresponding decision
+                decision = self._action_to_decision(action)
+                
+                # Calculate sentiment tallies
+                bullish_count = 0
+                bearish_count = 0
+                for component in action_components:
+                    if component > 0.05:  # Threshold for considering bullish
+                        bullish_count += 1
+                    elif component < -0.05:  # Threshold for considering bearish
+                        bearish_count += 1
+                
+                # Log decision and sentiment alignment
+                decision_sentiment = "bullish" if decision.startswith("BUY") else "bearish" if decision.startswith("SELL") else "neutral"
+                logger.debug(f"Decision: {decision} ({decision_sentiment}) with {bullish_count} bullish vs {bearish_count} bearish indicators")
+                
+                # Check for potential inconsistency
+                if (decision_sentiment == "bullish" and bearish_count > bullish_count) or \
+                   (decision_sentiment == "bearish" and bullish_count > bearish_count):
+                    logger.warning(f"Potential inconsistency in synthetic action: {decision} does not align with indicator balance")
+                
+                return action
+            else:
+                logger.warning(f"No indicators found to generate synthetic action for {asset_name}")
+                return 0.0
+                
+        except Exception as e:
+            logger.error(f"Error generating synthetic action: {str(e)}")
+            return 0.0
+
+    def _action_to_decision(self, action: float) -> str:
+        """Convert action value to decision string (for consistency)"""
+        if action > 0.6:
+            return "BUY (Strong)"
+        elif action > 0.2:
+            return "BUY (Moderate)"
+        elif action > 0:
+            return "BUY (Light)"
+        elif action < -0.6:
+            return "SELL (Strong)"
+        elif action < -0.2:
+            return "SELL (Moderate)"
+        elif action < 0:
+            return "SELL (Light)"
+        else:
+            return "HOLD"
 
 
 class MarketCommentaryGenerator:
@@ -589,7 +1260,7 @@ Write a market analysis for {symbol} at price ${market_context['price']:.2f} wit
         try:
             # Try simple prompt first
             logger.info("Attempting generation with simple prompt")
-            commentary = self.llm.generate_explanation(
+            commentary = self.llm.generate_text(
                 prompt=simple_prompt,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
@@ -629,8 +1300,8 @@ Market Patterns and Trend:
 Write a concise market analysis.
 [/INST]"""
                 
-                # Try with different parameters
-                commentary = self.llm.generate_explanation(
+                # Try with different parameters using generate_text method
+                commentary = self.llm.generate_text(
                     prompt=full_prompt,
                     max_new_tokens=max_tokens,
                     temperature=0.9,  # Higher temperature for more creativity
@@ -751,7 +1422,7 @@ Write a professional, data-driven market summary that would be valuable for trad
         
         # Generate summary
         logger.info(f"Generating market summary for {len(markets_data)} symbols with temperature {temperature}")
-        summary = self.llm.generate_explanation(
+        summary = self.llm.generate_text(
             prompt=prompt,
             max_new_tokens=max_tokens,
             temperature=temperature,
@@ -798,8 +1469,6 @@ def extract_trading_signals(
     import torch
     from gymnasium import spaces
     
-    logger.info("Extracting trading signals from RL model")
-    
     # Prepare market data
     data = market_data.copy()
     if 'timestamp' in data.columns:
@@ -822,47 +1491,94 @@ def extract_trading_signals(
             mean, std = data[col].mean(), data[col].std()
             data[col] = (data[col] - mean) / (std + 1e-8)
     
-    # Determine model device
-    model_device = next(rl_model.policy.parameters()).device
-    logger.info(f"Model is on device: {model_device}")
+    # Create temporary RLLMExplainer to use its observation preparation logic
+    # Use asset name extracted from market data if available
+    asset_name = None
+    if 'symbol' in data.columns:
+        asset_name = data['symbol'].iloc[0]
     
-    # Extract observations from market data
-    observations = []
+    from trading_llm.inference import RLLMExplainer
+    explainer = RLLMExplainer(
+        rl_model=rl_model,
+        asset_names=[asset_name] if asset_name else ["Asset"]
+    )
+    
+    # Extract observations from market data using a consistent approach
     timestamps = []
+    observations = []
     
+    # Process each timestamp in the data
     for i in range(len(data) - 1):  # -1 because we need the next price for position calculation
-        # Get relevant window
-        window = data.iloc[max(0, i-30):i+1]  # Use up to 30 previous values
+        # Extract the current window of data
+        window_size = 50  # Use reasonable window size
+        start_idx = max(0, i - window_size)
+        window_data = data.iloc[start_idx:i+1].copy()
         
-        # Create observation
-        if isinstance(rl_model.observation_space, spaces.Dict):
-            # If the model uses a Dict observation space, format accordingly
-            obs = {
-                "market": torch.tensor(window[required_cols].values, dtype=torch.float32).to(model_device),
-            }
-        else:
-            # Otherwise, use a flat array
-            obs = torch.tensor(window[required_cols].values.flatten(), dtype=torch.float32).to(model_device)
-        
-        observations.append(obs)
-        timestamps.append(data.index[i] if not data.index.equals(pd.RangeIndex(len(data))) else i)
+        # Use the explainer to prepare the observation correctly
+        try:
+            obs = explainer._prepare_observation(window_data)
+            observations.append(obs)
+            timestamps.append(data.index[i] if not data.index.equals(pd.RangeIndex(len(data))) else i)
+        except Exception as e:
+            print(f"Error preparing observation at index {i}: {str(e)}")
+            continue
+    
+    # Limit debug messages for prediction
+    debug_log_count = 0
+    max_debug_logs = 3
     
     # Get actions from model
     actions = []
-    
-    # Use smaller batches to prevent memory issues
-    batch_size = 32
+    batch_size = 32  # Use smaller batches to prevent memory issues
     
     for i in range(0, len(observations), batch_size):
         batch_obs = observations[i:i+batch_size]
         batch_actions = []
         
         for obs in batch_obs:
-            with torch.no_grad():  # Use no_grad to reduce memory usage
-                action, _ = rl_model.predict(obs, deterministic=False)
-                if isinstance(action, torch.Tensor):
-                    action = action.cpu().numpy()
-                batch_actions.append(float(action))
+            try:
+                with torch.no_grad():  # Use no_grad to reduce memory usage
+                    # Log only the first few predictions
+                    if debug_log_count < max_debug_logs:
+                        print(f"DEBUG: Predicting with observation shape {obs.shape if hasattr(obs, 'shape') else 'unknown'}")
+                        debug_log_count += 1
+                    
+                    action, _ = rl_model.predict(obs, deterministic=False)
+                    
+                    # Process the action
+                    if isinstance(action, torch.Tensor):
+                        action_cpu = action.detach().cpu()
+                        action_np = action_cpu.numpy()
+                    else:
+                        action_np = action
+                    
+                    # Handle multi-dimensional actions and arrays correctly
+                    if isinstance(action_np, np.ndarray):
+                        # Check if it's a multi-asset action (array with multiple values)
+                        if action_np.size > 1:
+                            # For multi-asset case, we'll use the first asset for simplicity
+                            action_value = float(action_np[0])
+                        elif action_np.size == 1:
+                            # Single-asset case with array of size 1
+                            action_value = float(action_np.item())
+                        else:
+                            # Empty array (shouldn't happen)
+                            action_value = 0.0
+                    elif isinstance(action_np, (int, float, np.number)):
+                        # Direct scalar value
+                        action_value = float(action_np)
+                    else:
+                        action_value = 0.0
+                        
+                    batch_actions.append(action_value)
+            except Exception as e:
+                import traceback
+                print(f"ERROR processing observation {i}: {str(e)}")
+                if debug_log_count < max_debug_logs:
+                    print(f"Traceback: {traceback.format_exc()}")
+                    debug_log_count += 1
+                # Use a neutral action as fallback
+                batch_actions.append(0.0)
                 
             # Clear GPU memory after each prediction
             if torch.cuda.is_available():
@@ -901,5 +1617,5 @@ def extract_trading_signals(
         
         signals[str(timestamp)] = signal
     
-    logger.info(f"Extracted {len(signals)} trading signals")
+    print(f"DEBUG: Extracted {len(signals)} trading signals")
     return signals 

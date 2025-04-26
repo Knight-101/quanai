@@ -5,7 +5,7 @@ Provides interactive Q&A about market conditions and trading signals.
 """
 
 import logging
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Union
 
 import pandas as pd
 import torch
@@ -33,6 +33,7 @@ class MarketChatbot:
         llm_model: TradingLLM,
         max_history: int = 5,
         system_prompt: Optional[str] = None,
+        asset_names: Optional[List[str]] = None,
     ):
         """
         Initialize the market chatbot.
@@ -41,6 +42,7 @@ class MarketChatbot:
             llm_model: TradingLLM instance for generating responses
             max_history: Maximum number of messages to keep in conversation history
             system_prompt: Custom system prompt to override the default
+            asset_names: List of asset names for multi-asset support
         """
         self.llm = llm_model
         self.max_history = max_history
@@ -51,8 +53,13 @@ class MarketChatbot:
         self.trading_signals = None
         self.portfolio_performance = None
         
+        # Multi-asset support
+        self.asset_names = asset_names or ["Asset"]
+        self.current_asset = self.asset_names[0] if self.asset_names else None
+        self.asset_name_to_index = {name.lower(): idx for idx, name in enumerate(self.asset_names)}
+        
         setup_logging()
-        logger.info("Market Chatbot initialized")
+        logger.info(f"Market Chatbot initialized with {len(self.asset_names)} assets: {self.asset_names}")
     
     def _default_system_prompt(self) -> str:
         """Default system prompt for the chatbot."""
@@ -99,6 +106,51 @@ class MarketChatbot:
         self.portfolio_performance = performance
         logger.info("Updated portfolio performance metrics")
     
+    def set_current_asset(self, asset: Union[str, int]) -> bool:
+        """
+        Set the current asset to focus on.
+        
+        Args:
+            asset: Asset name (string) or index (integer)
+            
+        Returns:
+            True if successful, False if asset not found
+        """
+        # Handle asset by index
+        if isinstance(asset, int):
+            if 0 <= asset < len(self.asset_names):
+                self.current_asset = self.asset_names[asset]
+                logger.info(f"Set current asset to: {self.current_asset} (by index)")
+                return True
+            else:
+                logger.warning(f"Invalid asset index: {asset}")
+                return False
+        
+        # Convert string asset name to lowercase for matching
+        if isinstance(asset, str):
+            asset = asset.lower()
+            
+            # Direct match
+            if asset in self.asset_name_to_index:
+                asset_index = self.asset_name_to_index[asset]
+                self.current_asset = self.asset_names[asset_index]
+                logger.info(f"Set current asset to: {self.current_asset} (by direct match)")
+                return True
+                
+            # Try partial matching
+            matches = [name for name in self.asset_name_to_index.keys() 
+                     if asset in name or name in asset]
+            
+            if matches:
+                # Use the closest match
+                asset_index = self.asset_name_to_index[matches[0]]
+                self.current_asset = self.asset_names[asset_index]
+                logger.info(f"Set current asset to: {self.current_asset} (by partial match from '{asset}')")
+                return True
+        
+        logger.warning(f"Asset not found: {asset}")
+        return False
+    
     def _format_conversation_history(self) -> str:
         """Format the conversation history for the prompt."""
         formatted = []
@@ -112,34 +164,116 @@ class MarketChatbot:
         """Prepare market context from available data."""
         context_parts = []
         
+        # Add current asset focus information
+        if self.current_asset:
+            context_parts.append(f"Current Asset Focus: {self.current_asset}")
+        
+        # List available assets
+        context_parts.append(f"Available Assets: {', '.join(self.asset_names)}")
+        
         if self.market_data is not None:
+            # Filter market data for current asset if possible
             recent_data = self.market_data.tail(5)
-            market_summary = (
-                f"Recent Market Data (last 5 periods):\n"
-                f"Close prices: {recent_data['close'].values.tolist()}\n"
-                f"Volume: {recent_data['volume'].values.tolist()}\n"
-            )
             
-            # Add technical indicators if available
-            tech_indicators = [col for col in recent_data.columns 
-                              if col not in ['open', 'high', 'low', 'close', 'volume', 'timestamp']]
-            if tech_indicators:
-                market_summary += "Technical Indicators:\n"
-                for indicator in tech_indicators[:5]:  # Limit to 5 indicators to keep context manageable
-                    market_summary += f"- {indicator}: {recent_data[indicator].iloc[-1]:.4f}\n"
+            # Check if multi-asset columns exist (using naming convention like 'close_BTC', 'close_ETH')
+            asset_specific_columns = {}
+            for asset in self.asset_names:
+                asset_cols = [col for col in recent_data.columns if col.endswith(f"_{asset}")]
+                if asset_cols:
+                    asset_specific_columns[asset] = asset_cols
+            
+            # If we have asset-specific columns and a current asset
+            if asset_specific_columns and self.current_asset in asset_specific_columns:
+                # Get columns for current asset
+                cols = asset_specific_columns[self.current_asset]
+                # Extract base column names without asset suffix
+                base_cols = [col.rsplit('_', 1)[0] for col in cols]
+                
+                market_summary = (
+                    f"Recent Market Data for {self.current_asset} (last 5 periods):\n"
+                )
+                
+                # Add price data if available
+                price_cols = [col for col in cols if col.startswith('close_')]
+                if price_cols:
+                    market_summary += f"Close prices: {recent_data[price_cols[0]].values.tolist()}\n"
+                
+                # Add volume data if available
+                volume_cols = [col for col in cols if col.startswith('volume_')]
+                if volume_cols:
+                    market_summary += f"Volume: {recent_data[volume_cols[0]].values.tolist()}\n"
+                
+                # Add technical indicators if available
+                tech_indicators = [col for col in cols 
+                                  if not col.startswith(('open_', 'high_', 'low_', 'close_', 'volume_', 'timestamp_'))]
+                if tech_indicators:
+                    market_summary += "Technical Indicators:\n"
+                    for indicator in tech_indicators[:5]:  # Limit to 5 indicators
+                        indicator_value = recent_data[indicator].iloc[-1]
+                        # Check if the value is numeric before applying float formatting
+                        if isinstance(indicator_value, (int, float)):
+                            market_summary += f"- {indicator.split('_')[0]}: {indicator_value:.4f}\n"
+                        else:
+                            market_summary += f"- {indicator.split('_')[0]}: {indicator_value}\n"
+            else:
+                # Standard single-asset format
+                market_summary = (
+                    f"Recent Market Data (last 5 periods):\n"
+                    f"Close prices: {recent_data['close'].values.tolist()}\n"
+                )
+                
+                if 'volume' in recent_data.columns:
+                    market_summary += f"Volume: {recent_data['volume'].values.tolist()}\n"
+                
+                # Add technical indicators if available
+                tech_indicators = [col for col in recent_data.columns 
+                                  if col not in ['open', 'high', 'low', 'close', 'volume', 'timestamp']]
+                if tech_indicators:
+                    market_summary += "Technical Indicators:\n"
+                    for indicator in tech_indicators[:5]:  # Limit to 5 indicators
+                        indicator_value = recent_data[indicator].iloc[-1]
+                        # Check if the value is numeric before applying float formatting
+                        if isinstance(indicator_value, (int, float)):
+                            market_summary += f"- {indicator}: {indicator_value:.4f}\n"
+                        else:
+                            market_summary += f"- {indicator}: {indicator_value}\n"
             
             context_parts.append(market_summary)
         
         if self.trading_signals is not None:
             signal_summary = "Current Trading Signals:\n"
-            for asset, signal in self.trading_signals.items():
-                signal_summary += f"- {asset}: {signal['action']} (confidence: {signal['confidence']:.2f})\n"
+            
+            # Filter trading signals for current asset if specified
+            if self.current_asset and self.current_asset in self.trading_signals:
+                signal = self.trading_signals[self.current_asset]
+                signal_summary += f"- {self.current_asset}: {signal['action']} (confidence: {signal['confidence']:.2f})\n"
+            else:
+                # Otherwise show all signals
+                for asset, signal in self.trading_signals.items():
+                    signal_summary += f"- {asset}: {signal['action']} (confidence: {signal['confidence']:.2f})\n"
+            
             context_parts.append(signal_summary)
         
         if self.portfolio_performance is not None:
-            perf_summary = "Portfolio Performance:\n"
-            for metric, value in self.portfolio_performance.items():
-                perf_summary += f"- {metric}: {value}\n"
+            # Add asset-specific performance if available
+            if isinstance(self.portfolio_performance, dict) and self.current_asset in self.portfolio_performance:
+                asset_perf = self.portfolio_performance[self.current_asset]
+                perf_summary = f"Portfolio Performance for {self.current_asset}:\n"
+                for metric, value in asset_perf.items():
+                    perf_summary += f"- {metric}: {value}\n"
+            else:
+                # General portfolio performance
+                perf_summary = "Portfolio Performance:\n"
+                if isinstance(self.portfolio_performance, dict):
+                    for metric, value in self.portfolio_performance.items():
+                        if isinstance(value, dict) and self.current_asset in value:
+                            # If we have asset-specific metrics inside a general dict
+                            perf_summary += f"- {metric}: {value[self.current_asset]}\n"
+                        else:
+                            perf_summary += f"- {metric}: {value}\n"
+                else:
+                    perf_summary += "Performance data not available in expected format"
+            
             context_parts.append(perf_summary)
         
         return "\n".join(context_parts)
@@ -188,27 +322,65 @@ Assistant:"""
         if len(self.conversation_history) > self.max_history * 2:  # *2 because we count pairs
             self.conversation_history = self.conversation_history[-self.max_history*2:]
     
-    def chat(self, message: str) -> str:
+    def chat(self, message: str, asset_name: Optional[str] = None) -> str:
         """
         Process a user message and generate a response.
         
         Args:
             message: User's message
+            asset_name: Optional asset name to focus on for this response
             
         Returns:
             Assistant's response
         """
+        # Update current asset if provided
+        if asset_name:
+            self.set_current_asset(asset_name)
+        
+        # Check for asset switching in the message
+        asset_mention_found = False
+        
+        # Look for specific asset mentions
+        for name in self.asset_names:
+            name_lower = name.lower()
+            msg_lower = message.lower()
+            
+            # Check both direct mentions and switching commands
+            direct_mention = name_lower in msg_lower
+            
+            switch_patterns = [
+                f"switch to {name_lower}",
+                f"focus on {name_lower}",
+                f"tell me about {name_lower}",
+                f"what about {name_lower}",
+                f"how is {name_lower} doing",
+                f"analyze {name_lower}"
+            ]
+            command_mention = any(pattern in msg_lower for pattern in switch_patterns)
+            
+            if direct_mention or command_mention:
+                if self.set_current_asset(name):
+                    asset_mention_found = True
+                    break
+        
+        # Check for general requests to list available assets
+        if not asset_mention_found and any(phrase in message.lower() for phrase in 
+                                        ["list assets", "available assets", "what assets", "show assets"]):
+            asset_list = ", ".join(self.asset_names)
+            message = f"The available assets are: {asset_list}. " + message
+        
         self.add_message("user", message)
         
         # Build the prompt with system instruction, context, history and the new message
         prompt = self._build_prompt(message)
         
-        # Generate response
+        # Generate response using the current asset name for context
         response = self.llm.generate_text(
             prompt,
             max_new_tokens=512,
             temperature=0.7,
             top_p=0.9,
+            asset_name=self.current_asset
         )
         
         # Clean response if needed (remove any instances of "Assistant:" prefix)
@@ -229,28 +401,136 @@ Assistant:"""
 
 def load_market_chatbot(
     model_path: str,
+    base_model: Optional[str] = None,
     max_history: int = 5,
     system_prompt: Optional[str] = None,
-    device: str = "auto",
+    device_map: str = "auto",
+    asset_names: Optional[List[str]] = None,
 ) -> MarketChatbot:
     """
     Load a market chatbot with a pre-trained model.
     
     Args:
-        model_path: Path to the trained LLM model or Hugging Face model ID
+        model_path: Path to the trained LLM model or adapter
+        base_model: Optional base model to use if model_path contains LoRA adapters
         max_history: Maximum number of message pairs to keep in history
         system_prompt: Custom system prompt
-        device: Device to load the model on ('cpu', 'cuda', 'auto')
+        device_map: Device mapping strategy ('cpu', 'cuda', 'auto')
+        asset_names: List of asset names for multi-asset support
         
     Returns:
         Initialized MarketChatbot instance
     """
     # Load the TradingLLM model
-    llm = TradingLLM.load(model_path, device=device)
+    llm = TradingLLM.load_from_pretrained(
+        model_dir=model_path,
+        base_model=base_model,
+        device_map=device_map
+    )
     
-    # Create and return the chatbot
+    # Initialize and return chatbot
     return MarketChatbot(
         llm_model=llm,
         max_history=max_history,
         system_prompt=system_prompt,
-    ) 
+        asset_names=asset_names,
+    )
+
+def run_cli_chatbot():
+    """
+    Run a simple CLI interface for the Market Chatbot.
+    """
+    import argparse
+    import sys
+    
+    parser = argparse.ArgumentParser(description="Interactive Market Trading Chatbot")
+    parser.add_argument("--model_path", required=True, help="Path to the trained LLM model or adapter")
+    parser.add_argument("--base_model", help="Base model path (required when using LoRA adapters)")
+    parser.add_argument("--max_history", type=int, default=5, help="Maximum number of message pairs to retain")
+    parser.add_argument("--device", default="auto", help="Device to run the model on ('cpu', 'cuda', 'auto')")
+    parser.add_argument("--market_data", help="Optional path to CSV or Parquet market data file")
+    parser.add_argument("--trading_signals", help="Optional path to JSON file with trading signals")
+    parser.add_argument("--assets", help="Comma-separated list of asset names")
+    parser.add_argument("--focus_asset", help="Initial asset to focus on")
+    args = parser.parse_args()
+    
+    # Process asset names if provided
+    asset_names = None
+    if args.assets:
+        asset_names = [name.strip() for name in args.assets.split(",")]
+    
+    print(f"Initializing chatbot with model from {args.model_path}...")
+    chatbot = load_market_chatbot(
+        model_path=args.model_path,
+        base_model=args.base_model,
+        max_history=args.max_history,
+        device_map=args.device,
+        asset_names=asset_names,
+    )
+    
+    # Set initial focus asset if provided
+    if args.focus_asset and chatbot.set_current_asset(args.focus_asset):
+        print(f"Initially focusing on asset: {args.focus_asset}")
+    
+    # Load market data if provided
+    if args.market_data:
+        print(f"Loading market data from {args.market_data}")
+        try:
+            if args.market_data.endswith('.csv'):
+                market_data = pd.read_csv(args.market_data)
+            elif args.market_data.endswith('.parquet'):
+                market_data = pd.read_parquet(args.market_data)
+            else:
+                print(f"Unsupported market data format: {args.market_data}")
+                market_data = None
+                
+            if market_data is not None:
+                chatbot.update_market_data(market_data)
+        except Exception as e:
+            print(f"Error loading market data: {str(e)}")
+    
+    # Load trading signals if provided
+    if args.trading_signals:
+        print(f"Loading trading signals from {args.trading_signals}")
+        try:
+            import json
+            with open(args.trading_signals, 'r') as f:
+                signals = json.load(f)
+            chatbot.update_trading_signals(signals)
+        except Exception as e:
+            print(f"Error loading trading signals: {str(e)}")
+    
+    print("\nTrading Chatbot initialized. Type 'exit', 'quit', or use Ctrl+C to end the conversation.")
+    print("Type 'clear' to reset the conversation history.")
+    print("Type 'focus <asset_name>' to change the current asset focus.\n")
+
+    try:
+        while True:
+            user_input = input("You: ")
+            if user_input.lower() in ['exit', 'quit']:
+                print("Ending conversation. Goodbye!")
+                break
+            elif user_input.lower() == 'clear':
+                chatbot.reset_conversation()
+                print("Conversation history cleared.")
+                continue
+            elif user_input.lower().startswith('focus '):
+                asset_name = user_input[6:].strip()
+                if chatbot.set_current_asset(asset_name):
+                    print(f"Now focusing on: {asset_name}")
+                else:
+                    print(f"Asset '{asset_name}' not found. Available assets: {chatbot.asset_names}")
+                continue
+            
+            print("Assistant: ", end="")
+            sys.stdout.flush()  # Ensure prompt appears before potentially long processing
+            
+            response = chatbot.chat(user_input)
+            
+            print(response)
+            print()
+    except KeyboardInterrupt:
+        print("\nEnding conversation. Goodbye!")
+
+if __name__ == "__main__":
+    run_cli_chatbot() 

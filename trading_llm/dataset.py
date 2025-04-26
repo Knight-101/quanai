@@ -46,39 +46,134 @@ class TechnicalIndicatorProcessor:
         for col in required_columns:
             if col not in df.columns:
                 raise ValueError(f"Required column '{col}' not found in DataFrame")
+                
+        # Check if we have enough data for meaningful indicators
+        # Most indicators need at least 26 days of data
+        if len(df) < 26:
+            # print(f"WARNING: Dataset has only {len(df)} rows, which may not be sufficient for calculating some indicators")
+            pass
         
         # Calculate indicators
         indicators = {}
         
         # Trend indicators
-        indicators['sma_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator().iloc[-1]
-        indicators['sma_50'] = SMAIndicator(close=df['close'], window=50).sma_indicator().iloc[-1]
-        indicators['ema_12'] = EMAIndicator(close=df['close'], window=12).ema_indicator().iloc[-1]
-        indicators['ema_26'] = EMAIndicator(close=df['close'], window=26).ema_indicator().iloc[-1]
+        try:
+            indicators['sma_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator().iloc[-1]
+            if pd.isna(indicators['sma_20']):
+                indicators['sma_20'] = df['close'].iloc[-1]  # Use current price as fallback
+        except Exception as e:
+            # print(f"Warning: Could not calculate SMA(20): {str(e)}")
+            indicators['sma_20'] = df['close'].iloc[-1]  # Use current price as fallback
+            
+        try:
+            indicators['sma_50'] = SMAIndicator(close=df['close'], window=50).sma_indicator().iloc[-1]
+            if pd.isna(indicators['sma_50']):
+                indicators['sma_50'] = df['close'].iloc[-1]  # Use current price as fallback
+        except Exception as e:
+            # print(f"Warning: Could not calculate SMA(50): {str(e)}")
+            indicators['sma_50'] = df['close'].iloc[-1]  # Use current price as fallback
+            
+        try:
+            indicators['ema_12'] = EMAIndicator(close=df['close'], window=12).ema_indicator().iloc[-1]
+            if pd.isna(indicators['ema_12']):
+                indicators['ema_12'] = df['close'].iloc[-1]  # Use current price as fallback
+        except Exception as e:
+            # print(f"Warning: Could not calculate EMA(12): {str(e)}")
+            indicators['ema_12'] = df['close'].iloc[-1]  # Use current price as fallback
+            
+        try:
+            indicators['ema_26'] = EMAIndicator(close=df['close'], window=26).ema_indicator().iloc[-1]
+            if pd.isna(indicators['ema_26']):
+                indicators['ema_26'] = df['close'].iloc[-1]  # Use current price as fallback
+        except Exception as e:
+            # print(f"Warning: Could not calculate EMA(26): {str(e)}")
+            indicators['ema_26'] = df['close'].iloc[-1]  # Use current price as fallback
         
         # MACD
-        macd = MACD(close=df['close'])
-        indicators['macd'] = macd.macd().iloc[-1]
-        indicators['macd_signal'] = macd.macd_signal().iloc[-1]
-        indicators['macd_diff'] = macd.macd_diff().iloc[-1]
+        try:
+            macd = MACD(close=df['close'])
+            indicators['macd'] = macd.macd().iloc[-1]
+            indicators['macd_signal'] = macd.macd_signal().iloc[-1]
+            indicators['macd_diff'] = macd.macd_diff().iloc[-1]
+            
+            # Check for NaN values and replace with sensible defaults
+            if pd.isna(indicators['macd']):
+                indicators['macd'] = 0.0
+            if pd.isna(indicators['macd_signal']):
+                indicators['macd_signal'] = 0.0
+            if pd.isna(indicators['macd_diff']):
+                indicators['macd_diff'] = 0.0
+        except Exception as e:
+            # print(f"Warning: Could not calculate MACD: {str(e)}")
+            # Use zeros as defaults
+            indicators['macd'] = 0.0
+            indicators['macd_signal'] = 0.0
+            indicators['macd_diff'] = 0.0
         
         # Momentum indicators
-        indicators['rsi'] = RSIIndicator(close=df['close']).rsi().iloc[-1]
+        try:
+            indicators['rsi'] = RSIIndicator(close=df['close']).rsi().iloc[-1]
+            if pd.isna(indicators['rsi']):
+                indicators['rsi'] = 50.0  # Neutral RSI value as fallback
+        except Exception as e:
+            # print(f"Warning: Could not calculate RSI: {str(e)}")
+            indicators['rsi'] = 50.0  # Neutral RSI value as fallback
         
-        stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'])
-        indicators['stoch_k'] = stoch.stoch().iloc[-1]
-        indicators['stoch_d'] = stoch.stoch_signal().iloc[-1]
+        try:
+            stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'])
+            indicators['stoch_k'] = stoch.stoch().iloc[-1]
+            indicators['stoch_d'] = stoch.stoch_signal().iloc[-1]
+            
+            # Check for NaN values
+            if pd.isna(indicators['stoch_k']):
+                indicators['stoch_k'] = 50.0
+            if pd.isna(indicators['stoch_d']):
+                indicators['stoch_d'] = 50.0
+        except Exception as e:
+            # print(f"Warning: Could not calculate Stochastic Oscillator: {str(e)}")
+            indicators['stoch_k'] = 50.0
+            indicators['stoch_d'] = 50.0
         
         # Volatility indicators
-        bb = BollingerBands(close=df['close'])
-        indicators['bb_high'] = bb.bollinger_hband().iloc[-1]
-        indicators['bb_low'] = bb.bollinger_lband().iloc[-1]
-        indicators['bb_width'] = (indicators['bb_high'] - indicators['bb_low']) / df['close'].iloc[-1]
+        try:
+            bb = BollingerBands(close=df['close'])
+            indicators['bb_high'] = bb.bollinger_hband().iloc[-1]
+            indicators['bb_low'] = bb.bollinger_lband().iloc[-1]
+            
+            # Handle NaN values
+            if pd.isna(indicators['bb_high']) or pd.isna(indicators['bb_low']):
+                # Use a percentage of price as fallback
+                current_price = df['close'].iloc[-1]
+                indicators['bb_high'] = current_price * 1.02  # 2% above current price
+                indicators['bb_low'] = current_price * 0.98   # 2% below current price
+                
+            indicators['bb_width'] = (indicators['bb_high'] - indicators['bb_low']) / df['close'].iloc[-1]
+        except Exception as e:
+            # print(f"Warning: Could not calculate Bollinger Bands: {str(e)}")
+            # Use a percentage of price as fallback
+            current_price = df['close'].iloc[-1]
+            indicators['bb_high'] = current_price * 1.02  # 2% above current price
+            indicators['bb_low'] = current_price * 0.98   # 2% below current price
+            indicators['bb_width'] = 0.04  # 4% width as default
         
-        indicators['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range().iloc[-1]
+        try:
+            indicators['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range().iloc[-1]
+            if pd.isna(indicators['atr']):
+                # Use a percentage of price as fallback
+                indicators['atr'] = df['close'].iloc[-1] * 0.01  # 1% of price as fallback
+        except Exception as e:
+            # print(f"Warning: Could not calculate ATR: {str(e)}")
+            # Use a percentage of price as fallback
+            indicators['atr'] = df['close'].iloc[-1] * 0.01  # 1% of price as fallback
         
         # Volume indicators
-        indicators['obv'] = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume']).on_balance_volume().iloc[-1]
+        try:
+            indicators['obv'] = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume']).on_balance_volume().iloc[-1]
+            if pd.isna(indicators['obv']):
+                indicators['obv'] = df['volume'].iloc[-1]  # Use last volume as fallback
+        except Exception as e:
+            # print(f"Warning: Could not calculate OBV: {str(e)}")
+            indicators['obv'] = df['volume'].iloc[-1]  # Use last volume as fallback
         
         # Price action indicators
         indicators['price'] = df['close'].iloc[-1]

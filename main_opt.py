@@ -1450,7 +1450,7 @@ class TradingSystem:
             
             while not done and step_count < max_episode_steps:
                 # Get action from model
-                action, _ = model.predict(obs, deterministic=False)  # Use stochastic actions for evaluation
+                action, _ = model.predict(obs, deterministic=True)  # Use stochastic actions for evaluation
                 
                 # CRITICAL FIX: Add much stronger exploration noise for more steps during evaluation
                 # This is crucial to ensure trades are executed during evaluation

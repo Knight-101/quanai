@@ -1355,13 +1355,6 @@ class InstitutionalBacktester:
                 # Save results
                 self.save_results(metrics)
                 
-                # If requested, run additional analyses
-                if self.regime_analysis:
-                    self.run_regime_analysis()
-                    
-                if self.walk_forward:
-                    self.run_walk_forward_validation()
-                
                 return metrics
             except Exception as e:
                 logger.error(f"Error calculating metrics: {str(e)}")
@@ -2402,13 +2395,14 @@ class InstitutionalBacktester:
         
         return filtered_data
     
-    def run_walk_forward_validation(self, window_size: int = 60, step_size: int = 30) -> Dict[str, Any]:
+    def run_walk_forward_validation(self, window_size: int = 90, step_size: int = 60, max_windows: int = 25) -> Dict[str, Any]:
         """
         Run walk-forward validation to test model robustness across time periods.
         
         Args:
-            window_size: Number of days for each window
-            step_size: Number of days to step forward for each iteration
+            window_size: Number of days for each window (default: 90 days - quarterly)
+            step_size: Number of days to step forward for each iteration (default: 60 days)
+            max_windows: Maximum number of windows to analyze (default: 25)
             
         Returns:
             Dictionary of walk-forward validation results
@@ -2444,7 +2438,7 @@ class InstitutionalBacktester:
         windows = []
         start_idx = 0
         
-        while start_idx < len(unique_dates):
+        while start_idx < len(unique_dates) and len(windows) < max_windows:
             if start_idx + window_size > len(unique_dates):
                 break
                 
@@ -2458,7 +2452,15 @@ class InstitutionalBacktester:
             logger.warning("No valid windows created for walk-forward validation")
             return None
             
-        logger.info(f"Created {len(windows)} windows for walk-forward validation")
+        # If we have too many windows, sample them systematically
+        if len(windows) > max_windows:
+            logger.warning(f"Created {len(windows)} windows, limiting to {max_windows} as specified")
+            # Take windows at regular intervals to cover the entire range
+            step = len(windows) / max_windows
+            selected_indices = [int(i * step) for i in range(max_windows)]
+            windows = [windows[i] for i in selected_indices]
+        
+        logger.info(f"Analyzing {len(windows)} windows for walk-forward validation")
         
         # Run backtest for each window
         wf_results = []
@@ -2474,7 +2476,10 @@ class InstitutionalBacktester:
                 start_date=start_date.strftime('%Y-%m-%d'),
                 end_date=end_date.strftime('%Y-%m-%d'),
                 assets=self.assets,
-                config_path='config/prod_config.yaml'
+                config_path='config/prod_config.yaml',
+                # IMPORTANT: Disable walk_forward and regime_analysis in the sub-backtester to prevent recursion
+                walk_forward=False,
+                regime_analysis=False
             )
             
             # Use the same model
@@ -2490,7 +2495,24 @@ class InstitutionalBacktester:
             if window_data is not None and len(window_data) > 0:
                 # Run backtest on window data
                 window_backtester.data = window_data
-                window_backtester.env = window_backtester.prepare_environment(window_data)
+                
+                # Initialize environment with last known prices if available
+                if hasattr(window_data, 'attrs') and 'last_prices' in window_data.attrs:
+                    logger.info(f"Initializing environment with pre-cached last prices for window {i+1}")
+                    window_env = window_backtester.prepare_environment(window_data)
+                    
+                    # Set last_prices in the underlying environment to avoid mark price errors
+                    if window_env is not None:
+                        # Access the actual environment inside the VecNormalize wrapper
+                        actual_env = window_env.venv.envs[0]
+                        if hasattr(window_data.attrs, 'last_prices'):
+                            actual_env.last_prices = window_data.attrs['last_prices'].copy()
+                            logger.info(f"Set last_prices for {len(actual_env.last_prices)} assets in window environment")
+                    
+                    window_backtester.env = window_env
+                else:
+                    # Standard environment preparation
+                    window_backtester.env = window_backtester.prepare_environment(window_data)
                 
                 window_metrics = window_backtester.run_backtest(n_eval_episodes=1)
                 
