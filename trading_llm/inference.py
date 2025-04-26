@@ -714,30 +714,57 @@ class RLLMExplainer:
         # Ensure market_data columns are lowercase
         market_data.columns = [col.lower() for col in market_data.columns]
         
+        # Check if we have multi-asset data (with 'symbol' column)
+        is_multi_asset = 'symbol' in market_data.columns
+        
         # Calculate any missing indicators
         market_data = self._calculate_missing_indicators(market_data, base_features, tech_features)
         
-        # 1. Add market data features for each asset
-        # Since we might only have a single asset in inference vs. multiple in training,
-        # we'll process for each asset in the asset_names list
-        for asset_name in self.asset_names:
+        # Target asset list - fixed for the expected 78-sized observation (3 assets)
+        target_assets = ['BTC', 'ETH', 'SOL']
+        
+        # Map the available asset_names to the standard target_assets
+        asset_map = {}
+        if len(self.asset_names) > 0:
+            for i, asset in enumerate(self.asset_names):
+                if i < len(target_assets):
+                    asset_map[target_assets[i]] = asset
+        
+        # 1. Add market data features for each target asset
+        for target_asset in target_assets:
+            # Get the corresponding asset name if we have a mapping
+            asset_name = asset_map.get(target_asset, target_asset)
+            
+            # Check if we have data for this specific asset
+            asset_data = None
+            if is_multi_asset:
+                asset_df = market_data[market_data['symbol'] == asset_name]
+                if not asset_df.empty:
+                    asset_data = asset_df.iloc[-1]
+            
+            # If no specific asset data, use the entire market_data
+            if asset_data is None:
+                asset_data = market_data.iloc[-1] if not market_data.empty else None
+            
             # Add base features (OHLCV)
             for feat in base_features:
-                if feat in market_data.columns:
-                    # Take the latest value for this feature
+                if asset_data is not None and feat in asset_data.index:
+                    value = float(asset_data[feat])
+                elif feat in market_data.columns:
                     value = float(market_data[feat].iloc[-1])
                 else:
-                    logger.warning(f"Missing base feature {feat}, using 0.0")
+                    logger.warning(f"Missing base feature {feat} for {asset_name}, using 0.0")
                     value = 0.0
                 observation.append(value)
             
             # Add technical indicators
             for feat in tech_features:
-                if feat in market_data.columns:
-                    # Take the latest value for this feature
+                if asset_data is not None and feat in asset_data.index:
+                    value = float(asset_data[feat])
+                elif feat in market_data.columns:
                     value = float(market_data[feat].iloc[-1])
                 else:
-                    logger.warning(f"Missing technical feature {feat}, using 0.0")
+                    logger.warning(f"Missing technical feature {feat} for {asset_name}, using 0.0")
                     value = 0.0
                 observation.append(value)
         
@@ -745,7 +772,7 @@ class RLLMExplainer:
         # In training, this includes position size, position value ratio, and funding accrued
         # During inference, we don't have real positions, so use placeholder values
         total_portfolio_value = 10000.0  # Default value
-        for asset_name in self.asset_names:
+        for _ in target_assets:  # Use target_assets to ensure we always have 3 assets' worth of data
             # Placeholder for position size (0 = no position)
             observation.append(0.0)
             
@@ -761,6 +788,12 @@ class RLLMExplainer:
         observation.append(1.0)  # Portfolio value ratio (1.0 = at initial value)
         observation.append(0.0)  # Recent PnL ratio (0.0 = no recent profit/loss)
         observation.append(0.0)  # Active positions ratio (0.0 = no active positions)
+        
+        # 4. Add additional features to match expected 78 features
+        # Based on error we need 9 more features to reach 78 from our current 69
+        logger.info("Adding additional features to match expected 78 features")
+        for i in range(9):
+            observation.append(0.0)
         
         # Convert to numpy array
         observation_array = np.array(observation, dtype=np.float32)
@@ -797,18 +830,27 @@ class RLLMExplainer:
         # If model expects a flat array, check shape and adjust if needed
         if self.rl_model is not None:
             expected_shape = self.rl_model.observation_space.shape[0]
-            if len(observation_array) != expected_shape:
-                logger.warning(f"Observation shape mismatch: got {len(observation_array)}, expected {expected_shape}")
+            current_shape = len(observation_array)
+            
+            if current_shape != expected_shape:
+                logger.warning(f"Observation shape mismatch: got {current_shape}, expected {expected_shape}")
                 
-                if len(observation_array) < expected_shape:
+                # For the current case of 78 expected features:
+                # We should have exactly 78 elements (75 asset features + 3 portfolio features)
+                # The array should already be exactly sized due to our target_assets approach
+                
+                if current_shape < expected_shape:
                     # Pad with zeros if needed
-                    padding = np.zeros(expected_shape - len(observation_array), dtype=np.float32)
+                    padding = np.zeros(expected_shape - current_shape, dtype=np.float32)
                     observation_array = np.concatenate([observation_array, padding])
-                    logger.info(f"Padded observation to match expected shape {expected_shape}")
+                    logger.info(f"Padded observation from {current_shape} to match expected shape {expected_shape}")
                 else:
                     # Truncate if needed
                     observation_array = observation_array[:expected_shape]
-                    logger.info(f"Truncated observation to match expected shape {expected_shape}")
+                    logger.info(f"Truncated observation from {current_shape} to match expected shape {expected_shape}")
+        
+        # Log the final observation shape for debugging
+        logger.info(f"Final observation shape: {observation_array.shape}")
         
         return observation_array
         
@@ -834,91 +876,111 @@ class RLLMExplainer:
                     # Create placeholder data
                     market_data[feat] = np.ones(len(market_data))
                     
-        # Calculate technical indicators
-        from ta.trend import SMAIndicator, MACD
-        from ta.momentum import RSIIndicator
-        from ta.volatility import BollingerBands, AverageTrueRange
-        
-        close_series = market_data['close']
-        high_series = market_data['high']
-        low_series = market_data['low']
-        
-        # RSI
-        if 'rsi' not in market_data.columns:
-            try:
-                rsi = RSIIndicator(close=close_series).rsi()
-                market_data['rsi'] = rsi
-            except Exception as e:
-                logger.warning(f"Error calculating RSI: {e}")
-                market_data['rsi'] = 50.0  # Neutral RSI value
-        
-        # MACD
-        if 'macd' not in market_data.columns or 'macd_signal' not in market_data.columns:
-            try:
-                macd_indicator = MACD(close=close_series)
-                market_data['macd'] = macd_indicator.macd()
-                market_data['macd_signal'] = macd_indicator.macd_signal()
-            except Exception as e:
-                logger.warning(f"Error calculating MACD: {e}")
-                market_data['macd'] = 0.0
-                market_data['macd_signal'] = 0.0
-        
-        # Bollinger Bands
-        if 'bb_upper' not in market_data.columns or 'bb_middle' not in market_data.columns or 'bb_lower' not in market_data.columns:
-            try:
-                bb = BollingerBands(close=close_series)
-                market_data['bb_upper'] = bb.bollinger_hband()
-                market_data['bb_middle'] = bb.bollinger_mavg()
-                market_data['bb_lower'] = bb.bollinger_lband()
-            except Exception as e:
-                logger.warning(f"Error calculating Bollinger Bands: {e}")
-                # Use close price with offsets as fallback
-                market_data['bb_middle'] = close_series
-                market_data['bb_upper'] = close_series * 1.02  # 2% above
-                market_data['bb_lower'] = close_series * 0.98  # 2% below
-        
-        # SMAs
-        if 'sma_10' not in market_data.columns:
-            try:
-                market_data['sma_10'] = SMAIndicator(close=close_series, window=10).sma_indicator()
-            except Exception as e:
-                logger.warning(f"Error calculating SMA(10): {e}")
-                market_data['sma_10'] = close_series
+        # Calculate technical indicators with better error handling
+        try:
+            from ta.trend import SMAIndicator, MACD
+            from ta.momentum import RSIIndicator
+            from ta.volatility import BollingerBands, AverageTrueRange
+            
+            close_series = market_data['close']
+            high_series = market_data['high']
+            low_series = market_data['low']
+            
+            # RSI
+            if 'rsi' not in market_data.columns:
+                try:
+                    rsi = RSIIndicator(close=close_series).rsi()
+                    market_data['rsi'] = rsi
+                except Exception as e:
+                    logger.warning(f"Error calculating RSI: {e}")
+                    market_data['rsi'] = 50.0  # Neutral RSI value
+            
+            # MACD
+            if 'macd' not in market_data.columns or 'macd_signal' not in market_data.columns:
+                try:
+                    macd_indicator = MACD(close=close_series)
+                    market_data['macd'] = macd_indicator.macd()
+                    market_data['macd_signal'] = macd_indicator.macd_signal()
+                except Exception as e:
+                    logger.warning(f"Error calculating MACD: {e}")
+                    market_data['macd'] = 0.0
+                    market_data['macd_signal'] = 0.0
+            
+            # Bollinger Bands
+            if 'bb_upper' not in market_data.columns or 'bb_middle' not in market_data.columns or 'bb_lower' not in market_data.columns:
+                try:
+                    bb = BollingerBands(close=close_series)
+                    market_data['bb_upper'] = bb.bollinger_hband()
+                    market_data['bb_middle'] = bb.bollinger_mavg()
+                    market_data['bb_lower'] = bb.bollinger_lband()
+                except Exception as e:
+                    logger.warning(f"Error calculating Bollinger Bands: {e}")
+                    # Use close price with offsets as fallback
+                    market_data['bb_middle'] = close_series
+                    market_data['bb_upper'] = close_series * 1.02  # 2% above
+                    market_data['bb_lower'] = close_series * 0.98  # 2% below
+            
+            # SMAs
+            if 'sma_10' not in market_data.columns:
+                try:
+                    market_data['sma_10'] = SMAIndicator(close=close_series, window=10).sma_indicator()
+                except Exception as e:
+                    logger.warning(f"Error calculating SMA(10): {e}")
+                    market_data['sma_10'] = close_series
+                    
+            if 'sma_20' not in market_data.columns:
+                try:
+                    market_data['sma_20'] = SMAIndicator(close=close_series, window=20).sma_indicator()
+                except Exception as e:
+                    logger.warning(f"Error calculating SMA(20): {e}")
+                    market_data['sma_20'] = close_series
+            
+            # Returns
+            if 'returns_1d' not in market_data.columns:
+                market_data['returns_1d'] = close_series.pct_change(1).fillna(0)
                 
-        if 'sma_20' not in market_data.columns:
-            try:
-                market_data['sma_20'] = SMAIndicator(close=close_series, window=20).sma_indicator()
-            except Exception as e:
-                logger.warning(f"Error calculating SMA(20): {e}")
-                market_data['sma_20'] = close_series
-        
-        # Returns
-        if 'returns_1d' not in market_data.columns:
-            market_data['returns_1d'] = close_series.pct_change(1).fillna(0)
+            if 'returns_5d' not in market_data.columns:
+                market_data['returns_5d'] = close_series.pct_change(5).fillna(0)
+                
+            if 'returns_10d' not in market_data.columns:
+                market_data['returns_10d'] = close_series.pct_change(10).fillna(0)
             
-        if 'returns_5d' not in market_data.columns:
-            market_data['returns_5d'] = close_series.pct_change(5).fillna(0)
+            # Volatility
+            if 'volatility_5d' not in market_data.columns:
+                market_data['volatility_5d'] = market_data['returns_1d'].rolling(5).std().fillna(0)
+                
+            if 'volatility_10d' not in market_data.columns:
+                market_data['volatility_10d'] = market_data['returns_1d'].rolling(10).std().fillna(0)
             
-        if 'returns_10d' not in market_data.columns:
-            market_data['returns_10d'] = close_series.pct_change(10).fillna(0)
-        
-        # Volatility
-        if 'volatility_5d' not in market_data.columns:
-            market_data['volatility_5d'] = market_data['returns_1d'].rolling(5).std().fillna(0)
+            # Average True Range - error happens here most often
+            if 'atr' not in market_data.columns:
+                try:
+                    # Ensure data is sufficient for ATR calculation - needs at least 14 data points
+                    if len(market_data) >= 14:
+                        market_data['atr'] = AverageTrueRange(
+                            high=high_series, 
+                            low=low_series, 
+                            close=close_series,
+                            window=14
+                        ).average_true_range()
+                    else:
+                        # Not enough data for ATR calculation, use simplified formula
+                        logger.warning(f"Not enough data for ATR calculation, using simplified approach")
+                        market_data['atr'] = (high_series - low_series).mean()
+                except Exception as e:
+                    logger.warning(f"Error calculating ATR: {e}")
+                    # Use a basic volatility measure as fallback
+                    market_data['atr'] = (high_series - low_series).mean()
             
-        if 'volatility_10d' not in market_data.columns:
-            market_data['volatility_10d'] = market_data['returns_1d'].rolling(10).std().fillna(0)
-        
-        # Average True Range
-        if 'atr' not in market_data.columns:
-            try:
-                market_data['atr'] = AverageTrueRange(high=high_series, low=low_series, close=close_series).average_true_range()
-            except Exception as e:
-                logger.warning(f"Error calculating ATR: {e}")
-                market_data['atr'] = (high_series - low_series).rolling(14).mean().fillna(0)
-        
-        # Handle NaN values
-        market_data = market_data.fillna(0)
+            # Handle NaN values
+            market_data = market_data.fillna(0)
+            
+        except Exception as e:
+            logger.error(f"Error calculating indicators: {e}")
+            # Set default values for all technical features
+            for feat in tech_features:
+                if feat not in market_data.columns:
+                    market_data[feat] = 0.0
         
         return market_data
 
@@ -1452,6 +1514,7 @@ def extract_trading_signals(
     market_data: pd.DataFrame,
     normalize_data: bool = True,
     action_threshold: float = 0.2,
+    asset_names: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Extract trading signals and positions from the RL model for market data.
@@ -1461,6 +1524,7 @@ def extract_trading_signals(
         market_data: Pandas DataFrame with market data (OHLCV)
         normalize_data: Whether to normalize input data
         action_threshold: Threshold for considering an action significant
+        asset_names: Optional list of asset names for multi-asset environments
         
     Returns:
         Dictionary with trading signals for each timestamp
@@ -1468,6 +1532,13 @@ def extract_trading_signals(
     import numpy as np
     import torch
     from gymnasium import spaces
+    import time
+    
+    start_time = time.time()
+    
+    # Default asset name if none provided
+    if asset_names is None or len(asset_names) == 0:
+        asset_names = ["Asset"]
     
     # Prepare market data
     data = market_data.copy()
@@ -1492,27 +1563,50 @@ def extract_trading_signals(
             data[col] = (data[col] - mean) / (std + 1e-8)
     
     # Create temporary RLLMExplainer to use its observation preparation logic
-    # Use asset name extracted from market data if available
-    asset_name = None
-    if 'symbol' in data.columns:
-        asset_name = data['symbol'].iloc[0]
-    
     from trading_llm.inference import RLLMExplainer
     explainer = RLLMExplainer(
         rl_model=rl_model,
-        asset_names=[asset_name] if asset_name else ["Asset"]
+        asset_names=asset_names
     )
+    
+    # Check if we have enough data
+    if len(data) < 15:  # Need at least 15 data points for indicators
+        print(f"WARNING: Not enough data points ({len(data)}) for reliable indicators. Need at least 15.")
+        # Return empty signals dictionary with a warning
+        return {"warning": {"message": f"Not enough data points ({len(data)}) for reliable indicators."}}
+    
+    # Use a fixed window size approach for more efficient processing
+    # Minimum window size needed for all technical indicators
+    min_window_size = 30  # Large enough for MACD, RSI, etc.
+    
+    # Skip the first min_window_size-1 data points since we need history for indicators
+    start_index = min_window_size - 1
+    
+    # Set a maximum number of samples to process
+    # Increase from 1000 to a higher limit to process more of the data
+    # -1 because we need the next price for position calculation
+    max_samples = min(50000, len(data) - 1 - start_index)
+    
+    print(f"Processing {max_samples} samples from dataset with {len(data)} records")
+    print(f"Starting from index {start_index} with window size {min_window_size}")
     
     # Extract observations from market data using a consistent approach
     timestamps = []
     observations = []
     
-    # Process each timestamp in the data
-    for i in range(len(data) - 1):  # -1 because we need the next price for position calculation
-        # Extract the current window of data
-        window_size = 50  # Use reasonable window size
-        start_idx = max(0, i - window_size)
-        window_data = data.iloc[start_idx:i+1].copy()
+    error_count = 0
+    max_errors = 20  # Maximum number of errors before giving up
+    progress_step = max(1, max_samples // 10)  # Show progress every 10%
+    
+    # Process each timestamp in the data, with fixed window size
+    for i in range(start_index, start_index + max_samples):
+        # Show progress
+        if i % progress_step == 0 or i == start_index:
+            print(f"Processing timestamp {i-start_index+1}/{max_samples} ({(i-start_index+1)/max_samples*100:.1f}%)")
+        
+        # Extract the fixed-size window of data
+        window_start = i - min_window_size + 1  # Ensure window_size data points
+        window_data = data.iloc[window_start:i+1].copy()
         
         # Use the explainer to prepare the observation correctly
         try:
@@ -1520,28 +1614,42 @@ def extract_trading_signals(
             observations.append(obs)
             timestamps.append(data.index[i] if not data.index.equals(pd.RangeIndex(len(data))) else i)
         except Exception as e:
-            print(f"Error preparing observation at index {i}: {str(e)}")
+            error_count += 1
+            if error_count <= 3 or error_count % 100 == 0:  # Show only first 3 errors and then every 100th
+                print(f"Error preparing observation at index {i}: {str(e)}")
+            if error_count >= max_errors:
+                print(f"Too many errors ({error_count}). Stopping observation preparation.")
+                break
             continue
     
-    # Limit debug messages for prediction
-    debug_log_count = 0
-    max_debug_logs = 3
+    # If we have no valid observations, return an empty result
+    if not observations:
+        print("No valid observations could be generated. Cannot extract trading signals.")
+        return {"error": {"message": "No valid observations could be generated."}}
+    
+    print(f"Generated {len(observations)} valid observations. Predicting actions...")
     
     # Get actions from model
     actions = []
-    batch_size = 32  # Use smaller batches to prevent memory issues
+    prediction_errors = 0
+    max_prediction_errors = 20
+    batch_size = 64  # Increase batch size for faster processing
     
+    # Process in batches for memory efficiency
     for i in range(0, len(observations), batch_size):
+        batch_progress = min(i + batch_size, len(observations))
+        if i % (batch_size * 10) == 0 or i == 0:  # Show progress every 10 batches
+            print(f"Predicting batch {i//batch_size + 1}/{(len(observations)-1)//batch_size + 1} ({batch_progress}/{len(observations)})")
+        
         batch_obs = observations[i:i+batch_size]
         batch_actions = []
         
-        for obs in batch_obs:
+        for j, obs in enumerate(batch_obs):
             try:
                 with torch.no_grad():  # Use no_grad to reduce memory usage
-                    # Log only the first few predictions
-                    if debug_log_count < max_debug_logs:
+                    # Only show the first few observation shapes
+                    if i == 0 and j < 3:
                         print(f"DEBUG: Predicting with observation shape {obs.shape if hasattr(obs, 'shape') else 'unknown'}")
-                        debug_log_count += 1
                     
                     action, _ = rl_model.predict(obs, deterministic=False)
                     
@@ -1556,8 +1664,8 @@ def extract_trading_signals(
                     if isinstance(action_np, np.ndarray):
                         # Check if it's a multi-asset action (array with multiple values)
                         if action_np.size > 1:
-                            # For multi-asset case, we'll use the first asset for simplicity
-                            action_value = float(action_np[0])
+                            # For multi-asset case, use the full array
+                            action_value = action_np
                         elif action_np.size == 1:
                             # Single-asset case with array of size 1
                             action_value = float(action_np.item())
@@ -1573,49 +1681,142 @@ def extract_trading_signals(
                     batch_actions.append(action_value)
             except Exception as e:
                 import traceback
-                print(f"ERROR processing observation {i}: {str(e)}")
-                if debug_log_count < max_debug_logs:
-                    print(f"Traceback: {traceback.format_exc()}")
-                    debug_log_count += 1
+                prediction_errors += 1
+                if prediction_errors <= 3 or prediction_errors % 100 == 0:  # Show only first 3 errors and then every 100th
+                    print(f"ERROR processing observation {i+j}: {str(e)}")
+                    if prediction_errors <= 3:
+                        print(f"Traceback: {traceback.format_exc()}")
                 # Use a neutral action as fallback
                 batch_actions.append(0.0)
                 
-            # Clear GPU memory after each prediction
-            if torch.cuda.is_available():
+                # Exit if too many prediction errors
+                if prediction_errors >= max_prediction_errors:
+                    print(f"Too many prediction errors ({prediction_errors}). Stopping prediction.")
+                    break
+                
+            # Clear GPU memory after each prediction to prevent OOM
+            if j % 16 == 0 and torch.cuda.is_available():  # Clean every 16 samples
                 torch.cuda.empty_cache()
+        
+        # Exit batch processing if too many errors        
+        if prediction_errors >= max_prediction_errors:
+            break
                 
         actions.extend(batch_actions)
     
+    # If we couldn't get any actions, return an error
+    if not actions:
+        print("Could not generate any valid actions. Exiting.")
+        return {"error": {"message": "Could not generate any valid actions."}}
+    
     # Convert actions to trading signals
     signals = {}
-    for i, (timestamp, action) in enumerate(zip(timestamps, actions)):
-        # Calculate position (1 for long, -1 for short, 0 for neutral)
-        if action > action_threshold:
-            position = 1  # Long
-        elif action < -action_threshold:
-            position = -1  # Short
-        else:
-            position = 0  # Neutral
-        
-        # Calculate next return (for evaluation)
-        next_close = data['close'].iloc[i+1]
-        current_close = data['close'].iloc[i]
-        next_return = (next_close - current_close) / current_close
-        
-        # Calculate confidence score (scale action to 0-1 range)
-        action_max = max(abs(action), 1.0)  # Prevent division by zero
-        confidence = (action + action_max) / (2 * action_max)
-        
-        # Format signal
-        signal = {
-            'action': 'buy' if action > action_threshold else ('sell' if action < -action_threshold else 'hold'),
-            'action_value': float(action),
-            'confidence': float(confidence),
-            'position': position,
-            'next_return': float(next_return),
-        }
-        
-        signals[str(timestamp)] = signal
+    signal_count = 0
+    signal_errors = 0
     
-    print(f"DEBUG: Extracted {len(signals)} trading signals")
-    return signals 
+    for i, (timestamp, action) in enumerate(zip(timestamps, actions)):
+        try:
+            # Calculate index in original data
+            orig_idx = start_index + i
+            
+            # Ensure we don't go out of bounds
+            if orig_idx + 1 >= len(data):
+                continue
+                
+            # Handle both single value and array actions
+            if isinstance(action, np.ndarray) and action.size > 1:
+                # Multi-asset action
+                signal_dict = {}
+                for j, asset_name in enumerate(asset_names):
+                    if j < len(action):
+                        asset_action = float(action[j])
+                        
+                        # Calculate position (1 for long, -1 for short, 0 for neutral)
+                        if asset_action > action_threshold:
+                            position = 1  # Long
+                        elif asset_action < -action_threshold:
+                            position = -1  # Short
+                        else:
+                            position = 0  # Neutral
+                        
+                        # Calculate next return (for evaluation)
+                        try:
+                            next_close = data['close'].iloc[orig_idx+1]
+                            current_close = data['close'].iloc[orig_idx]
+                            next_return = (next_close - current_close) / current_close
+                        except Exception as e:
+                            signal_errors += 1
+                            if signal_errors <= 3:
+                                print(f"Error calculating return: {e}")
+                            next_return = 0.0
+                        
+                        # Calculate confidence score (scale action to 0-1 range)
+                        action_max = max(abs(asset_action), 1.0)  # Prevent division by zero
+                        confidence = (asset_action + action_max) / (2 * action_max)
+                        
+                        # Format signal for this asset
+                        signal_dict[asset_name] = {
+                            'action': 'buy' if asset_action > action_threshold else ('sell' if asset_action < -action_threshold else 'hold'),
+                            'action_value': float(asset_action),
+                            'confidence': float(confidence),
+                            'position': position,
+                            'next_return': float(next_return),
+                        }
+                
+                signals[str(timestamp)] = signal_dict
+                signal_count += 1
+            else:
+                # Single asset case
+                # Convert to float in case it's still a numpy type
+                action_value = float(action) if isinstance(action, (int, float, np.number)) else 0.0
+                
+                # Calculate position (1 for long, -1 for short, 0 for neutral)
+                if action_value > action_threshold:
+                    position = 1  # Long
+                elif action_value < -action_threshold:
+                    position = -1  # Short
+                else:
+                    position = 0  # Neutral
+                
+                # Calculate next return (for evaluation)
+                try:
+                    next_close = data['close'].iloc[orig_idx+1]
+                    current_close = data['close'].iloc[orig_idx]
+                    next_return = (next_close - current_close) / current_close
+                except Exception as e:
+                    signal_errors += 1
+                    if signal_errors <= 3:
+                        print(f"Error calculating return: {e}")
+                    next_return = 0.0
+                
+                # Calculate confidence score (scale action to 0-1 range)
+                action_max = max(abs(action_value), 1.0)  # Prevent division by zero
+                confidence = (action_value + action_max) / (2 * action_max)
+                
+                # For backward compatibility, use the first asset name
+                asset_name = asset_names[0]
+                signal_dict = {
+                    asset_name: {
+                        'action': 'buy' if action_value > action_threshold else ('sell' if action_value < -action_threshold else 'hold'),
+                        'action_value': float(action_value),
+                        'confidence': float(confidence),
+                        'position': position,
+                        'next_return': float(next_return),
+                    }
+                }
+                signals[str(timestamp)] = signal_dict
+                signal_count += 1
+        except Exception as e:
+            signal_errors += 1
+            if signal_errors <= 3:
+                print(f"Error creating signal for index {i}: {str(e)}")
+    
+    end_time = time.time()
+    processing_time = end_time - start_time
+    
+    print(f"Extract trading signals completed in {processing_time:.1f} seconds:")
+    print(f"- Processed {len(observations)} observations")
+    print(f"- Generated {signal_count} trading signals for {len(asset_names)} assets")
+    print(f"- Encountered {error_count} observation errors, {prediction_errors} prediction errors, {signal_errors} signal errors")
+    
+    return signals

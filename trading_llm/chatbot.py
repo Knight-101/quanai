@@ -91,10 +91,45 @@ class MarketChatbot:
         Update the current trading signals from the RL model.
         
         Args:
-            signals: Dictionary containing trading signals, positions, and confidence scores
+            signals: Dictionary containing trading signals in the format:
+                    {timestamp: {asset_name: signal_data}}
         """
-        self.trading_signals = signals
-        logger.info("Updated trading signals")
+        # Check if we received the new signal format (timestamp-based)
+        if signals and isinstance(signals, dict) and len(signals) > 0:
+            first_key = next(iter(signals.keys()))
+            first_value = signals[first_key]
+            
+            # New format: {timestamp: {asset_name: signal_data}}
+            if isinstance(first_value, dict) and any(asset in first_value for asset in self.asset_names):
+                logger.info("Detected multi-asset timestamp-based signals")
+                
+                # Restructure to {asset_name: latest_signal}
+                restructured_signals = {}
+                
+                # Find the most recent timestamp
+                latest_timestamp = max(signals.keys(), key=lambda k: k if isinstance(k, (int, float)) else 0)
+                latest_signals = signals[latest_timestamp]
+                
+                logger.info(f"Using signals from latest timestamp: {latest_timestamp}")
+                
+                # Extract signals for each asset
+                for asset_name in self.asset_names:
+                    if asset_name in latest_signals:
+                        restructured_signals[asset_name] = latest_signals[asset_name]
+                        logger.info(f"Found signal for {asset_name}: {latest_signals[asset_name]['action']}")
+                    else:
+                        logger.warning(f"No signal found for {asset_name} at timestamp {latest_timestamp}")
+                
+                self.trading_signals = restructured_signals
+                logger.info(f"Updated trading signals for {len(restructured_signals)} assets")
+            else:
+                # Assume it's already in the format we need: {asset_name: signal_data}
+                self.trading_signals = signals
+                logger.info(f"Updated trading signals for {len(signals)} assets/timestamps")
+        else:
+            # Empty or invalid signals
+            self.trading_signals = {}
+            logger.warning("Received empty or invalid trading signals")
     
     def update_portfolio_performance(self, performance: Dict[str, Any]) -> None:
         """

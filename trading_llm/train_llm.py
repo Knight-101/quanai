@@ -264,6 +264,7 @@ def parse_args():
     chat_parser.add_argument("--market-data", default="auto", help="Path to market data file or 'auto' to use combined multi-asset data")
     chat_parser.add_argument("--max-history", type=int, default=5, help="Maximum conversation history")
     chat_parser.add_argument("--system-prompt", help="System prompt for the chatbot")
+    chat_parser.add_argument("--asset-name", help="Specific asset name to focus on")
     
     # Explain subcommand
     explain_parser = subparsers.add_parser('explain', help='Generate natural language explanations for trading decisions')
@@ -596,6 +597,25 @@ def main():
             market_data_path = load_multi_asset_data(for_training=False)
             logger.info(f"Using auto-generated combined market data: {market_data_path}")
         
+        # Determine which asset names to use
+        default_asset_names = ["BTC", "ETH", "SOL"]
+        used_asset_names = None
+        
+        # Get asset names from command line argument if provided
+        if hasattr(args, 'asset_name') and args.asset_name:
+            if isinstance(args.asset_name, list):
+                used_asset_names = args.asset_name
+            else:
+                used_asset_names = [args.asset_name]
+            logger.info(f"Using asset names from command line: {used_asset_names}")
+        elif hasattr(args, 'assets') and args.assets:
+            used_asset_names = args.assets
+            logger.info(f"Using asset names from command line: {used_asset_names}")
+        else:
+            # Fall back to default asset names
+            used_asset_names = default_asset_names
+            logger.info(f"No asset names provided, using defaults: {used_asset_names}")
+        
         # Load the LLM model using the appropriate method
         llm_model = None
         try:
@@ -619,11 +639,12 @@ def main():
             from trading_llm.model import TradingLLM
             llm_model = TradingLLM(model_name=args.base_model or "meta-llama/Meta-Llama-3-8B-Instruct")
         
-        # Load the chatbot
+        # Load the chatbot with the determined asset names
         chatbot = MarketChatbot(
             llm_model=llm_model,
             max_history=args.max_history,
-            system_prompt=args.system_prompt
+            system_prompt=args.system_prompt,
+            asset_names=used_asset_names
         )
         
         # Load market data if provided
@@ -662,43 +683,76 @@ def main():
                     market_data.columns = market_data.columns.str.lower()
                     
                 # Extract trading signals with better error handling
-                signals = extract_trading_signals(model, market_data)
+                # Pass the asset_names to ensure proper multi-asset handling
+                signals = extract_trading_signals(model, market_data, asset_names=used_asset_names)
                 chatbot.update_trading_signals(signals)
                 print("Loaded trading signals from RL model")
                 
                 # Calculate basic performance metrics
                 returns = np.diff(market_data['close'].values) / market_data['close'].values[:-1]
-                positions = np.array([s['position'] for s in signals.values()])
                 
-                # Ensure arrays have matching lengths before calculations
-                if len(returns) != len(positions[:-1]):
-                    logger.warning(f"Length mismatch: returns ({len(returns)}) vs positions ({len(positions[:-1])})")
+                # Create positions array from signals (handling the new nested structure)
+                # First get list of all timestamp keys
+                timestamps = list(signals.keys())
+                if timestamps:
+                    latest_timestamp = timestamps[-1]  # Use last timestamp for performance metrics
+                    positions_dict = {}
                     
-                    # Adjust the shorter array to match the longer one's length
-                    if len(returns) > len(positions[:-1]):
-                        # Truncate returns to match positions length
-                        logger.info(f"Truncating returns array from {len(returns)} to {len(positions[:-1])}")
-                        returns = returns[-len(positions[:-1]):]
-                    else:
-                        # Truncate positions to match returns length
-                        logger.info(f"Truncating positions array from {len(positions[:-1])} to {len(returns)}")
-                        positions = positions[:len(returns)+1]
+                    # Extract positions for each asset
+                    for asset_name in used_asset_names:
+                        if asset_name in signals[latest_timestamp]:
+                            positions_dict[asset_name] = signals[latest_timestamp][asset_name]['position']
+                        else:
+                            positions_dict[asset_name] = 0  # Default if no signal
+
+                    # Calculate performance for each asset
+                    portfolio_performance = {}
+                    primary_asset = used_asset_names[0] if used_asset_names else "Asset"
+                    
+                    # Use primary asset's position for basic metrics
+                    positions = np.array([signals[ts][primary_asset]['position'] 
+                                       for ts in timestamps 
+                                       if primary_asset in signals[ts]])
+                    
+                    # Ensure arrays have matching lengths before calculations
+                    if len(returns) != len(positions[:-1]):
+                        logger.warning(f"Length mismatch: returns ({len(returns)}) vs positions ({len(positions[:-1])})")
+                        
+                        # Adjust the shorter array to match the longer one's length
+                        if len(returns) > len(positions[:-1]):
+                            # Truncate returns to match positions length
+                            logger.info(f"Truncating returns array from {len(returns)} to {len(positions[:-1])}")
+                            returns = returns[-len(positions[:-1]):]
+                        else:
+                            # Truncate positions to match returns length
+                            logger.info(f"Truncating positions array from {len(positions[:-1])} to {len(returns)}")
+                            positions = positions[:len(returns)+1]
+                    
+                    # Calculate overall portfolio performance
+                    portfolio_performance = {
+                        "total_return": f"{np.sum(returns * positions[:-1]):.4f}",
+                        "sharpe_ratio": f"{np.mean(returns) / np.std(returns):.4f}",
+                        "win_rate": f"{np.mean([signals[ts][primary_asset]['confidence'] > 0.5 for ts in timestamps if primary_asset in signals[ts]]):.4f}"
+                    }
+                    
+                    chatbot.update_portfolio_performance(portfolio_performance)
+                else:
+                    logger.warning("No signals available for performance calculation")
                 
-                # Now calculate performance metrics
-                portfolio_performance = {
-                    "total_return": f"{np.sum(returns * positions[:-1]):.4f}",
-                    "sharpe_ratio": f"{np.mean(returns) / np.std(returns):.4f}",
-                    "win_rate": f"{np.mean([s['confidence'] > 0.5 for s in signals.values()]):.4f}"
-                }
-                chatbot.update_portfolio_performance(portfolio_performance)
             except Exception as e:
                 logger.error(f"Error loading RL model: {str(e)}")
                 logger.error(traceback.format_exc())  # Print full traceback for debugging
                 print(f"Failed to load RL model: {str(e)}")
-            
+        
+        # Set initial asset focus if specified
+        if hasattr(args, 'asset_name') and args.asset_name and isinstance(args.asset_name, str):
+            if chatbot.set_current_asset(args.asset_name):
+                print(f"Initially focusing on asset: {args.asset_name}")
+        
         print("\nTrading Assistant Chatbot")
         print("Type 'exit', 'quit', or 'q' to end the conversation")
         print("Type 'reset' to reset the conversation history")
+        print("Available assets: " + ", ".join(used_asset_names))
         print("-" * 50)
         
         while True:
