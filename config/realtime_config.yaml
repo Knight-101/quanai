@@ -1,3 +1,36 @@
+# Real-time Trading System Configuration
+
+# Trading parameters
+symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+timeframe: '5m'
+update_interval: 60  # seconds
+
+# Data paths
+data_dir: 'data/market_data'
+model_path: 'models/trading_llm'
+position_file: 'data/positions.json'
+
+# Trading settings
+live_trading: false  # Set to true to enable real trading
+api_key: ''  # Your exchange API key
+api_secret: ''  # Your exchange API secret
+
+# Risk management
+max_positions: 3
+risk_per_trade: 0.01  # 1% of account balance
+take_profit: 0.05  # 5% profit target
+stop_loss: 0.02  # 2% stop loss
+
+# Data structure
+data_format:
+  use_multi_index: true  # Set to true if using MultiIndex columns in combined data
+  asset_level_name: 'asset'  # First level name in MultiIndex
+  feature_level_name: 'feature'  # Second level name in MultiIndex
+  
+# Logging
+log_level: 'INFO'
+log_file: 'logs/realtime_trading.log'
+
 # Real-time Trading Monitor Configuration
 
 # Trading parameters
@@ -12,7 +45,6 @@ trading:
   trade_cooldown_minutes: 15
   
   # Position management
-  max_positions: 3
   position_sizing_method: "equal"  # Options: equal, volatility, confidence
   
   # Risk management

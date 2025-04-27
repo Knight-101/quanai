@@ -6,8 +6,8 @@ This script implements a real-time trading monitor that:
 1. Fetches constant price data for BTC, ETH, and SOL on 5m timeframes
 2. Executes trades via the RL model similar to training/backtesting
 3. Logs all trades to a file
-4. Logs current positions every 15 minutes
-5. Logs market commentary every 15 minutes
+4. Logs current positions every 5 minutes
+5. Logs market commentary every 5 minutes
 6. Handles synchronization between data sources and ensures error-free operation
 
 This is production-ready code for an AI quant crypto hedge fund.
@@ -66,7 +66,7 @@ class RealTimeTradeMonitor:
         timeframe: str = '5m',
         symbols: List[str] = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
         initial_balance: float = 10000.0,
-        max_leverage: float = 10.0
+        max_leverage: float = 20.0
     ):
         """
         Initialize the real-time trading monitor.
@@ -139,6 +139,14 @@ class RealTimeTradeMonitor:
         self.last_position_log_time = datetime.now()
         self.last_commentary_time = datetime.now()
         
+        # Add timestamp tracking for signal generation
+        self.last_signal_time = {}
+        for symbol in self.symbols:
+            self.last_signal_time[symbol] = datetime.min
+        self.last_candle_times = {}
+        for symbol in self.symbols:
+            self.last_candle_times[symbol] = datetime.min
+        
         # Data lock for thread safety
         self.data_lock = threading.Lock()
         
@@ -156,6 +164,116 @@ class RealTimeTradeMonitor:
         
         # Signal threshold from config
         self.signal_threshold = self.config.get('trading', {}).get('signal_threshold', 0.1)
+        
+        # Initialize trading environment for consistent leverage calculations
+        try:
+            from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
+            
+            # First, try to inspect the class signature to understand the proper parameters
+            try:
+                from inspect import signature
+                env_signature = signature(InstitutionalPerpetualEnv.__init__)
+                logger.info(f"Environment constructor signature: {env_signature}")
+                # This will help us see the actual parameter names
+            except Exception as e:
+                logger.warning(f"Could not inspect environment signature: {e}")
+            
+            # Create a DataFrame with the correct MultiIndex columns structure and one row of data
+            tuples = [(symbol, feat) for symbol in symbols for feat in ['open', 'high', 'low', 'close', 'volume']]
+            columns = pd.MultiIndex.from_tuples(tuples, names=['asset', 'feature'])
+            
+            # Create a single row of data (all 1.0 values)
+            data = np.ones((1, len(tuples)))
+            
+            # Create DataFrame with index and data
+            empty_df = pd.DataFrame(data, columns=columns, index=pd.DatetimeIndex([pd.Timestamp.now()]))
+            
+            # Set up default last_prices dictionary for market prices
+            last_prices = {symbol: 1000.0 for symbol in symbols}
+            
+            # Create environment config
+            env_config = {
+                'df': empty_df,
+                'assets': symbols,
+                'initial_balance': initial_balance,
+                'max_leverage': max_leverage,
+                'commission': self.commission,
+                'window_size': 100
+            }
+            
+            self.trading_env = InstitutionalPerpetualEnv(**env_config)
+            
+            # Initialize last_prices in the environment
+            self.trading_env.last_prices = last_prices
+            
+            # Create update_market_price method if it doesn't exist
+            if not hasattr(self.trading_env, 'update_market_price'):
+                def update_market_price(self_env, asset, price):
+                    """Update the mark price for an asset"""
+                    self_env.last_prices[asset] = float(price)
+                    logger.debug(f"Updated market price for {asset}: {price}")
+                
+                # Add the method to the environment instance
+                import types
+                self.trading_env.update_market_price = types.MethodType(update_market_price, self.trading_env)
+            
+            logger.info("Initialized trading environment for leverage calculations")
+            
+            # Store risk limits separately to be used by the risk engine
+            risk_limits = {
+                'max_position_value_usd': 0.8 * self.initial_balance,
+                'max_portfolio_leverage': self.max_leverage * 0.9,
+                'max_portfolio_drawdown_pct': 0.3,
+                'max_single_order_value_usd': 0.5 * self.initial_balance,
+                'max_portfolio_value_usd': 2.0 * self.initial_balance,
+                'min_available_balance_pct': 0.1,
+            }
+            
+            # Add any additional configuration from self.config
+            if 'trading_env' in self.config:
+                for key, value in self.config['trading_env'].items():
+                    if key in ['df', 'assets', 'window_size', 'max_leverage', 
+                              'commission', 'funding_fee_multiplier', 'base_features',
+                              'tech_features', 'risk_free_rate', 'initial_balance',
+                              'max_drawdown', 'maintenance_margin', 'max_steps',
+                              'max_no_trade_steps', 'enforce_min_leverage', 'verbose',
+                              'training_mode']:
+                        env_config[key] = value
+            
+            # Log config
+            logger.info("Initializing institutional perpetual environment with config:")
+            for key, value in env_config.items():
+                logger.info(f"  {key}: {value}")
+            
+            logger.info(f"Risk limits (to be applied separately): {risk_limits}")
+            
+            # Try importing the class with error handling to see details of the class requirements
+            try:
+                from inspect import signature
+                env_signature = signature(InstitutionalPerpetualEnv.__init__)
+                logger.info(f"Environment constructor signature: {env_signature}")
+            except Exception as e:
+                logger.warning(f"Could not inspect environment signature: {e}")
+            
+            # Initialize the environment
+            self.trading_env = InstitutionalPerpetualEnv(**env_config)
+            
+            # Initialize risk engine explicitly with risk limits
+            if hasattr(self.trading_env, 'initialize_risk_engine'):
+                try:
+                    self.trading_env.initialize_risk_engine(risk_limits=risk_limits)
+                    logger.info("Risk engine initialized with custom limits")
+                except Exception as e:
+                    logger.error(f"Error initializing risk engine with params: {e}")
+                    logger.warning("Attempting to initialize risk engine without parameters")
+                    self.trading_env.initialize_risk_engine()
+            
+            logger.info("Initialized trading environment for position management and risk assessment")
+            
+        except Exception as e:
+            logger.error(f"Error initializing trading environment: {str(e)}")
+            logger.warning("Will use simplified leverage calculation instead")
+            self.trading_env = None
     
     def _load_config(self) -> dict:
         """Load configuration from YAML file."""
@@ -171,7 +289,7 @@ class RealTimeTradeMonitor:
                 'trading': {
                     'commission': 0.0004,
                     'signal_threshold': 0.1,
-                    'trade_cooldown_minutes': 15
+                    'trade_cooldown_minutes': 5
                 },
                 'data': {
                     'backfill_periods': 1000
@@ -183,7 +301,7 @@ class RealTimeTradeMonitor:
         logger.info("Setting up real-time trading monitor...")
         
         # Initialize exchange
-        self.exchange = ccxt_async.binance({
+        self.exchange = ccxt_async.binanceus({
             'options': {
                 'defaultType': 'future',
                 'defaultMarket': 'linear',
@@ -227,6 +345,145 @@ class RealTimeTradeMonitor:
         
         # Backfill initial data
         await self._backfill_initial_data()
+        
+        # Initialize trading environment for full position management
+        try:
+            # Create a combined DataFrame with proper MultiIndex structure from real market data
+            combined_data = pd.concat([self.market_data[symbol] for symbol in self.symbols 
+                                      if not self.market_data[symbol].empty], axis=1)
+            
+            if combined_data.empty:
+                logger.error("No market data available for initializing environment")
+                raise ValueError("Cannot initialize trading environment without market data")
+            
+            logger.info(f"Combined data shape: {combined_data.shape}, Index: {type(combined_data.index)}")
+            logger.info(f"Combined data columns: {combined_data.columns}")
+            
+            # Make sure our index is a DateTimeIndex sorted in ascending order
+            if not isinstance(combined_data.index, pd.DatetimeIndex):
+                logger.warning("Converting index to DatetimeIndex")
+                combined_data.index = pd.to_datetime(combined_data.index)
+            
+            # Sort the index to ensure chronological order
+            combined_data = combined_data.sort_index()
+            
+            # Set up last_prices dictionary with the latest prices
+            last_prices = {}
+            for symbol in self.symbols:
+                if not self.market_data[symbol].empty:
+                    last_prices[symbol] = float(self.market_data[symbol][(symbol, 'close')].iloc[-1])
+                    logger.info(f"Initial price for {symbol}: {last_prices[symbol]}")
+            
+            # CRITICAL FIX: Set the environment's window_size to match our data
+            window_size = min(100, max(10, len(combined_data) - 1))
+            logger.info(f"Using window_size of {window_size} with {len(combined_data)} data points")
+            
+            # Create environment config with careful initialization
+            env_config = {
+                'df': combined_data,
+                'assets': self.symbols,
+                'window_size': window_size,
+                'initial_balance': self.initial_balance,
+                'max_leverage': self.max_leverage,
+                'commission': self.commission,
+                'funding_fee_multiplier': 1.0,
+                'max_drawdown': 0.3,
+                'maintenance_margin': 0.1,
+                'verbose': True,
+                'training_mode': False,
+                'max_steps': len(combined_data) + 1000  # Allow for future growth
+            }
+            
+            # Add any additional configuration from self.config
+            if 'trading_env' in self.config:
+                for key, value in self.config['trading_env'].items():
+                    if key in ['window_size', 'max_leverage', 'commission', 'funding_fee_multiplier', 
+                              'base_features', 'tech_features', 'risk_free_rate', 'initial_balance',
+                              'max_drawdown', 'maintenance_margin', 'max_steps', 'max_no_trade_steps', 
+                              'enforce_min_leverage', 'verbose', 'training_mode']:
+                        env_config[key] = value
+            
+            # Create risk limits
+            risk_limits = {
+                'max_position_value_usd': 0.8 * self.initial_balance,
+                'max_portfolio_leverage': self.max_leverage * 0.9,
+                'max_portfolio_drawdown_pct': 0.3,
+                'max_single_order_value_usd': 0.5 * self.initial_balance,
+                'max_portfolio_value_usd': 2.0 * self.initial_balance,
+                'min_available_balance_pct': 0.1,
+            }
+            
+            # Log config
+            logger.info("Initializing institutional perpetual environment with config:")
+            for key, value in env_config.items():
+                if key != 'df':  # Don't log the entire DataFrame
+                    logger.info(f"  {key}: {value}")
+                else:
+                    logger.info(f"  df: DataFrame with {len(value)} rows, columns: {value.columns.names}")
+            
+            logger.info(f"Risk limits: {risk_limits}")
+            
+            # Initialize the environment
+            self.trading_env = InstitutionalPerpetualEnv(**env_config)
+            
+            # CRITICAL FIX: Manually set current_step to the end of data minus 1
+            # This ensures we're pointing to valid data but still have room to increment
+            self.trading_env.current_step = len(combined_data) - 1
+            logger.info(f"Set environment current_step to {self.trading_env.current_step}")
+            
+            # Initialize last_prices in the environment
+            self.trading_env.last_prices = last_prices
+            
+            # Create update_market_price method if it doesn't exist
+            if not hasattr(self.trading_env, 'update_market_price'):
+                def update_market_price(self_env, asset, price):
+                    """Update the mark price for an asset"""
+                    self_env.last_prices[asset] = float(price)
+                    logger.debug(f"Updated market price for {asset}: {price}")
+                
+                # Add the method to the environment instance
+                import types
+                self.trading_env.update_market_price = types.MethodType(update_market_price, self.trading_env)
+            
+            # Initialize risk engine explicitly with risk limits
+            if hasattr(self.trading_env, 'initialize_risk_engine'):
+                try:
+                    self.trading_env.initialize_risk_engine(risk_limits=risk_limits)
+                    logger.info("Risk engine initialized with custom limits")
+                except Exception as e:
+                    logger.error(f"Error initializing risk engine with params: {e}")
+                    logger.warning("Attempting to initialize risk engine without parameters")
+                    self.trading_env.initialize_risk_engine()
+            
+            # Initialize market conditions
+            if hasattr(self.trading_env, 'initialize_market_conditions'):
+                self.trading_env.initialize_market_conditions()
+                logger.info("Market conditions initialized")
+            
+            # Test access to prices to verify environment is working
+            for symbol in self.symbols:
+                try:
+                    price = self.trading_env._get_mark_price(symbol)
+                    logger.info(f"Successfully accessed price for {symbol}: {price}")
+                except Exception as e:
+                    logger.error(f"Error accessing price for {symbol}: {e}")
+            
+            # Reset the environment to ensure proper initialization
+            self.trading_env.reset()
+            
+            logger.info("Trading environment initialized with historical market data")
+            
+            # Log initial state
+            if hasattr(self.trading_env, 'get_state'):
+                initial_state = self.trading_env.get_state()
+                logger.info(f"Initial balance: ${initial_state['balance']:.2f}")
+                logger.info(f"Initial positions: {len([p for p in initial_state['positions'].values() if p['size'] != 0])}")
+            
+        except Exception as e:
+            logger.error(f"Error initializing trading environment: {str(e)}")
+            logger.warning("Will use simplified position management")
+            logger.error(traceback.format_exc())
+            self.trading_env = None
         
         logger.info("Real-time trading monitor setup complete")
     
@@ -274,74 +531,181 @@ class RealTimeTradeMonitor:
                 # Calculate basic technical indicators
                 df = self._calculate_indicators(df)
                 
-                self.market_data[symbol] = df
+                # Convert to MultiIndex format for the environment
+                # Get column names and data values
+                columns = df.columns
+                values = df.values
+                
+                # Create MultiIndex columns
+                multi_columns = pd.MultiIndex.from_product(
+                    [[symbol], columns],
+                    names=['asset', 'feature']
+                )
+                
+                # Create DataFrame with proper MultiIndex columns
+                multi_df = pd.DataFrame(
+                    values, 
+                    index=df.index,
+                    columns=multi_columns
+                )
+                
+                self.market_data[symbol] = multi_df
                 logger.info(f"Backfilled {len(df)} periods for {symbol}")
+                logger.info(f"Latest {symbol} price: {df['close'].iloc[-1]}")
+            
+            # Save the fetched data to files for future use
+            self._save_market_data_to_files()
             
             logger.info("Initial data backfill complete")
         except Exception as e:
             logger.error(f"Error backfilling initial data: {str(e)}")
             logger.error(traceback.format_exc())
     
-    async def _load_data_from_files(self) -> bool:
-        """
-        Load market data from local files.
-        
-        Returns:
-            bool: True if data was successfully loaded, False otherwise
-        """
+    def _save_market_data_to_files(self):
+        """Save market data to files for future use in the correct MultiIndex format."""
         try:
-            # First, check for combined data file
-            combined_path = f"data/market_data/{self.timeframe}/combined_data.parquet"
-            if os.path.exists(combined_path):
-                logger.info(f"Found combined data file: {combined_path}")
-                
-                # Load combined data
-                combined_df = pd.read_parquet(combined_path)
-                
-                # Split into separate DataFrames for each symbol
-                for symbol in self.symbols:
-                    if (symbol,) in combined_df.columns.levels[0]:
-                        # Extract symbol data
-                        symbol_cols = [col for col in combined_df.columns if col[0] == symbol]
-                        df = combined_df[symbol_cols].copy()
-                        
-                        # Flatten multi-index columns
-                        df.columns = [col[1] for col in df.columns]
-                        
-                        # Store in market_data
-                        self.market_data[symbol] = df
-                        logger.info(f"Loaded {len(df)} rows for {symbol} from combined file")
-                    else:
-                        logger.warning(f"Symbol {symbol} not found in combined data file")
-                
-                # Return True if we loaded data for at least one symbol
-                return any(not df.empty for df in self.market_data.values())
+            data_dir = os.path.join('data/market_data', self.timeframe)
+            os.makedirs(data_dir, exist_ok=True)
             
-            # If no combined file, check for individual files
-            logger.info("No combined file found, checking for individual files")
-            
-            data_loaded = False
+            # Save individual symbol data
             for symbol in self.symbols:
-                # Check for parquet file first (faster)
-                parquet_path = f"data/market_data/{self.timeframe}/{symbol}.parquet"
-                csv_path = f"data/market_data/{self.timeframe}/{symbol}.csv"
-                
-                if os.path.exists(parquet_path):
-                    df = pd.read_parquet(parquet_path)
-                    logger.info(f"Loaded {len(df)} rows for {symbol} from {parquet_path}")
-                    self.market_data[symbol] = df
-                    data_loaded = True
-                elif os.path.exists(csv_path):
-                    df = pd.read_csv(csv_path)
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df.set_index('timestamp', inplace=True)
-                    logger.info(f"Loaded {len(df)} rows for {symbol} from {csv_path}")
-                    self.market_data[symbol] = df
-                    data_loaded = True
-                else:
-                    logger.warning(f"No data file found for {symbol}")
+                if not self.market_data[symbol].empty:
+                    symbol_file = os.path.join(data_dir, f"{symbol}.parquet")
+                    
+                    # Verify it has MultiIndex columns before saving
+                    if not isinstance(self.market_data[symbol].columns, pd.MultiIndex):
+                        logger.warning(f"DataFrame for {symbol} doesn't have MultiIndex columns - fixing before saving")
+                        
+                        # This shouldn't happen with our current code, but just in case
+                        # Get column names and data values
+                        df = self.market_data[symbol]
+                        columns = df.columns
+                        values = df.values
+                        
+                        # Create MultiIndex columns
+                        multi_columns = pd.MultiIndex.from_product(
+                            [[symbol], columns],
+                            names=['asset', 'feature']
+                        )
+                        
+                        # Create DataFrame with proper MultiIndex columns
+                        multi_df = pd.DataFrame(
+                            values, 
+                            index=df.index,
+                            columns=multi_columns
+                        )
+                        
+                        # Replace DataFrame with MultiIndex version
+                        self.market_data[symbol] = multi_df
+                    
+                    # Now save to file
+                    self.market_data[symbol].to_parquet(symbol_file)
+                    logger.info(f"Saved market data for {symbol} to {symbol_file}")
             
-            return data_loaded
+            # Save combined data for future use
+            combined_data = pd.concat([self.market_data[symbol] for symbol in self.symbols 
+                                      if not self.market_data[symbol].empty], axis=1)
+            
+            if not combined_data.empty:
+                combined_file = os.path.join(data_dir, 'combined_data.parquet')
+                combined_data.to_parquet(combined_file)
+                logger.info(f"Saved combined market data to {combined_file}")
+            
+        except Exception as e:
+            logger.error(f"Error saving market data to files: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    async def _load_data_from_files(self) -> bool:
+        """Load market data from existing files."""
+        try:
+            data_dir = os.path.join('data/market_data', self.timeframe)
+            
+            if not os.path.exists(data_dir):
+                logger.warning(f"Market data directory not found: {data_dir}")
+                return False
+            
+            # Load individual symbol data
+            for symbol in self.symbols:
+                symbol_file = os.path.join(data_dir, f"{symbol}.parquet")
+                
+                if os.path.exists(symbol_file):
+                    df = pd.read_parquet(symbol_file)
+                    
+                    # CRITICAL FIX: Check if the loaded DataFrame already has MultiIndex columns
+                    if not isinstance(df.columns, pd.MultiIndex):
+                        logger.info(f"Converting {symbol} data to MultiIndex format")
+                        
+                        # Ensure DataFrame has expected columns
+                        required_columns = ['open', 'high', 'low', 'close', 'volume']
+                        if not all(col in df.columns for col in required_columns):
+                            logger.warning(f"Symbol data for {symbol} is missing required columns.")
+                            continue
+                        
+                        # Get column names and data values
+                        columns = df.columns
+                        values = df.values
+                        
+                        # Create MultiIndex columns
+                        multi_columns = pd.MultiIndex.from_product(
+                            [[symbol], columns],
+                            names=['asset', 'feature']
+                        )
+                        
+                        # Create DataFrame with proper MultiIndex columns
+                        multi_df = pd.DataFrame(
+                            values, 
+                            index=df.index,
+                            columns=multi_columns
+                        )
+                        
+                        # Replace DataFrame with MultiIndex version
+                        df = multi_df
+                    
+                    # Ensure index is DateTimeIndex and sorted
+                    if not isinstance(df.index, pd.DatetimeIndex):
+                        df.index = pd.to_datetime(df.index)
+                    df = df.sort_index()
+                    
+                    # Store in market_data
+                    self.market_data[symbol] = df
+                    logger.info(f"Loaded market data for {symbol} with {len(df)} rows")
+                    logger.info(f"Data columns format: {type(df.columns)}")
+                    logger.info(f"Sample column names: {df.columns[:5]}")
+                else:
+                    logger.warning(f"Symbol data file not found: {symbol_file}")
+                    return False
+            
+            # Also try to load combined data for chatbot
+            combined_file = os.path.join(data_dir, 'combined_data.parquet')
+            if os.path.exists(combined_file) and self.chatbot is not None:
+                combined_data = pd.read_parquet(combined_file)
+                
+                # Check if it's a MultiIndex format
+                if isinstance(combined_data.columns, pd.MultiIndex):
+                    # Get the unique assets from the first level
+                    assets = combined_data.columns.get_level_values(0).unique()
+                    logger.info(f"Found assets in combined data: {assets}")
+                    
+                    # Make sure our symbols are in the combined data
+                    for symbol in self.symbols:
+                        if symbol not in assets:
+                            logger.warning(f"Symbol {symbol} not found in combined data")
+                    
+                    # Update chatbot with combined data
+                    self.chatbot.update_market_data(combined_data)
+                    logger.info(f"Updated chatbot with combined data containing {len(combined_data)} rows")
+                else:
+                    logger.warning("Combined data file does not have MultiIndex format")
+            
+            # ADDED: Combine data for all symbols (important for proper environment initialization)
+            combined_data = pd.concat([self.market_data[symbol] for symbol in self.symbols 
+                                     if not self.market_data[symbol].empty], axis=1)
+            
+            logger.info(f"Combined data with shape {combined_data.shape}")
+            logger.info(f"Combined columns structure: {type(combined_data.columns)}")
+            
+            # If we got here, we have loaded all necessary data
+            return all(len(df) > 0 for df in self.market_data.values())
             
         except Exception as e:
             logger.error(f"Error loading data from files: {str(e)}")
@@ -389,10 +753,10 @@ class RealTimeTradeMonitor:
             true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
             df['atr'] = true_range.rolling(window=14).mean()
             
-            # Fill NaN values
-            df.fillna(method='bfill', inplace=True)
-            df.fillna(method='ffill', inplace=True)
-            df.fillna(0, inplace=True)
+            # Fill NaN values - Use proper methods instead of deprecated 'method' parameter
+            df = df.bfill()
+            df = df.ffill()
+            df = df.fillna(0)
             
             return df
         except Exception as e:
@@ -401,173 +765,395 @@ class RealTimeTradeMonitor:
             return df
     
     async def _fetch_latest_data(self):
-        """Fetch the latest data for all symbols."""
+        """Fetch the latest market data from the exchange."""
         try:
+            new_data_available = False
+            market_conditions_changed = False
+            
             for symbol in self.symbols:
-                # Fetch recent OHLCV data
-                ohlcv = await self.exchange.fetch_ohlcv(
-                    symbol, 
-                    self.timeframe, 
-                    limit=2  # Get current and previous candle
+                # Determine timeframe in seconds
+                tf_seconds = self._timeframe_to_seconds(self.timeframe)
+                
+                # Fetch latest candles
+                logger.debug(f"Fetching latest data for {symbol}")
+                candles = await self.exchange.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=self.timeframe,
+                    limit=10  # Just get a few recent candles
                 )
                 
-                if not ohlcv or len(ohlcv) < 2:
-                    logger.warning(f"Insufficient data received for {symbol}")
+                if not candles:
+                    logger.warning(f"No data received for {symbol}")
                     continue
                 
                 # Convert to DataFrame
-                new_data = pd.DataFrame(
-                    ohlcv,
-                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-                )
-                new_data['timestamp'] = pd.to_datetime(new_data['timestamp'], unit='ms')
-                new_data.set_index('timestamp', inplace=True)
+                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 
-                with self.data_lock:
-                    # Check if we already have this candle
-                    if (self.market_data[symbol].empty or 
-                        new_data.index[-1] > self.market_data[symbol].index[-1]):
+                # Get the timestamp of the most recent complete candle
+                # The last candle is often incomplete, so use the second-to-last if available
+                if len(df) > 1:
+                    newest_complete_candle_time = df['timestamp'].iloc[-2]
+                else:
+                    newest_complete_candle_time = df['timestamp'].iloc[-1]
+                
+                # Check if this is a new candle we haven't processed yet
+                if symbol in self.last_candle_times:
+                    previous_candle_time = self.last_candle_times[symbol]
+                    if newest_complete_candle_time > previous_candle_time:
+                        logger.info(f"New candle available for {symbol}: {newest_complete_candle_time}")
+                        self.last_candle_times[symbol] = newest_complete_candle_time
+                        new_data_available = True
+                        market_conditions_changed = True
+                else:
+                    # First time seeing this symbol
+                    self.last_candle_times[symbol] = newest_complete_candle_time
+                    new_data_available = True
+                    market_conditions_changed = True
+                
+                # Set timestamp as index
+                df.set_index('timestamp', inplace=True)
+                
+                # Ensure DataFrame is sorted by time
+                df = df.sort_index()
+                
+                # Update market data
+                if symbol in self.market_data and not self.market_data[symbol].empty:
+                    # Get only new data
+                    last_timestamp = self.market_data[symbol].index[-1]
+                    new_df = df[df.index > last_timestamp]
+                    
+                    if not new_df.empty:
+                        # Calculate indicators
+                        new_df = self._calculate_indicators(new_df)
                         
-                        # Append new data to existing data
-                        combined_data = pd.concat([self.market_data[symbol], new_data])
-                        combined_data = combined_data[~combined_data.index.duplicated(keep='last')]
-                        combined_data = combined_data.sort_index()
+                        # Get column names and data values
+                        columns = new_df.columns
+                        values = new_df.values
                         
-                        # Recalculate indicators
-                        combined_data = self._calculate_indicators(combined_data)
+                        # Create MultiIndex columns
+                        multi_columns = pd.MultiIndex.from_product(
+                            [[symbol], columns],
+                            names=['asset', 'feature']
+                        )
                         
-                        # Update market data
-                        self.market_data[symbol] = combined_data
+                        # Create DataFrame with proper MultiIndex columns
+                        new_multi_df = pd.DataFrame(
+                            values, 
+                            index=new_df.index,
+                            columns=multi_columns
+                        )
                         
-                        logger.debug(f"Updated market data for {symbol}, new timestamp: {new_data.index[-1]}")
-                    else:
-                        logger.debug(f"No new data for {symbol}, current latest: {self.market_data[symbol].index[-1]}")
+                        # Concat with existing data
+                        self.market_data[symbol] = pd.concat([self.market_data[symbol], new_multi_df])
+                        logger.debug(f"Added {len(new_df)} new rows for {symbol}")
+                else:
+                    # Calculate indicators
+                    df = self._calculate_indicators(df)
+                    
+                    # Get column names and data values
+                    columns = df.columns
+                    values = df.values
+                    
+                    # Create MultiIndex columns
+                    multi_columns = pd.MultiIndex.from_product(
+                        [[symbol], columns],
+                        names=['asset', 'feature']
+                    )
+                    
+                    # Create DataFrame with proper MultiIndex columns
+                    multi_df = pd.DataFrame(
+                        values, 
+                        index=df.index,
+                        columns=multi_columns
+                    )
+                    
+                    self.market_data[symbol] = multi_df
+                    logger.debug(f"Initialized market data for {symbol} with {len(df)} rows")
+                
+                # Update the trading environment with new data if available
+                if new_data_available and self.trading_env is not None:
+                    try:
+                        # Create a combined DataFrame with the latest data for all symbols
+                        combined_data = pd.concat([self.market_data[symbol] for symbol in self.symbols 
+                                                  if not self.market_data[symbol].empty], axis=1)
+                        
+                        if combined_data is not None and not combined_data.empty:
+                            # CRITICAL FIX: Record current position within the DataFrame before updating
+                            current_position = self.trading_env.current_step
+                            rows_before = len(self.trading_env.df) if hasattr(self.trading_env, 'df') and self.trading_env.df is not None else 0
+                            
+                            # Set the DataFrame in the environment
+                            self.trading_env.df = combined_data
+                            logger.debug(f"Updated trading environment with new market data ({len(combined_data)} rows)")
+                            
+                            # CRITICAL FIX: Adjust current_step to point to the correct position in the new DataFrame
+                            # If the DataFrame grew, adjust current_step accordingly to maintain the same position
+                            rows_after = len(combined_data)
+                            if rows_after > rows_before and rows_before > 0:
+                                # Update current_step to maintain position (keep at the same percentage point)
+                                # This ensures we don't go out of bounds after updating the DataFrame
+                                self.trading_env.current_step = min(rows_after - 1, current_position + (rows_after - rows_before))
+                                logger.debug(f"Adjusted current_step from {current_position} to {self.trading_env.current_step} due to DataFrame growth")
+                            
+                            # Always ensure current_step is valid
+                            self.trading_env.current_step = min(len(combined_data) - 1, self.trading_env.current_step)
+                            
+                            # Initialize last_prices in the environment if not already set
+                            if not hasattr(self.trading_env, 'last_prices') or self.trading_env.last_prices is None:
+                                self.trading_env.last_prices = {}
+                            
+                            # Update market prices for each symbol
+                            for symbol in self.symbols:
+                                if not self.market_data[symbol].empty:
+                                    latest_price = self.market_data[symbol][(symbol, 'close')].iloc[-1]
+                                    
+                                    # Update last_prices first
+                                    self.trading_env.last_prices[symbol] = float(latest_price)
+                                    
+                                    # Make sure the symbol exists in positions
+                                    if not hasattr(self.trading_env, 'positions'):
+                                        self.trading_env.positions = {}
+                                        
+                                    if symbol not in self.trading_env.positions:
+                                        self.trading_env.positions[symbol] = {
+                                            'size': 0, 
+                                            'entry_price': 0,
+                                            'last_price': float(latest_price),
+                                            'funding_accrued': 0,
+                                            'leverage': 0.0,
+                                            'direction': 0
+                                        }
+                                    
+                                    # Update market price if method exists
+                                    if hasattr(self.trading_env, 'update_market_price'):
+                                        self.trading_env.update_market_price(symbol, latest_price)
+                        
+                        logger.debug(f"Updated trading environment with new data for all symbols")
+                    except Exception as e:
+                        logger.error(f"Error updating environment with new data: {str(e)}")
+                        logger.error(traceback.format_exc())
             
-            return True
+            # If market conditions have changed, update the environment's market condition analysis
+            if market_conditions_changed and self.trading_env is not None:
+                try:
+                    # Update market conditions in the environment
+                    self.trading_env.update_market_conditions()
+                    
+                    # Get market condition information
+                    market_info = self.trading_env.get_market_conditions()
+                    if market_info:
+                        for symbol, conditions in market_info.items():
+                            # Log market regime 
+                            if 'regime' in conditions:
+                                logger.info(f"Market conditions for {symbol}: Regime={conditions['regime']}, "
+                                           f"Volatility={conditions.get('volatility', 'unknown')}")
+                except Exception as e:
+                    logger.error(f"Error updating market conditions: {str(e)}")
+            
+            return new_data_available
+            
         except Exception as e:
             logger.error(f"Error fetching latest data: {str(e)}")
             logger.error(traceback.format_exc())
             return False
     
-    def _prepare_observation(self, symbol: str) -> np.ndarray:
-        """Prepare observation for the RL model."""
+    def _timeframe_to_seconds(self, timeframe):
+        """Convert a timeframe string (e.g., '5m', '1h') to seconds."""
+        try:
+            # Extract the number and unit
+            number = int(''.join(filter(str.isdigit, timeframe)))
+            unit = ''.join(filter(str.isalpha, timeframe))
+            
+            # Convert to seconds
+            if unit.lower() == 'm':
+                return number * 60
+            elif unit.lower() == 'h':
+                return number * 60 * 60
+            elif unit.lower() == 'd':
+                return number * 24 * 60 * 60
+            else:
+                logger.warning(f"Unknown timeframe unit: {unit}, defaulting to 300 seconds (5m)")
+                return 300
+                
+        except Exception as e:
+            logger.error(f"Error converting timeframe to seconds: {str(e)}")
+            return 300  # Default to 5 minutes
+    
+    def _prepare_observation(self, symbol: str = None) -> np.ndarray:
+        """
+        Prepare observation for the RL model.
+        
+        If symbol is None, prepare a combined observation of all assets.
+        Otherwise, prepare observation for a specific asset.
+        
+        The RL model expects a flattened vector of shape (78,).
+        """
         try:
             with self.data_lock:
-                if self.market_data[symbol].empty:
-                    logger.warning(f"No market data available for {symbol}")
+                # Check if market data is available for all symbols
+                if any(self.market_data[s].empty for s in self.symbols):
+                    missing_symbols = [s for s in self.symbols if self.market_data[s].empty]
+                    logger.warning(f"No market data available for symbols: {missing_symbols}")
                     return None
                 
-                # Get the latest data
-                df = self.market_data[symbol]
+                # Get the latest data for all symbols
+                combined_features = []
                 
-                # Use the last 30 candles for the observation
-                window = df.tail(30).copy()
+                # For each symbol, extract the key features
+                for sym in self.symbols:
+                    df = self.market_data[sym]
+                    
+                    # Use a shorter lookback of 10 candles instead of 30
+                    # This is because we have 3 assets x 26 features = 78 (as expected by the model)
+                    window = df.tail(10).copy()
+                    
+                    # Key price features relative to last close
+                    close_price = window[(sym, 'close')].iloc[-1]
+                    
+                    # Extract normalized price features (just the most recent values)
+                    normalized_features = []
+                    
+                    # Price features (normalized by last close)
+                    for col in ['open', 'high', 'low', 'close']:
+                        if (sym, col) in window.columns:
+                            # Only use the most recent value
+                            normalized_features.append(window[(sym, col)].iloc[-1] / close_price)
+                    
+                    # Volume (normalized by mean)
+                    vol_mean = window[(sym, 'volume')].mean()
+                    if vol_mean > 0:
+                        normalized_features.append(window[(sym, 'volume')].iloc[-1] / vol_mean)
+                    else:
+                        normalized_features.append(0.0)
+                    
+                    # Technical indicators
+                    for indicator in ['sma_10', 'sma_20', 'ema_12', 'ema_26']:
+                        if (sym, indicator) in window.columns:
+                            normalized_features.append(window[(sym, indicator)].iloc[-1] / close_price)
+                    
+                    # MACD components
+                    if (sym, 'macd') in window.columns and (sym, 'macd_signal') in window.columns:
+                        # These are differences, so use absolute normalization
+                        normalized_features.append(window[(sym, 'macd')].iloc[-1] / (0.01 * close_price))
+                        normalized_features.append(window[(sym, 'macd_signal')].iloc[-1] / (0.01 * close_price))
+                        if (sym, 'macd_hist') in window.columns:
+                            normalized_features.append(window[(sym, 'macd_hist')].iloc[-1] / (0.01 * close_price))
+                    
+                    # RSI (already 0-100, so normalize to 0-1)
+                    if (sym, 'rsi') in window.columns:
+                        normalized_features.append(window[(sym, 'rsi')].iloc[-1] / 100.0)
+                    
+                    # Bollinger Bands
+                    for band in ['bb_upper', 'bb_middle', 'bb_lower']:
+                        if (sym, band) in window.columns:
+                            normalized_features.append(window[(sym, band)].iloc[-1] / close_price)
+                    
+                    # ATR (normalize by close price)
+                    if (sym, 'atr') in window.columns:
+                        normalized_features.append(window[(sym, 'atr')].iloc[-1] / close_price)
+                    
+                    # Recent price changes (short-term momentum)
+                    if len(window) >= 3:
+                        # 1-candle change
+                        price_change_1 = window[(sym, 'close')].iloc[-1] / window[(sym, 'close')].iloc[-2] - 1
+                        normalized_features.append(price_change_1)
+                        
+                        # 3-candle change
+                        price_change_3 = window[(sym, 'close')].iloc[-1] / window[(sym, 'close')].iloc[-min(len(window), 4)] - 1
+                        normalized_features.append(price_change_3)
+                    else:
+                        normalized_features.extend([0.0, 0.0])
+                    
+                    # Current position state
+                    position = self.positions[sym]
+                    normalized_features.append(float(position['direction']))  # -1 (short), 0 (none), or 1 (long)
+                    normalized_features.append(position['leverage'] / self.max_leverage)  # Normalized leverage
+                    
+                    # Convert any NaN values to 0
+                    normalized_features = np.nan_to_num(normalized_features, nan=0.0)
+                    
+                    # Add to combined features
+                    combined_features.extend(normalized_features)
                 
-                # Extract features used by the RL model
-                features = []
+                # Ensure we have exactly 78 features by padding or truncating
+                if len(combined_features) > 78:
+                    logger.warning(f"Truncating observation from {len(combined_features)} to 78 features")
+                    combined_features = combined_features[:78]
+                elif len(combined_features) < 78:
+                    logger.warning(f"Padding observation from {len(combined_features)} to 78 features")
+                    combined_features.extend([0.0] * (78 - len(combined_features)))
                 
-                # Price and volume features
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    if col in window.columns:
-                        # Normalize by the last close price
-                        if col != 'volume':
-                            norm_factor = window['close'].iloc[-1]
-                            features.append(window[col].values / norm_factor)
-                        else:
-                            # Normalize volume by its own mean to handle different scales
-                            norm_factor = window['volume'].mean()
-                            if norm_factor > 0:
-                                features.append(window['volume'].values / norm_factor)
-                            else:
-                                features.append(window['volume'].values)
+                # Convert to numpy array and ensure correct shape
+                observation = np.array(combined_features, dtype=np.float32)
                 
-                # Technical indicators
-                for indicator in ['sma_10', 'sma_20', 'ema_12', 'ema_26', 
-                                 'macd', 'macd_signal', 'rsi', 
-                                 'bb_upper', 'bb_middle', 'bb_lower', 'atr']:
-                    if indicator in window.columns:
-                        if indicator in ['sma_10', 'sma_20', 'ema_12', 'ema_26', 'bb_upper', 'bb_middle', 'bb_lower']:
-                            # Normalize price-based indicators
-                            norm_factor = window['close'].iloc[-1]
-                            features.append(window[indicator].values / norm_factor)
-                        elif indicator == 'rsi':
-                            # RSI is already normalized
-                            features.append(window[indicator].values / 100)
-                        else:
-                            # Other indicators
-                            features.append(window[indicator].values)
-                
-                # Stack features
-                observation = np.column_stack(features)
-                
+                logger.debug(f"Prepared observation with shape {observation.shape}")
                 return observation
             
         except Exception as e:
-            logger.error(f"Error preparing observation for {symbol}: {str(e)}")
+            logger.error(f"Error preparing observation: {str(e)}")
             logger.error(traceback.format_exc())
             return None
     
     async def generate_signals(self):
         """Generate trading signals using the RL model."""
         try:
+            # Prepare a combined observation for all assets
+            observation = self._prepare_observation()
+            
+            if observation is None:
+                logger.warning("Skipping signal generation: No valid observation")
+                return {}
+            
+            # Check observation shape
+            if observation.shape != (78,):
+                logger.warning(f"Unexpected observation shape: {observation.shape}, expected (78,)")
+                return {}
+                
+            # Generate action using RL model
+            actions, _ = self.rl_model.predict(observation, deterministic=False)
+            
+            # In the case of multi-asset models, the actions might come as a vector
+            # Let's assume actions for BTC, ETH, SOL in that order
             signals = {}
             
-            for symbol in self.symbols:
-                # Prepare observation
-                observation = self._prepare_observation(symbol)
+            # If actions is a single value, it's likely a model trained on one asset at a time
+            if isinstance(actions, (int, float)) or (isinstance(actions, np.ndarray) and actions.size == 1):
+                # Use the single action for all assets (this is a fallback)
+                action_value = float(actions)
+                logger.warning(f"Single action value {action_value} for all assets - check model training")
                 
-                if observation is None:
-                    logger.warning(f"Skipping signal generation for {symbol}: No valid observation")
-                    continue
+                for i, symbol in enumerate(self.symbols):
+                    direction = np.sign(action_value)
+                    strength = abs(action_value)
+                    
+                    signals[symbol] = self._create_signal_dict(symbol, direction, strength)
+            
+            # If actions is a vector with multiple values (one per asset)
+            elif isinstance(actions, np.ndarray) and actions.size == len(self.symbols):
+                for i, symbol in enumerate(self.symbols):
+                    action_value = float(actions[i])
+                    direction = np.sign(action_value)
+                    strength = abs(action_value)
+                    
+                    signals[symbol] = self._create_signal_dict(symbol, direction, strength)
+            
+            # If actions is a vector but doesn't match our symbol count
+            elif isinstance(actions, np.ndarray):
+                logger.warning(f"Action shape {actions.shape} doesn't match symbol count {len(self.symbols)}")
                 
-                # Generate action using RL model
-                action, _ = self.rl_model.predict(observation, deterministic=True)
-                
-                # Extract the raw action value
-                action_value = float(action[0])
-                
-                # Determine direction and strength
-                direction = np.sign(action_value)
-                strength = abs(action_value)
-                
-                # Convert to trading signal
-                if strength < self.signal_threshold:
-                    decision = "HOLD"
-                    leverage = 0
-                elif direction > 0:
-                    if strength > 0.6:
-                        decision = "BUY (Strong)"
-                        leverage = self.max_leverage * 0.8
-                    elif strength > 0.3:
-                        decision = "BUY (Moderate)"
-                        leverage = self.max_leverage * 0.5
-                    else:
-                        decision = "BUY (Light)"
-                        leverage = self.max_leverage * 0.3
-                else:
-                    if strength > 0.6:
-                        decision = "SELL (Strong)"
-                        leverage = self.max_leverage * 0.8
-                    elif strength > 0.3:
-                        decision = "SELL (Moderate)"
-                        leverage = self.max_leverage * 0.5
-                    else:
-                        decision = "SELL (Light)"
-                        leverage = self.max_leverage * 0.3
-                
-                # Store signal data
-                signals[symbol] = {
-                    'timestamp': datetime.now().isoformat(),
-                    'action': decision,
-                    'raw_action': action_value,
-                    'direction': int(direction),
-                    'strength': float(strength),
-                    'leverage': float(leverage),
-                    'confidence': float(strength),
-                    'price': float(self.market_data[symbol]['close'].iloc[-1])
-                }
-                
-                logger.info(f"Generated signal for {symbol}: {decision}, action: {action_value:.4f}, leverage: {leverage:.2f}x")
+                # Try to use the first few actions
+                for i, symbol in enumerate(self.symbols):
+                    if i < len(actions):
+                        action_value = float(actions[i])
+                        direction = np.sign(action_value)
+                        strength = abs(action_value)
+                        
+                        signals[symbol] = self._create_signal_dict(symbol, direction, strength)
+            
+            # Log the signals
+            for symbol, signal in signals.items():
+                logger.info(f"Generated signal for {symbol}: {signal['action']}, action: {signal['raw_action']:.4f}, leverage: {signal['leverage']:.2f}x")
             
             return signals
         
@@ -576,94 +1162,263 @@ class RealTimeTradeMonitor:
             logger.error(traceback.format_exc())
             return {}
     
+    def _create_signal_dict(self, symbol, direction, strength):
+        """Create a standardized signal dictionary."""
+        # Get current price
+        current_price = self.market_data[symbol][(symbol, 'close')].iloc[-1]
+        
+        # Calculate raw action
+        raw_action = direction * strength
+        
+        # Calculate leverage using the same function as during training
+        if hasattr(self, 'trading_env') and self.trading_env is not None:
+            try:
+                # Use the exact same leverage calculation as in training
+                target_leverage = self.trading_env._get_target_leverage(raw_action)
+                logger.debug(f"Used environment leverage calculation: {raw_action} -> {target_leverage}")
+            except Exception as e:
+                logger.error(f"Error using environment leverage calculation: {str(e)}")
+                # Fallback to simplified calculation
+                target_leverage = self.max_leverage * np.tanh(abs(raw_action)) * direction
+                logger.debug(f"Used fallback leverage calculation: {raw_action} -> {target_leverage}")
+        else:
+            # Fallback to simplified calculation if environment not available
+            target_leverage = self.max_leverage * np.tanh(abs(raw_action)) * direction
+        
+        # Determine decision based on direction and strength
+        if strength < self.signal_threshold:
+            decision = "HOLD"
+            target_leverage = 0.0
+        elif direction > 0:
+            if strength > 0.6:
+                decision = "BUY (Strong)"
+            elif strength > 0.3:
+                decision = "BUY (Moderate)"
+            else:
+                decision = "BUY (Light)"
+        else:
+            if strength > 0.6:
+                decision = "SELL (Strong)"
+            elif strength > 0.3:
+                decision = "SELL (Moderate)"
+            else:
+                decision = "SELL (Light)"
+        
+        # Create and return the signal dictionary
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'action': decision,
+            'raw_action': raw_action,
+            'direction': int(direction),
+            'strength': float(strength),
+            'leverage': float(target_leverage),
+            'confidence': float(strength),
+            'price': float(current_price)
+        }
+    
     async def execute_trades(self, signals: Dict):
-        """Execute trades based on generated signals."""
+        """Execute trades based on generated signals using the trading environment."""
         try:
             trades_executed = []
             current_time = datetime.now()
             
-            for symbol, signal in signals.items():
-                # Get signal data
-                decision = signal['action']
-                trade_direction = signal['direction']
-                target_leverage = signal['leverage']
-                current_price = signal['price']
+            # If we have the trading environment, use it for sophisticated position management
+            if self.trading_env is not None:
+                logger.info("Using institutional environment for trade execution and risk management")
                 
-                # Skip if HOLD
-                if decision == "HOLD" or abs(trade_direction) < 0.1:
-                    continue
+                # Get current environment state before actions
+                pre_state = self.trading_env.get_state()
                 
-                # Get current position
-                position = self.positions[symbol]
+                # Convert signals to actions for each symbol
+                actions = {}
+                for symbol, signal in signals.items():
+                    # Get the raw action (direction * strength)
+                    raw_action = signal['raw_action']
+                    
+                    # Log the action being sent to the environment
+                    logger.info(f"Sending action {raw_action:.4f} to environment for {symbol}")
+                    
+                    actions[symbol] = raw_action
                 
-                # Determine if we need to execute a trade
-                execute_trade = False
+                # Execute the actions in the environment
+                # This is the main call that applies the action to the environment
+                obs, reward, done, info = self.trading_env.step(actions)
                 
-                # If no position, execute if we have a signal
-                if position['size'] == 0 and abs(trade_direction) > 0:
-                    execute_trade = True
+                # Get the new environment state after actions
+                post_state = self.trading_env.get_state()
                 
-                # If position exists, execute if direction changes or significant leverage change
-                elif position['size'] != 0:
-                    # Different direction than current position
-                    if np.sign(position['direction']) != np.sign(trade_direction) and abs(trade_direction) > 0:
+                # Log results from the step
+                if 'rewards' in info:
+                    for symbol, r in info['rewards'].items():
+                        logger.info(f"Reward for {symbol}: {r:.4f}")
+                
+                # Record trades for each symbol where position changed
+                for symbol in self.symbols:
+                    pre_position = pre_state['positions'].get(symbol, {'size': 0, 'direction': 0})
+                    post_position = post_state['positions'].get(symbol, {'size': 0, 'direction': 0})
+                    
+                    # Check if the position changed
+                    if (pre_position.get('size', 0) != post_position.get('size', 0) or 
+                        pre_position.get('direction', 0) != post_position.get('direction', 0)):
+                        
+                        # Get current price from our market data
+                        current_price = self.market_data[symbol][(symbol, 'close')].iloc[-1]
+                        
+                        # Determine action type
+                        if pre_position.get('size', 0) == 0 and post_position.get('size', 0) != 0:
+                            # New position
+                            action_type = 'BUY' if post_position.get('direction', 0) > 0 else 'SELL'
+                        elif pre_position.get('size', 0) != 0 and post_position.get('size', 0) == 0:
+                            # Closed position
+                            action_type = 'CLOSE'
+                        elif (pre_position.get('direction', 0) * post_position.get('direction', 0) < 0 and 
+                              pre_position.get('size', 0) != 0 and post_position.get('size', 0) != 0):
+                            # Direction changed
+                            action_type = 'REVERSE to ' + ('BUY' if post_position.get('direction', 0) > 0 else 'SELL')
+                        elif pre_position.get('size', 0) < post_position.get('size', 0):
+                            # Increased position size
+                            action_type = 'INCREASE ' + ('LONG' if post_position.get('direction', 0) > 0 else 'SHORT')
+                        elif pre_position.get('size', 0) > post_position.get('size', 0):
+                            # Decreased position size
+                            action_type = 'DECREASE ' + ('LONG' if post_position.get('direction', 0) > 0 else 'SHORT')
+                        else:
+                            # Some other change
+                            action_type = 'ADJUST'
+                        
+                        # Record the trade
+                        trade = {
+                            'symbol': symbol,
+                            'timestamp': current_time.isoformat(),
+                            'action': action_type,
+                            'price': current_price,
+                            'pre_size': pre_position.get('size', 0),
+                            'post_size': post_position.get('size', 0),
+                            'size_delta': post_position.get('size', 0) - pre_position.get('size', 0),
+                            'pre_value': pre_position.get('value', 0),
+                            'post_value': post_position.get('value', 0),
+                            'pre_leverage': pre_position.get('leverage', 0),
+                            'post_leverage': post_position.get('leverage', 0),
+                            'direction': post_position.get('direction', 0),
+                            'cost': info.get('costs', {}).get(symbol, 0),
+                            'raw_signal': signals[symbol]['raw_action'] if symbol in signals else 0
+                        }
+                        
+                        self.trades.append(trade)
+                        trades_executed.append(trade)
+                        
+                        logger.info(f"Executed {action_type} for {symbol} at {current_price}, "
+                                  f"size {post_position.get('size', 0):.6f}, "
+                                  f"value ${post_position.get('value', 0):.2f}, "
+                                  f"leverage {post_position.get('leverage', 0):.2f}x")
+                
+                # Update our internal positions to match the environment
+                self.positions = post_state['positions']
+                self.balance = post_state['balance']
+                self.total_value = post_state['total_value']
+                
+                # Log any risk management actions that occurred
+                if 'risk_actions' in info and info['risk_actions']:
+                    for action in info['risk_actions']:
+                        logger.warning(f"Risk management action: {action}")
+                
+                # Check for liquidations
+                if 'liquidations' in info and info['liquidations']:
+                    for symbol, liquidation in info['liquidations'].items():
+                        logger.critical(f"LIQUIDATION on {symbol}: {liquidation}")
+                
+                # Log portfolio state after trades
+                logger.info(f"Portfolio after trades - Balance: ${self.balance:.2f}, "
+                          f"Total value: ${self.total_value:.2f}")
+                for symbol, position in self.positions.items():
+                    if position['size'] != 0:
+                        logger.info(f"Position {symbol}: Size={position['size']:.6f}, "
+                                  f"Direction={position['direction']}, Leverage={position['leverage']:.2f}x")
+            
+            # Fallback to our own simplified position management if environment not available
+            else:
+                logger.warning("Trading environment not available, using simplified position management")
+                for symbol, signal in signals.items():
+                    # Get signal data
+                    decision = signal['action']
+                    trade_direction = signal['direction']
+                    target_leverage = signal['leverage']
+                    current_price = signal['price']
+                    
+                    # Skip if HOLD
+                    if decision == "HOLD" or abs(trade_direction) < 0.1:
+                        continue
+                    
+                    # Get current position
+                    position = self.positions[symbol]
+                    
+                    # Determine if we need to execute a trade
+                    execute_trade = False
+                    
+                    # If no position, execute if we have a signal
+                    if position['size'] == 0 and abs(trade_direction) > 0:
                         execute_trade = True
-                    # Same direction but significant leverage change
-                    elif (np.sign(position['direction']) == np.sign(trade_direction) and
-                          abs(position['leverage'] - target_leverage) > 0.5 * self.max_leverage):
-                        execute_trade = True
-                
-                # Execute the trade if needed
-                if execute_trade:
-                    # Close existing position if direction changes
-                    if position['size'] != 0 and np.sign(position['direction']) != np.sign(trade_direction):
-                        await self._close_position(symbol)
                     
-                    # Calculate position size based on target leverage
-                    portfolio_value = self.balance + sum(p['unrealized_pnl'] for p in self.positions.values())
-                    position_value = portfolio_value * target_leverage / len(self.symbols)
-                    position_size = position_value / current_price
+                    # If position exists, execute if direction changes or significant leverage change
+                    elif position['size'] != 0:
+                        # Different direction than current position
+                        if np.sign(position['direction']) != np.sign(trade_direction) and abs(trade_direction) > 0:
+                            execute_trade = True
+                        # Same direction but significant leverage change
+                        elif (np.sign(position['direction']) == np.sign(trade_direction) and
+                              abs(position['leverage'] - target_leverage) > 0.5 * self.max_leverage):
+                            execute_trade = True
                     
-                    # Apply direction
-                    position_size *= trade_direction
-                    
-                    # Calculate transaction cost
-                    transaction_cost = abs(position_value) * self.commission
-                    
-                    # Update position
-                    self.positions[symbol] = {
-                        'size': position_size,
-                        'entry_price': current_price,
-                        'current_price': current_price,
-                        'leverage': target_leverage,
-                        'direction': trade_direction,
-                        'unrealized_pnl': 0.0,
-                        'realized_pnl': position.get('realized_pnl', 0.0),
-                        'timestamp': current_time,
-                        'value': position_value
-                    }
-                    
-                    # Record the trade
-                    trade = {
-                        'symbol': symbol,
-                        'timestamp': current_time.isoformat(),
-                        'action': 'BUY' if trade_direction > 0 else 'SELL',
-                        'price': current_price,
-                        'size': position_size,
-                        'value': position_value,
-                        'leverage': target_leverage,
-                        'cost': transaction_cost,
-                        'signal': signal['raw_action']
-                    }
-                    
-                    self.trades.append(trade)
-                    trades_executed.append(trade)
-                    
-                    # Update balance for transaction costs
-                    self.balance -= transaction_cost
-                    
-                    logger.info(f"Executed {trade['action']} trade for {symbol} at price {current_price}, "
-                              f"size {position_size:.6f}, value ${position_value:.2f}, leverage {target_leverage:.2f}x")
+                    # Execute the trade if needed
+                    if execute_trade:
+                        # Close existing position if direction changes
+                        if position['size'] != 0 and np.sign(position['direction']) != np.sign(trade_direction):
+                            await self._close_position(symbol)
+                        
+                        # Calculate position size based on target leverage
+                        portfolio_value = self.balance + sum(p['unrealized_pnl'] for p in self.positions.values())
+                        position_value = portfolio_value * target_leverage / len(self.symbols)
+                        position_size = position_value / current_price
+                        
+                        # Apply direction
+                        position_size *= trade_direction
+                        
+                        # Calculate transaction cost
+                        transaction_cost = abs(position_value) * self.commission
+                        
+                        # Update position
+                        self.positions[symbol] = {
+                            'size': position_size,
+                            'entry_price': current_price,
+                            'current_price': current_price,
+                            'leverage': target_leverage,
+                            'direction': trade_direction,
+                            'unrealized_pnl': 0.0,
+                            'realized_pnl': position.get('realized_pnl', 0.0),
+                            'timestamp': current_time,
+                            'value': position_value
+                        }
+                        
+                        # Record the trade
+                        trade = {
+                            'symbol': symbol,
+                            'timestamp': current_time.isoformat(),
+                            'action': 'BUY' if trade_direction > 0 else 'SELL',
+                            'price': current_price,
+                            'size': position_size,
+                            'value': position_value,
+                            'leverage': target_leverage,
+                            'cost': transaction_cost,
+                            'signal': signal['raw_action']
+                        }
+                        
+                        self.trades.append(trade)
+                        trades_executed.append(trade)
+                        
+                        # Update balance for transaction costs
+                        self.balance -= transaction_cost
+                        
+                        logger.info(f"Executed {trade['action']} trade for {symbol} at price {current_price}, "
+                                  f"size {position_size:.6f}, value ${position_value:.2f}, leverage {target_leverage:.2f}x")
             
             # Update PnL after trades
             await self._update_pnl()
@@ -687,7 +1442,8 @@ class RealTimeTradeMonitor:
             logger.debug(f"No position to close for {symbol}")
             return
         
-        current_price = self.market_data[symbol]['close'].iloc[-1]
+        # FIXED: Using correct MultiIndex access pattern
+        current_price = self.market_data[symbol][(symbol, 'close')].iloc[-1]
         position_size = position['size']
         entry_price = position['entry_price']
         direction = position['direction']
@@ -736,38 +1492,128 @@ class RealTimeTradeMonitor:
     
     async def _update_pnl(self):
         """Update unrealized PnL for all positions."""
-        logger.debug("Updating PnL...")
-        
-        total_unrealized_pnl = 0.0
-        
-        for symbol, position in self.positions.items():
-            if position['size'] == 0:
-                continue
+        try:
+            # If we have the trading environment, use it for accurate PnL calculation
+            if self.trading_env is not None:
+                # Update the environment with latest market data
+                for symbol in self.symbols:
+                    if not self.market_data[symbol].empty:
+                        # FIXED: Using correct MultiIndex access pattern
+                        latest_price = self.market_data[symbol][(symbol, 'close')].iloc[-1]
+                        
+                        # Update market price in the environment
+                        self.trading_env.update_market_price(symbol, latest_price)
+                
+                # Recalculate PnL
+                self.trading_env.calculate_pnl()
+                
+                # Get updated state
+                state = self.trading_env.get_state()
+                
+                # Update our internal state to match
+                self.positions = state['positions']
+                self.balance = state['balance']
+                self.total_value = state['total_value']
+                
+                # Also check funding rates if applicable (for perpetual futures)
+                if hasattr(self.trading_env, 'apply_funding_rates'):
+                    try:
+                        funding_impacts = self.trading_env.apply_funding_rates()
+                        if funding_impacts:
+                            for symbol, impact in funding_impacts.items():
+                                if abs(impact) > 0.01:  # Only log non-trivial impacts
+                                    logger.info(f"Funding rate impact for {symbol}: ${impact:.2f}")
+                    except Exception as e:
+                        logger.error(f"Error applying funding rates: {str(e)}")
+                
+                # Perform risk checks
+                risk_info = self.trading_env.check_risk_limits()
+                
+                # If any risk violations occurred, log them
+                if risk_info['violations']:
+                    for violation in risk_info['violations']:
+                        logger.warning(f"Risk violation: {violation}")
+                
+                # Check for liquidations
+                liquidations = self.trading_env.check_liquidations()
+                if liquidations:
+                    for symbol, liquidation in liquidations.items():
+                        logger.critical(f"LIQUIDATION on {symbol}: {liquidation}")
+                        
+                        # If position was liquidated, ensure our internal state reflects this
+                        if symbol in self.positions:
+                            self.positions[symbol]['size'] = 0
+                            self.positions[symbol]['direction'] = 0
+                            self.positions[symbol]['leverage'] = 0
+                            self.positions[symbol]['value'] = 0
+                            
+                            # Record the liquidation as a trade
+                            trade = {
+                                'symbol': symbol,
+                                'timestamp': datetime.now().isoformat(),
+                                'action': 'LIQUIDATION',
+                                'price': self.market_data[symbol][(symbol, 'close')].iloc[-1],
+                                'size': 0,
+                                'value': 0,
+                                'leverage': 0,
+                                'pnl': liquidation.get('loss', 0)
+                            }
+                            self.trades.append(trade)
+                            self._save_trade_data()
+                
+                # Also check for auto-close conditions (underwater positions)
+                if hasattr(self.trading_env, 'check_underwater_positions'):
+                    try:
+                        underwater = self.trading_env.check_underwater_positions()
+                        if underwater:
+                            for symbol, position_info in underwater.items():
+                                logger.warning(f"Position underwater for {symbol}: {position_info}")
+                    except Exception as e:
+                        logger.error(f"Error checking underwater positions: {str(e)}")
+                
+                logger.debug(f"Updated PnL via environment - Balance: ${self.balance:.2f}, "
+                           f"Total Value: ${self.total_value:.2f}")
+                
+                return
             
-            current_price = self.market_data[symbol]['close'].iloc[-1]
-            position_size = position['size']
-            entry_price = position['entry_price']
-            direction = position['direction']
+            # Fallback to manual PnL calculation if environment not available
+            logger.debug("Using fallback PnL calculation")
             
-            # Calculate unrealized PnL
-            if direction > 0:  # Long position
-                unrealized_pnl = position_size * (current_price - entry_price)
-            else:  # Short position
-                unrealized_pnl = position_size * (entry_price - current_price)
+            total_unrealized_pnl = 0.0
             
-            # Update position
-            position['unrealized_pnl'] = unrealized_pnl
-            position['current_price'] = current_price
+            for symbol, position in self.positions.items():
+                if position['size'] == 0:
+                    continue
+                
+                # FIXED: Using correct MultiIndex access pattern
+                current_price = self.market_data[symbol][(symbol, 'close')].iloc[-1]
+                position_size = position['size']
+                entry_price = position['entry_price']
+                direction = position['direction']
+                
+                # Calculate unrealized PnL
+                if direction > 0:  # Long position
+                    unrealized_pnl = position_size * (current_price - entry_price)
+                else:  # Short position
+                    unrealized_pnl = position_size * (entry_price - current_price)
+                
+                # Update position
+                position['unrealized_pnl'] = unrealized_pnl
+                position['current_price'] = current_price
+                
+                # Add to total
+                total_unrealized_pnl += unrealized_pnl
             
-            # Add to total
-            total_unrealized_pnl += unrealized_pnl
-        
-        # Update total value
-        self.total_value = self.balance + total_unrealized_pnl
-        
-        logger.debug(f"Updated PnL - Balance: ${self.balance:.2f}, "
-                   f"Unrealized PnL: ${total_unrealized_pnl:.2f}, "
-                   f"Total Value: ${self.total_value:.2f}")
+            # Update total value
+            self.total_value = self.balance + total_unrealized_pnl
+            
+            logger.debug(f"Updated PnL - Balance: ${self.balance:.2f}, "
+                       f"Unrealized PnL: ${total_unrealized_pnl:.2f}, "
+                       f"Total Value: ${self.total_value:.2f}")
+                
+        except Exception as e:
+            logger.error(f"Error updating PnL: {str(e)}")
+            logger.error(traceback.format_exc())
     
     async def _generate_market_commentary(self):
         """Generate market commentary for all assets."""
@@ -794,18 +1640,6 @@ class RealTimeTradeMonitor:
                 
                 commentary[symbol] = asset_commentary
                 logger.info(f"Generated commentary for {symbol}: {len(asset_commentary)} chars")
-            
-            # Generate overall market summary
-            if len(self.symbols) > 1:
-                market_summary = self.commentary_generator.generate_market_summary(
-                    symbols=self.symbols,
-                    ohlcv_dict=self.market_data,
-                    max_tokens=750,
-                    temperature=0.7
-                )
-                
-                commentary['market_summary'] = market_summary
-                logger.info(f"Generated market summary: {len(market_summary)} chars")
             
             # Save commentary to file
             self._save_commentary(commentary)
@@ -860,20 +1694,57 @@ class RealTimeTradeMonitor:
     def _save_trade_data(self):
         """Save trade data to log file."""
         try:
+            # Check if the file exists
+            existing_trades = []
+            if os.path.exists(self.trade_log_file):
+                try:
+                    with open(self.trade_log_file, 'r') as f:
+                        existing_data = json.load(f)
+                        if 'trades' in existing_data:
+                            existing_trades = existing_data['trades']
+                except (json.JSONDecodeError, FileNotFoundError):
+                    logger.warning(f"Could not read existing trades from {self.trade_log_file}, starting fresh")
+            
+            # Get only new trades to append (assuming trades list is chronological)
+            if existing_trades:
+                # Find trades not already in the file based on timestamp
+                last_timestamp = existing_trades[-1].get('timestamp', '')
+                new_trades = [trade for trade in self.trades if trade.get('timestamp', '') > last_timestamp]
+                
+                # Append new trades to existing ones
+                combined_trades = existing_trades + new_trades
+            else:
+                combined_trades = self.trades
+            
+            # Write back the combined list
             with open(self.trade_log_file, 'w') as f:
-                json.dump({'trades': self.trades}, f, indent=2)
+                json.dump({'trades': combined_trades}, f, indent=2)
+            
             logger.debug(f"Saved {len(self.trades)} trades to {self.trade_log_file}")
         except Exception as e:
             logger.error(f"Error saving trade data: {str(e)}")
+            logger.error(traceback.format_exc())
     
     def _save_position_data(self):
         """Save current positions to log file."""
         try:
+            # Convert positions to JSON-serializable format
+            serializable_positions = {}
+            for symbol, position in self.positions.items():
+                # Create a copy of the position dictionary
+                pos_copy = position.copy()
+                
+                # Convert datetime to string if present
+                if isinstance(pos_copy.get('timestamp'), datetime):
+                    pos_copy['timestamp'] = pos_copy['timestamp'].isoformat()
+                
+                serializable_positions[symbol] = pos_copy
+            
             position_data = {
                 'timestamp': datetime.now().isoformat(),
-                'balance': self.balance,
-                'total_value': self.total_value,
-                'positions': self.positions
+                'balance': float(self.balance),
+                'total_value': float(self.total_value),
+                'positions': serializable_positions
             }
             
             with open(self.position_log_file, 'w') as f:
@@ -905,25 +1776,55 @@ class RealTimeTradeMonitor:
             
         except Exception as e:
             logger.error(f"Error saving position data: {str(e)}")
+            logger.error(traceback.format_exc())
     
     def _save_commentary(self, commentary):
         """Save market commentary to log file."""
         try:
+            current_time = datetime.now()
             commentary_data = {
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': current_time.isoformat(),
                 'commentary': commentary
             }
             
+            # Check if file exists and read existing data
+            existing_commentaries = []
+            if os.path.exists(self.commentary_log_file):
+                try:
+                    with open(self.commentary_log_file, 'r') as f:
+                        existing_data = json.load(f)
+                        if isinstance(existing_data, list):
+                            existing_commentaries = existing_data
+                        elif isinstance(existing_data, dict) and 'commentaries' in existing_data:
+                            existing_commentaries = existing_data['commentaries']
+                        else:
+                            # If it's a single commentary, convert to list
+                            existing_commentaries = [existing_data]
+                except (json.JSONDecodeError, FileNotFoundError):
+                    logger.warning(f"Could not read existing commentaries from {self.commentary_log_file}, starting fresh")
+            
+            # Append new commentary
+            existing_commentaries.append(commentary_data)
+            
+            # Keep only the most recent 24 hours of commentaries
+            cutoff_time = (current_time - timedelta(hours=24)).isoformat()
+            recent_commentaries = [
+                c for c in existing_commentaries 
+                if isinstance(c, dict) and c.get('timestamp', '') >= cutoff_time
+            ]
+            
+            # Write back combined commentaries
             with open(self.commentary_log_file, 'w') as f:
-                json.dump(commentary_data, f, indent=2)
+                json.dump({'commentaries': recent_commentaries}, f, indent=2)
             
             logger.debug(f"Saved commentary to {self.commentary_log_file}")
             
             # Also append to historical file
-            historical_file = f"{self.log_dir}/commentary/commentary_{datetime.now().strftime('%Y-%m-%d')}.json"
+            historical_file = f"{self.log_dir}/commentary/commentary_{current_time.strftime('%Y-%m-%d')}.json"
             
             # Check if file exists, if not create it with empty list
             if not os.path.exists(historical_file):
+                os.makedirs(os.path.dirname(historical_file), exist_ok=True)
                 with open(historical_file, 'w') as f:
                     json.dump([], f)
             
@@ -943,47 +1844,92 @@ class RealTimeTradeMonitor:
             
         except Exception as e:
             logger.error(f"Error saving commentary: {str(e)}")
+            logger.error(traceback.format_exc())
     
     async def run_trading_loop(self):
         """Run the main trading loop."""
-        self.is_running = True
         logger.info("Starting trading loop")
         
-        while self.is_running and not self.shutting_down:
-            try:
+        self.is_running = True
+        
+        try:
+            while self.is_running and not self.shutting_down:
                 # Fetch latest data
-                data_updated = await self._fetch_latest_data()
+                new_data_available = await self._fetch_latest_data()
                 
-                if data_updated:
-                    # Generate signals
-                    signals = await self.generate_signals()
-                    
-                    # Execute trades
-                    if signals:
-                        await self.execute_trades(signals)
-                    
+                # Generate signals only when new candle data is available
+                if new_data_available:
                     # Update chatbot with latest data
                     self._update_chatbot()
+                    
+                    # Check if enough time has passed since last signal generation
+                    now = datetime.now()
+                    min_signal_interval = timedelta(seconds=self._timeframe_to_seconds(self.timeframe) * 0.9)
+                    
+                    should_generate_signals = all(
+                        (now - self.last_signal_time[symbol]) > min_signal_interval
+                        for symbol in self.symbols
+                    )
+                    
+                    if should_generate_signals:
+                        logger.info("Generating new trading signals based on latest data")
+                        signals = await self.generate_signals()
+                        
+                        # Update signal timestamps
+                        for symbol in self.symbols:
+                            self.last_signal_time[symbol] = now
+                        
+                        # Execute trades based on signals
+                        if signals:
+                            await self.execute_trades(signals)
+                        else:
+                            logger.warning("Received empty or invalid trading signals")
+                    else:
+                        logger.debug("Skipping signal generation - not enough time elapsed since last signals")
+                else:
+                    logger.debug("No new candle data available, skipping signal generation")
                 
-                # Check if we need to log positions (every 15 minutes)
-                if (datetime.now() - self.last_position_log_time).total_seconds() >= 900:  # 15 minutes
-                    logger.info("Logging current positions")
-                    self._save_position_data()
-                    self.last_position_log_time = datetime.now()
+                # IMPORTANT: Always update PnL even if no new data, to catch price movements and liquidations
+                await self._update_pnl()
                 
-                # Check if we need to generate commentary (every 15 minutes)
-                if (datetime.now() - self.last_commentary_time).total_seconds() >= 900:  # 15 minutes
-                    logger.info("Generating market commentary")
+                # Check margin requirements and liquidation risk even when not trading
+                if self.trading_env is not None:
+                    # Perform periodic risk assessment
+                    risk_info = self.trading_env.check_risk_limits()
+                    margin_info = self.trading_env.get_margin_info() if hasattr(self.trading_env, 'get_margin_info') else None
+                    
+                    # Log margin info for active positions
+                    if margin_info:
+                        for symbol, info in margin_info.items():
+                            if self.positions.get(symbol, {}).get('size', 0) != 0:
+                                margin_ratio = info.get('margin_ratio', 0)
+                                if margin_ratio > 0.8:  # High margin utilization
+                                    logger.warning(f"HIGH MARGIN UTILIZATION for {symbol}: {margin_ratio:.2%}")
+                                elif margin_ratio > 0.5:  # Moderate margin utilization
+                                    logger.info(f"Margin utilization for {symbol}: {margin_ratio:.2%}")
+                
+                # Generate market commentary periodically
+                now = datetime.now()
+                if (now - self.last_commentary_time).total_seconds() > 5 * 60:  # Every 5 minutes
                     await self._generate_market_commentary()
-                    self.last_commentary_time = datetime.now()
+                    self.last_commentary_time = now
                 
-                # Sleep between updates
-                await asyncio.sleep(30)  # Check for new data every 30 seconds
+                # Log positions periodically
+                if (now - self.last_position_log_time).total_seconds() > 5 * 60:  # Every 5 minutes
+                    self._save_position_data()
+                    self.last_position_log_time = now
                 
-            except Exception as e:
-                logger.error(f"Error in trading loop: {str(e)}")
-                logger.error(traceback.format_exc())
-                await asyncio.sleep(60)  # Sleep longer on error
+                # Sleep for a bit before next update
+                await asyncio.sleep(30)
+                
+        except asyncio.CancelledError:
+            logger.info("Trading loop cancelled")
+        except Exception as e:
+            logger.error(f"Error in trading loop: {str(e)}")
+            logger.error(traceback.format_exc())
+        finally:
+            self.is_running = False
+            logger.info("Trading loop stopped")
     
     async def shutdown(self):
         """Shut down the trading monitor."""
@@ -992,10 +1938,25 @@ class RealTimeTradeMonitor:
         self.is_running = False
         
         try:
-            # Close all positions
-            for symbol in self.symbols:
-                if self.positions[symbol]['size'] != 0:
-                    await self._close_position(symbol)
+            # Close all positions - use trading environment if available
+            if self.trading_env is not None:
+                # Create a dictionary of "close" actions for all symbols
+                close_actions = {symbol: 0 for symbol in self.symbols}
+                
+                # Execute the close actions
+                logger.info("Closing all positions via trading environment")
+                obs, reward, done, info = self.trading_env.step(close_actions)
+                
+                # Get the final state
+                final_state = self.trading_env.get_state()
+                self.positions = final_state['positions']
+                self.balance = final_state['balance']
+                self.total_value = final_state['total_value']
+            else:
+                # Use our own close position function
+                for symbol in self.symbols:
+                    if self.positions[symbol]['size'] != 0:
+                        await self._close_position(symbol)
             
             # Save final data
             self._save_trade_data()
@@ -1008,6 +1969,7 @@ class RealTimeTradeMonitor:
             logger.info("Trading monitor shutdown complete")
         except Exception as e:
             logger.error(f"Error during shutdown: {str(e)}")
+            logger.error(traceback.format_exc())
 
 
 async def main():

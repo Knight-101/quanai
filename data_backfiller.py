@@ -1,60 +1,78 @@
 #!/usr/bin/env python
 import os
 import sys
-import json
+import time
 import logging
-import asyncio
 import argparse
-import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+import numpy as np
 from pathlib import Path
-import ccxt.async_support as ccxt
+from datetime import datetime, timedelta
+import ccxt
 
-# Configure logging
+# Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('data_backfiller.log'),
+        logging.FileHandler('backfiller.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('data_backfiller')
+
+# Try to import async version of ccxt for compatibility
+try:
+    import ccxt.async_support as ccxt_async
+    HAS_ASYNC = True
+except ImportError:
+    HAS_ASYNC = False
+    logger.warning("Could not import ccxt.async_support. Using synchronous version.")
 
 class MarketDataBackfiller:
     """
     Downloads historical market data for specified symbols and timeframes,
     calculates technical indicators, and saves the data to files.
     """
-    def __init__(self, symbols, timeframes, output_dir, periods=1500, exchange='binance'):
-        self.symbols = symbols.split(',') if isinstance(symbols, str) else symbols
-        self.timeframes = timeframes.split(',') if isinstance(timeframes, str) else timeframes
-        self.output_dir = output_dir
+    def __init__(self, symbols=None, timeframes=None, output_dir=None, periods=1000, exchange='binance'):
+        """
+        Initialize the market data backfiller.
+        
+        Args:
+            symbols: List of trading pairs (e.g., 'BTCUSDT')
+            timeframes: List of timeframes (e.g., '5m', '15m', '1h')
+            output_dir: Directory to save the data files
+            periods: Number of candles to fetch for each symbol and timeframe
+            exchange: Exchange to fetch data from (e.g., 'binance')
+        """
+        self.symbols = symbols or ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+        self.timeframes = timeframes or ['5m']
+        self.output_dir = output_dir or 'data/market_data'
         self.periods = periods
-        self.exchange_id = exchange
-        self.exchange = None
-
-    async def fetch_data(self):
-        """
-        Downloads historical market data for each symbol and timeframe,
-        calculates technical indicators, and saves the data.
-        """
+        
+        # Initialize exchange client
         try:
-            # Create exchange instance
-            logger.info(f"Initializing {self.exchange_id} exchange")
-            self.exchange = getattr(ccxt, self.exchange_id)({
+            exchange_class = getattr(ccxt, exchange)
+            self.exchange = exchange_class({
                 'enableRateLimit': True,
                 'options': {
-                    'defaultType': 'future',  # Use futures market for perpetual contracts
+                    'defaultType': 'future',
                 }
             })
-            
-            # Load markets
-            logger.info("Loading markets")
-            await self.exchange.load_markets()
-            
-            # Process each timeframe
+            logger.info(f"Initialized exchange client for {exchange}")
+        except Exception as e:
+            logger.error(f"Error initializing exchange: {str(e)}")
+            self.exchange = None
+    
+    def fetch_data(self):
+        """
+        Fetch historical market data for all symbols and timeframes.
+        """
+        if not self.exchange:
+            logger.error("Exchange client not initialized. Cannot fetch data.")
+            return False
+        
+        try:
             for timeframe in self.timeframes:
                 logger.info(f"Processing timeframe: {timeframe}")
                 
@@ -62,273 +80,260 @@ class MarketDataBackfiller:
                 timeframe_dir = os.path.join(self.output_dir, timeframe)
                 os.makedirs(timeframe_dir, exist_ok=True)
                 
-                # Download data for each symbol
+                # Dictionary to store DataFrames for all symbols
                 all_dfs = {}
-                for symbol in self.symbols:
-                    try:
-                        logger.info(f"Fetching data for {symbol}, timeframe {timeframe}")
-                        
-                        # Fetch historical OHLCV data
-                        ohlcv = await self.exchange.fetch_ohlcv(
-                            symbol=symbol, 
-                            timeframe=timeframe, 
-                            limit=self.periods
-                        )
-                        
-                        # Convert to DataFrame
-                        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                        df.set_index('timestamp', inplace=True)
-                        
-                        # Handle any duplicate timestamps
-                        df = df[~df.index.duplicated(keep='first')]
-                        
-                        logger.info(f"Fetched {len(df)} candles for {symbol}")
-                        
-                        # Calculate technical indicators
-                        df = self._calculate_indicators(df)
-                        
-                        # Save individual symbol data
-                        symbol_filename = symbol.replace('/', '') + '.parquet'
-                        symbol_path = os.path.join(timeframe_dir, symbol_filename)
-                        df.to_parquet(symbol_path)
-                        logger.info(f"Saved data to {symbol_path}")
-                        
-                        # Also save as CSV for easier inspection
-                        csv_path = os.path.join(timeframe_dir, symbol.replace('/', '') + '.csv')
-                        df.to_csv(csv_path)
-                        
-                        # Store for combined file
-                        all_dfs[symbol] = df
-                        
-                    except Exception as e:
-                        logger.error(f"Error fetching data for {symbol}: {str(e)}")
                 
-                # Create a combined file with all symbols for this timeframe
-                if all_dfs:
-                    await self._create_combined_file(all_dfs, timeframe_dir, timeframe)
+                # Process each symbol
+                for symbol in self.symbols:
+                    logger.info(f"Fetching data for {symbol} on {timeframe} timeframe")
+                    
+                    # Fetch OHLCV data
+                    ohlcv = self.exchange.fetch_ohlcv(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        limit=self.periods
+                    )
+                    
+                    # Convert to DataFrame
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
+                    
+                    # Add symbol column (important for training compatibility)
+                    df['symbol'] = symbol
+                    
+                    # Calculate technical indicators
+                    df = self._calculate_indicators(df)
+                    
+                    # Store in dictionary
+                    all_dfs[symbol] = df
+                    
+                    # Save individual symbol data
+                    symbol_file = os.path.join(timeframe_dir, f"{symbol}.parquet")
+                    df.to_parquet(symbol_file)
+                    
+                    # Also save as CSV for easier inspection
+                    csv_file = os.path.join(timeframe_dir, f"{symbol}.csv")
+                    df.to_csv(csv_file)
+                    
+                    logger.info(f"Saved {len(df)} candles for {symbol} to {symbol_file}")
+                    
+                    # Rate limiting
+                    time.sleep(1)
+                
+                # Create combined data file - THIS IS THE CRITICAL PART
+                self._create_combined_data(all_dfs, timeframe_dir)
             
-            logger.info("Data download completed")
-            
+            return True
+        
         except Exception as e:
             logger.error(f"Error fetching data: {str(e)}")
-            raise
-        finally:
-            # Close exchange
-            if self.exchange:
-                await self.exchange.close()
-    
-    async def _create_combined_file(self, all_dfs, timeframe_dir, timeframe):
-        """Creates a combined file with all symbols for a timeframe."""
-        try:
-            logger.info(f"Creating combined file for timeframe {timeframe}")
-            
-            # Create MultiIndex columns with symbol as the first level
-            combined_data = pd.DataFrame()
-            
-            for symbol, df in all_dfs.items():
-                # Create MultiIndex columns
-                symbol_id = symbol.replace('/', '')
-                df.columns = pd.MultiIndex.from_product(
-                    [[symbol_id], df.columns],
-                    names=['asset', 'feature']
-                )
-                
-                # Add to combined DataFrame
-                if combined_data.empty:
-                    combined_data = df
-                else:
-                    # Merge on index with outer join to include all timestamps
-                    combined_data = combined_data.join(df, how='outer')
-            
-            # Sort by timestamp
-            combined_data.sort_index(inplace=True)
-            
-            # Forward fill missing values
-            combined_data = combined_data.ffill()
-            
-            # Save combined file
-            combined_path = os.path.join(timeframe_dir, 'combined_data.parquet')
-            combined_data.to_parquet(combined_path)
-            logger.info(f"Saved combined data to {combined_path}")
-            
-            # Also save as CSV for easier inspection
-            csv_path = os.path.join(timeframe_dir, 'combined_data.csv')
-            combined_data.to_csv(csv_path)
-            
-        except Exception as e:
-            logger.error(f"Error creating combined file: {str(e)}")
+            return False
     
     def _calculate_indicators(self, df):
-        """Calculate technical indicators for a DataFrame."""
+        """
+        Calculate technical indicators for the given DataFrame.
+        
+        Args:
+            df: DataFrame with OHLCV data
+            
+        Returns:
+            DataFrame with added technical indicators
+        """
         try:
-            # Make sure we have numeric data
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col])
+            # Make a copy to avoid warnings
+            df = df.copy()
             
-            # ---------------- Simple Moving Averages ----------------
-            # Short-term
-            df['sma_5'] = df['close'].rolling(window=5).mean()
-            df['sma_10'] = df['close'].rolling(window=10).mean()
-            df['sma_20'] = df['close'].rolling(window=20).mean()
+            # Simple Moving Averages
+            df['sma_7'] = df['close'].rolling(window=7).mean()
+            df['sma_25'] = df['close'].rolling(window=25).mean()
+            df['sma_99'] = df['close'].rolling(window=99).mean()
             
-            # Medium-term
-            df['sma_50'] = df['close'].rolling(window=50).mean()
-            df['sma_100'] = df['close'].rolling(window=100).mean()
+            # Exponential Moving Averages
+            df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
+            df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
             
-            # Long-term
-            df['sma_200'] = df['close'].rolling(window=200).mean()
-            
-            # ---------------- Exponential Moving Averages ----------------
-            # Short-term
-            df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
-            df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
-            df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-            
-            # Medium-term
-            df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
-            df['ema_100'] = df['close'].ewm(span=100, adjust=False).mean()
-            
-            # Long-term
-            df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
-            
-            # ---------------- MACD ----------------
-            # MACD Line: (12-day EMA - 26-day EMA)
+            # MACD
             df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
             df['ema_26'] = df['close'].ewm(span=26, adjust=False).mean()
             df['macd'] = df['ema_12'] - df['ema_26']
-            
-            # Signal Line: 9-day EMA of MACD Line
             df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-            
-            # MACD Histogram: MACD Line - Signal Line
             df['macd_hist'] = df['macd'] - df['macd_signal']
             
-            # ---------------- RSI ----------------
+            # RSI (14 periods)
             delta = df['close'].diff()
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
-            
-            avg_gain = gain.rolling(window=14).mean()
-            avg_loss = loss.rolling(window=14).mean()
-            
-            # Calculate RSI
-            rs = avg_gain / avg_loss
+            gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+            loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+            rs = gain / loss
             df['rsi_14'] = 100 - (100 / (1 + rs))
             
-            # ---------------- Bollinger Bands ----------------
-            # Middle band = 20-day SMA
-            df['bb_middle'] = df['sma_20']
+            # Bollinger Bands
+            df['bb_middle'] = df['close'].rolling(window=20).mean()
+            df['bb_std'] = df['close'].rolling(window=20).std()
+            df['bb_upper'] = df['bb_middle'] + 2 * df['bb_std']
+            df['bb_lower'] = df['bb_middle'] - 2 * df['bb_std']
+            df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
             
-            # Calculate standard deviation
-            df['20d_std'] = df['close'].rolling(window=20).std()
-            
-            # Upper band = Middle band + (20-day standard deviation * 2)
-            df['bb_upper'] = df['bb_middle'] + (df['20d_std'] * 2)
-            
-            # Lower band = Middle band - (20-day standard deviation * 2)
-            df['bb_lower'] = df['bb_middle'] - (df['20d_std'] * 2)
-            
-            # ---------------- Average True Range (ATR) ----------------
+            # Average True Range (ATR)
             high_low = df['high'] - df['low']
             high_close = (df['high'] - df['close'].shift()).abs()
             low_close = (df['low'] - df['close'].shift()).abs()
-            
             true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
             df['atr_14'] = true_range.rolling(window=14).mean()
             
-            # ---------------- Stochastic Oscillator ----------------
-            # %K = (Current Close - Lowest Low) / (Highest High - Lowest Low) * 100
+            # Volume indicators
+            df['volume_sma_20'] = df['volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_sma_20']
+            
+            # Price momentum
+            df['momentum_14'] = df['close'] / df['close'].shift(14) - 1
+            
+            # Rate of Change
+            df['roc_10'] = (df['close'] / df['close'].shift(10) - 1) * 100
+            
+            # Stochastic Oscillator
             low_14 = df['low'].rolling(window=14).min()
             high_14 = df['high'].rolling(window=14).max()
             df['stoch_k'] = 100 * ((df['close'] - low_14) / (high_14 - low_14))
-            
-            # %D = 3-day SMA of %K
             df['stoch_d'] = df['stoch_k'].rolling(window=3).mean()
             
-            # ---------------- Rate of Change (ROC) ----------------
-            # Formula: ((Current Close - Close n periods ago) / Close n periods ago) * 100
-            df['roc_10'] = ((df['close'] - df['close'].shift(10)) / df['close'].shift(10)) * 100
+            # Percentage price oscillator
+            df['ppo'] = ((df['ema_12'] - df['ema_26']) / df['ema_26']) * 100
             
-            # ---------------- Volatility Metrics ----------------
-            # Daily Returns
-            df['returns'] = df['close'].pct_change()
+            # Add some price action indicators
+            df['candle_body'] = df['close'] - df['open']
+            df['candle_size'] = df['high'] - df['low']
+            df['upper_shadow'] = df['high'] - df['close'].where(df['close'] >= df['open'], df['open'])
+            df['lower_shadow'] = df['open'].where(df['close'] >= df['open'], df['close']) - df['low']
             
-            # 10-day standard deviation of returns (annualized)
-            df['volatility_10d'] = df['returns'].rolling(window=10).std() * np.sqrt(252)
+            # Add day of week and hour of day
+            df['day_of_week'] = df.index.dayofweek
+            df['hour_of_day'] = df.index.hour
             
-            # 30-day standard deviation of returns (annualized)
-            df['volatility_30d'] = df['returns'].rolling(window=30).std() * np.sqrt(252)
-            
-            # ---------------- Indicators for market regime detection ----------------
-            # ADX (Average Directional Index) - Used to determine trend strength
-            df['tr'] = true_range  # True Range calculated above
-            df['dm_plus'] = df['high'].diff().clip(lower=0)
-            df['dm_minus'] = df['low'].diff().clip(upper=0).abs()
-            
-            df['tr_14'] = df['tr'].rolling(window=14).sum()
-            df['dm_plus_14'] = df['dm_plus'].rolling(window=14).sum()
-            df['dm_minus_14'] = df['dm_minus'].rolling(window=14).sum()
-            
-            df['di_plus_14'] = (df['dm_plus_14'] / df['tr_14']) * 100
-            df['di_minus_14'] = (df['dm_minus_14'] / df['tr_14']) * 100
-            
-            df['dx'] = (abs(df['di_plus_14'] - df['di_minus_14']) / (df['di_plus_14'] + df['di_minus_14'])) * 100
-            df['adx_14'] = df['dx'].rolling(window=14).mean()
-            
-            # Label market regimes (Trending, Ranging, Volatile)
-            # A simple way to determine market regime:
-            # ADX > 25 = Trending, ADX < 20 = Ranging
-            df['trending'] = (df['adx_14'] > 25).astype(int)
-            df['ranging'] = (df['adx_14'] < 20).astype(int)
-            
-            # Clean up intermediate columns used for calculations
-            columns_to_drop = [
-                'tr', 'dm_plus', 'dm_minus', 'tr_14', 'dm_plus_14', 
-                'dm_minus_14', 'di_plus_14', 'di_minus_14', 'dx', '20d_std'
-            ]
-            df = df.drop(columns=columns_to_drop, errors='ignore')
-            
-            # Fill NaN values
+            # Clean up NaN values
             df = df.fillna(method='bfill')
-            df = df.fillna(0)  # Fill any remaining NaNs with 0
             
             return df
             
         except Exception as e:
             logger.error(f"Error calculating indicators: {str(e)}")
-            # Return original dataframe if there's an error
             return df
+    
+    def _create_combined_data(self, all_dfs, timeframe_dir):
+        """
+        Create a combined data file with all symbols.
+        This is critical for compatibility with the training code.
+        
+        Args:
+            all_dfs: Dictionary of DataFrames, one for each symbol
+            timeframe_dir: Directory to save combined data file
+        """
+        try:
+            # Method 1: Create MultiIndex format (as used in training code)
+            combined_data = pd.DataFrame()
+            
+            for symbol, df in all_dfs.items():
+                # Create MultiIndex columns with symbol as first level
+                df_copy = df.copy()
+                df_copy.columns = pd.MultiIndex.from_product(
+                    [[symbol], df_copy.columns],
+                    names=['asset', 'feature']
+                )
+                
+                # Add to combined DataFrame
+                if combined_data.empty:
+                    combined_data = df_copy
+                else:
+                    combined_data = combined_data.join(df_copy, how='outer')
+            
+            # Make sure timestamps are sorted and handle missing values
+            combined_data.sort_index(inplace=True)
+            combined_data = combined_data.ffill()
+            
+            # Save combined data in MultiIndex format
+            combined_file = os.path.join(timeframe_dir, 'combined_data.parquet')
+            combined_data.to_parquet(combined_file)
+            
+            # Also save as CSV for easier inspection
+            csv_file = os.path.join(timeframe_dir, 'combined_data.csv')
+            combined_data.to_csv(csv_file)
+            
+            logger.info(f"Saved combined data with {len(combined_data)} rows to {combined_file}")
+            
+            # Method 2: Also create a flattened version for compatibility with some systems
+            flat_combined = pd.DataFrame()
+            
+            for symbol, df in all_dfs.items():
+                # Rename columns to include symbol
+                df_flat = df.copy()
+                df_flat.columns = [f"{symbol}_{col}" for col in df_flat.columns]
+                
+                # Add to combined DataFrame
+                if flat_combined.empty:
+                    flat_combined = df_flat
+                else:
+                    flat_combined = flat_combined.join(df_flat, how='outer')
+            
+            # Save flattened combined data
+            flat_file = os.path.join(timeframe_dir, 'flat_combined_data.parquet')
+            flat_combined.to_parquet(flat_file)
+            
+            # Also save as CSV
+            flat_csv = os.path.join(timeframe_dir, 'flat_combined_data.csv')
+            flat_combined.to_csv(flat_csv)
+            
+            logger.info(f"Saved flattened combined data with {len(flat_combined)} rows to {flat_file}")
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error creating combined data: {str(e)}")
+            return False
 
-async def main():
-    parser = argparse.ArgumentParser(description='Download market data and calculate technical indicators')
+def main():
+    """Main entry point for the script."""
+    parser = argparse.ArgumentParser(description='Market Data Backfiller')
+    
     parser.add_argument('--symbols', type=str, default='BTCUSDT,ETHUSDT,SOLUSDT',
-                        help='Comma-separated list of symbols to fetch data for')
+                       help='Comma-separated list of trading pairs')
+    
     parser.add_argument('--timeframes', type=str, default='5m',
-                        help='Comma-separated list of timeframes to fetch data for')
+                       help='Comma-separated list of timeframes')
+    
     parser.add_argument('--output-dir', type=str, default='data/market_data',
-                        help='Directory to save the downloaded data')
-    parser.add_argument('--periods', type=int, default=5000,
-                        help='Number of candlesticks to fetch per symbol')
+                       help='Directory to save data files')
+    
+    parser.add_argument('--periods', type=int, default=1000,
+                       help='Number of candles to fetch')
+    
     parser.add_argument('--exchange', type=str, default='binance',
-                        help='Exchange to fetch data from')
+                       help='Exchange to fetch data from')
     
     args = parser.parse_args()
     
-    # Create output directory if it doesn't exist
+    # Parse arguments
+    symbols = args.symbols.split(',')
+    timeframes = args.timeframes.split(',')
+    
+    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Initialize backfiller
+    # Initialize and run backfiller
     backfiller = MarketDataBackfiller(
-        symbols=args.symbols,
-        timeframes=args.timeframes,
+        symbols=symbols,
+        timeframes=timeframes,
         output_dir=args.output_dir,
         periods=args.periods,
         exchange=args.exchange
     )
     
-    # Fetch data
-    await backfiller.fetch_data()
+    success = backfiller.fetch_data()
+    
+    if success:
+        logger.info("Market data backfill completed successfully")
+    else:
+        logger.error("Market data backfill failed")
+        sys.exit(1)
 
 if __name__ == '__main__':
-    asyncio.run(main()) 
+    main() 
