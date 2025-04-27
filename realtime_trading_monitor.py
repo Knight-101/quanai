@@ -232,14 +232,25 @@ class RealTimeTradeMonitor:
     
     async def _backfill_initial_data(self):
         """Backfill initial historical data."""
-        logger.info("Backfilling initial historical data...")
+        logger.info("Loading initial historical data...")
         
         try:
+            # Check for existing data files first
+            data_loaded = await self._load_data_from_files()
+            
+            # If data was successfully loaded from files, no need to fetch from exchange
+            if data_loaded:
+                logger.info("Successfully loaded data from local files")
+                return
+            
+            # No existing data found, need to fetch from exchange
+            logger.info("No existing data files found, fetching from exchange...")
+            
             # Load markets
             await self.exchange.load_markets()
             
             # Get backfill periods from config
-            backfill_periods = self.config.get('data', {}).get('backfill_periods', 1000)
+            backfill_periods = self.config.get('data', {}).get('backfill_periods', 5000)
             
             # Fetch data for each symbol
             for symbol in self.symbols:
@@ -270,6 +281,72 @@ class RealTimeTradeMonitor:
         except Exception as e:
             logger.error(f"Error backfilling initial data: {str(e)}")
             logger.error(traceback.format_exc())
+    
+    async def _load_data_from_files(self) -> bool:
+        """
+        Load market data from local files.
+        
+        Returns:
+            bool: True if data was successfully loaded, False otherwise
+        """
+        try:
+            # First, check for combined data file
+            combined_path = f"data/market_data/{self.timeframe}/combined_data.parquet"
+            if os.path.exists(combined_path):
+                logger.info(f"Found combined data file: {combined_path}")
+                
+                # Load combined data
+                combined_df = pd.read_parquet(combined_path)
+                
+                # Split into separate DataFrames for each symbol
+                for symbol in self.symbols:
+                    if (symbol,) in combined_df.columns.levels[0]:
+                        # Extract symbol data
+                        symbol_cols = [col for col in combined_df.columns if col[0] == symbol]
+                        df = combined_df[symbol_cols].copy()
+                        
+                        # Flatten multi-index columns
+                        df.columns = [col[1] for col in df.columns]
+                        
+                        # Store in market_data
+                        self.market_data[symbol] = df
+                        logger.info(f"Loaded {len(df)} rows for {symbol} from combined file")
+                    else:
+                        logger.warning(f"Symbol {symbol} not found in combined data file")
+                
+                # Return True if we loaded data for at least one symbol
+                return any(not df.empty for df in self.market_data.values())
+            
+            # If no combined file, check for individual files
+            logger.info("No combined file found, checking for individual files")
+            
+            data_loaded = False
+            for symbol in self.symbols:
+                # Check for parquet file first (faster)
+                parquet_path = f"data/market_data/{self.timeframe}/{symbol}.parquet"
+                csv_path = f"data/market_data/{self.timeframe}/{symbol}.csv"
+                
+                if os.path.exists(parquet_path):
+                    df = pd.read_parquet(parquet_path)
+                    logger.info(f"Loaded {len(df)} rows for {symbol} from {parquet_path}")
+                    self.market_data[symbol] = df
+                    data_loaded = True
+                elif os.path.exists(csv_path):
+                    df = pd.read_csv(csv_path)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df.set_index('timestamp', inplace=True)
+                    logger.info(f"Loaded {len(df)} rows for {symbol} from {csv_path}")
+                    self.market_data[symbol] = df
+                    data_loaded = True
+                else:
+                    logger.warning(f"No data file found for {symbol}")
+            
+            return data_loaded
+            
+        except Exception as e:
+            logger.error(f"Error loading data from files: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
     
     def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate technical indicators for a DataFrame."""
