@@ -866,15 +866,18 @@ class RLLMExplainer:
         Returns:
             DataFrame with all required indicators
         """
+        # Make a copy of the DataFrame to avoid warnings
+        data = market_data.copy()
+        
         # Ensure we have all base features
         for feat in base_features:
-            if feat not in market_data.columns:
-                if 'close' in market_data.columns:
+            if feat not in data.columns:
+                if 'close' in data.columns:
                     # Use close price as fallback
-                    market_data[feat] = market_data['close']
+                    data.loc[:, feat] = data['close']
                 else:
                     # Create placeholder data
-                    market_data[feat] = np.ones(len(market_data))
+                    data.loc[:, feat] = np.ones(len(data))
                     
         # Calculate technical indicators with better error handling
         try:
@@ -882,107 +885,110 @@ class RLLMExplainer:
             from ta.momentum import RSIIndicator
             from ta.volatility import BollingerBands, AverageTrueRange
             
-            close_series = market_data['close']
-            high_series = market_data['high']
-            low_series = market_data['low']
+            close_series = data['close']
+            high_series = data['high']
+            low_series = data['low']
             
             # RSI
-            if 'rsi' not in market_data.columns:
+            if 'rsi' not in data.columns:
                 try:
                     rsi = RSIIndicator(close=close_series).rsi()
-                    market_data['rsi'] = rsi
+                    data.loc[:, 'rsi'] = rsi
                 except Exception as e:
                     logger.warning(f"Error calculating RSI: {e}")
-                    market_data['rsi'] = 50.0  # Neutral RSI value
+                    data.loc[:, 'rsi'] = 50.0  # Neutral RSI value
             
             # MACD
-            if 'macd' not in market_data.columns or 'macd_signal' not in market_data.columns:
+            if 'macd' not in data.columns or 'macd_signal' not in data.columns:
                 try:
                     macd_indicator = MACD(close=close_series)
-                    market_data['macd'] = macd_indicator.macd()
-                    market_data['macd_signal'] = macd_indicator.macd_signal()
+                    data.loc[:, 'macd'] = macd_indicator.macd()
+                    data.loc[:, 'macd_signal'] = macd_indicator.macd_signal()
                 except Exception as e:
                     logger.warning(f"Error calculating MACD: {e}")
-                    market_data['macd'] = 0.0
-                    market_data['macd_signal'] = 0.0
+                    data.loc[:, 'macd'] = 0.0
+                    data.loc[:, 'macd_signal'] = 0.0
             
             # Bollinger Bands
-            if 'bb_upper' not in market_data.columns or 'bb_middle' not in market_data.columns or 'bb_lower' not in market_data.columns:
+            if 'bb_upper' not in data.columns or 'bb_middle' not in data.columns or 'bb_lower' not in data.columns:
                 try:
                     bb = BollingerBands(close=close_series)
-                    market_data['bb_upper'] = bb.bollinger_hband()
-                    market_data['bb_middle'] = bb.bollinger_mavg()
-                    market_data['bb_lower'] = bb.bollinger_lband()
+                    data.loc[:, 'bb_upper'] = bb.bollinger_hband()
+                    data.loc[:, 'bb_middle'] = bb.bollinger_mavg()
+                    data.loc[:, 'bb_lower'] = bb.bollinger_lband()
                 except Exception as e:
                     logger.warning(f"Error calculating Bollinger Bands: {e}")
                     # Use close price with offsets as fallback
-                    market_data['bb_middle'] = close_series
-                    market_data['bb_upper'] = close_series * 1.02  # 2% above
-                    market_data['bb_lower'] = close_series * 0.98  # 2% below
+                    data.loc[:, 'bb_middle'] = close_series
+                    data.loc[:, 'bb_upper'] = close_series * 1.02  # 2% above
+                    data.loc[:, 'bb_lower'] = close_series * 0.98  # 2% below
             
             # SMAs
-            if 'sma_10' not in market_data.columns:
+            if 'sma_10' not in data.columns:
                 try:
-                    market_data['sma_10'] = SMAIndicator(close=close_series, window=10).sma_indicator()
+                    data.loc[:, 'sma_10'] = SMAIndicator(close=close_series, window=10).sma_indicator()
                 except Exception as e:
                     logger.warning(f"Error calculating SMA(10): {e}")
-                    market_data['sma_10'] = close_series
+                    data.loc[:, 'sma_10'] = close_series
                     
-            if 'sma_20' not in market_data.columns:
+            if 'sma_20' not in data.columns:
                 try:
-                    market_data['sma_20'] = SMAIndicator(close=close_series, window=20).sma_indicator()
+                    data.loc[:, 'sma_20'] = SMAIndicator(close=close_series, window=20).sma_indicator()
                 except Exception as e:
                     logger.warning(f"Error calculating SMA(20): {e}")
-                    market_data['sma_20'] = close_series
+                    data.loc[:, 'sma_20'] = close_series
             
             # Returns
-            if 'returns_1d' not in market_data.columns:
-                market_data['returns_1d'] = close_series.pct_change(1).fillna(0)
+            if 'returns_1d' not in data.columns:
+                data.loc[:, 'returns_1d'] = close_series.pct_change(1).fillna(0)
                 
-            if 'returns_5d' not in market_data.columns:
-                market_data['returns_5d'] = close_series.pct_change(5).fillna(0)
+            if 'returns_5d' not in data.columns:
+                data.loc[:, 'returns_5d'] = close_series.pct_change(5).fillna(0)
                 
-            if 'returns_10d' not in market_data.columns:
-                market_data['returns_10d'] = close_series.pct_change(10).fillna(0)
+            if 'returns_10d' not in data.columns:
+                data.loc[:, 'returns_10d'] = close_series.pct_change(10).fillna(0)
             
             # Volatility
-            if 'volatility_5d' not in market_data.columns:
-                market_data['volatility_5d'] = market_data['returns_1d'].rolling(5).std().fillna(0)
+            if 'volatility_5d' not in data.columns:
+                returns_1d = data['returns_1d']
+                data.loc[:, 'volatility_5d'] = returns_1d.rolling(5).std().fillna(0)
                 
-            if 'volatility_10d' not in market_data.columns:
-                market_data['volatility_10d'] = market_data['returns_1d'].rolling(10).std().fillna(0)
+            if 'volatility_10d' not in data.columns:
+                returns_1d = data['returns_1d']
+                data.loc[:, 'volatility_10d'] = returns_1d.rolling(10).std().fillna(0)
             
             # Average True Range - error happens here most often
-            if 'atr' not in market_data.columns:
+            if 'atr' not in data.columns:
                 try:
                     # Ensure data is sufficient for ATR calculation - needs at least 14 data points
-                    if len(market_data) >= 14:
-                        market_data['atr'] = AverageTrueRange(
+                    if len(data) >= 14:
+                        atr_values = AverageTrueRange(
                             high=high_series, 
                             low=low_series, 
                             close=close_series,
                             window=14
                         ).average_true_range()
+                        data.loc[:, 'atr'] = atr_values
                     else:
                         # Not enough data for ATR calculation, use simplified formula
                         logger.warning(f"Not enough data for ATR calculation, using simplified approach")
-                        market_data['atr'] = (high_series - low_series).mean()
+                        data.loc[:, 'atr'] = (high_series - low_series).mean()
                 except Exception as e:
                     logger.warning(f"Error calculating ATR: {e}")
                     # Use a basic volatility measure as fallback
-                    market_data['atr'] = (high_series - low_series).mean()
+                    data.loc[:, 'atr'] = (high_series - low_series).mean()
             
             # Handle NaN values
-            market_data = market_data.fillna(0)
+            data = data.fillna(0)
             
         except Exception as e:
             logger.error(f"Error calculating indicators: {e}")
             # Set default values for all technical features
             for feat in tech_features:
-                if feat not in market_data.columns:
-                    market_data[feat] = 0.0
+                if feat not in data.columns:
+                    data.loc[:, feat] = 0.0
         
-        return market_data
+        return data
 
     def _generate_rl_action(self, observation: Union[np.ndarray, Dict[str, np.ndarray]], market_data: pd.DataFrame, asset_name: str) -> float:
         """

@@ -1,0 +1,86 @@
+# Real-time Trading Monitor Configuration
+
+# Trading parameters
+trading:
+  # Transaction costs (fees)
+  commission: 0.0004
+  
+  # Signal threshold for generating trades
+  signal_threshold: 0.1
+  
+  # Cooldown time between trades (minutes)
+  trade_cooldown_minutes: 15
+  
+  # Position management
+  max_positions: 3
+  position_sizing_method: "equal"  # Options: equal, volatility, confidence
+  
+  # Risk management
+  use_stop_loss: true
+  stop_loss_pct: 0.1  # 10% stop loss
+  use_take_profit: true
+  take_profit_pct: 0.2  # 20% take profit
+  
+  # Confidence thresholds for trade execution
+  min_trade_confidence: 0.2
+  strong_signal_threshold: 0.6
+
+# Data parameters
+data:
+  # Number of periods to backfill initially
+  backfill_periods: 1000
+  
+  # Data update interval (seconds)
+  update_interval: 30
+  
+  # Technical indicators to calculate
+  indicators:
+    - sma_10
+    - sma_20
+    - ema_12
+    - ema_26
+    - macd
+    - macd_signal
+    - rsi
+    - bb_upper
+    - bb_middle
+    - bb_lower
+    - atr
+
+# Logging parameters
+logging:
+  # Position logging interval (minutes)
+  position_log_interval: 15
+  
+  # Commentary generation interval (minutes)
+  commentary_interval: 15
+  
+  # Trade history limit
+  max_trade_history: 1000
+  
+  # Debug level
+  level: "INFO"
+
+# LLM parameters
+llm:
+  # Maximum tokens for commentary
+  max_tokens_asset: 500
+  max_tokens_summary: 750
+  
+  # Temperature for generation
+  temperature: 0.7
+  
+  # Commentary style
+  style: "detailed"  # Options: concise, detailed, comprehensive
+
+# Exchange parameters
+exchange:
+  # Exchange to use
+  name: "binance"
+  
+  # API rate limit (ms)
+  rate_limit: 1000
+  
+  # Connection retry settings
+  max_retries: 3
+  retry_delay: 5 
