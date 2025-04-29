@@ -32,6 +32,7 @@ import signal
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 import ccxt.async_support as ccxt_async
+import ta
 
 # Local imports - modify paths as needed
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -296,472 +297,502 @@ class RealTimeTradeMonitor:
                 }
             }
     
-    async def setup(self):
-        """Set up the real-time trading monitor."""
-        logger.info("Setting up real-time trading monitor...")
-        
-        # Initialize exchange
-        self.exchange = ccxt_async.binanceus({
-            'options': {
-                'defaultType': 'future',
-                'defaultMarket': 'linear',
-                'defaultMarginMode': 'cross'
-            },
-            'enableRateLimit': True
-        })
-        
-        # Load the RL model
+    def setup(self):
+        """
+        Set up the trading environment and prepare for trading.
+        """
         try:
-            logger.info(f"Loading RL model from {self.rl_model_path}")
-            self.rl_model = PPO.load(self.rl_model_path)
-            logger.info("RL model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading RL model: {str(e)}")
-            raise
-        
-        # Load the LLM model
-        try:
-            logger.info(f"Loading LLM model from {self.llm_model_path}")
-            self.llm_model = TradingLLM.load_from_pretrained(
-                model_dir=self.llm_model_path,
-                base_model=self.llm_base_model
-            )
-            logger.info("LLM model loaded successfully")
+            self.logger.info("Setting up the trading environment")
             
-            # Initialize chatbot
-            self.chatbot = MarketChatbot(
-                llm_model=self.llm_model,
-                asset_names=self.symbols
-            )
+            # Create necessary directories if they don't exist
+            os.makedirs(self.config['market_data_dir'], exist_ok=True)
+            os.makedirs(self.config['log_dir'], exist_ok=True)
             
-            # Initialize commentary generator
-            self.commentary_generator = MarketCommentaryGenerator(
-                llm_model_path=self.llm_model_path,
-                llm_base_model=self.llm_base_model
-            )
-        except Exception as e:
-            logger.error(f"Error loading LLM model: {str(e)}")
-            logger.warning("Will continue without LLM capabilities")
-        
-        # Backfill initial data
-        await self._backfill_initial_data()
-        
-        # Initialize trading environment for full position management
-        try:
-            # Create a combined DataFrame with proper MultiIndex structure from real market data
-            combined_data = pd.concat([self.market_data[symbol] for symbol in self.symbols 
-                                      if not self.market_data[symbol].empty], axis=1)
+            # Backfill initial data if needed
+            if self.config.get('backfill_initial_data', True):
+                self._backfill_initial_data()
             
-            if combined_data.empty:
-                logger.error("No market data available for initializing environment")
-                raise ValueError("Cannot initialize trading environment without market data")
-            
-            logger.info(f"Combined data shape: {combined_data.shape}, Index: {type(combined_data.index)}")
-            logger.info(f"Combined data columns: {combined_data.columns}")
-            
-            # Make sure our index is a DateTimeIndex sorted in ascending order
-            if not isinstance(combined_data.index, pd.DatetimeIndex):
-                logger.warning("Converting index to DatetimeIndex")
-                combined_data.index = pd.to_datetime(combined_data.index)
-            
-            # Sort the index to ensure chronological order
-            combined_data = combined_data.sort_index()
-            
-            # Set up last_prices dictionary with the latest prices
-            last_prices = {}
-            for symbol in self.symbols:
-                if not self.market_data[symbol].empty:
-                    last_prices[symbol] = float(self.market_data[symbol][(symbol, 'close')].iloc[-1])
-                    logger.info(f"Initial price for {symbol}: {last_prices[symbol]}")
-            
-            # CRITICAL FIX: Set the environment's window_size to match our data
-            window_size = min(100, max(10, len(combined_data) - 1))
-            logger.info(f"Using window_size of {window_size} with {len(combined_data)} data points")
-            
-            # Create environment config with careful initialization
-            env_config = {
-                'df': combined_data,
-                'assets': self.symbols,
-                'window_size': window_size,
-                'initial_balance': self.initial_balance,
-                'max_leverage': self.max_leverage,
-                'commission': self.commission,
-                'funding_fee_multiplier': 1.0,
-                'max_drawdown': 0.3,
-                'maintenance_margin': 0.1,
-                'verbose': True,
-                'training_mode': False,
-                'max_steps': len(combined_data) + 1000  # Allow for future growth
-            }
-            
-            # Add any additional configuration from self.config
-            if 'trading_env' in self.config:
-                for key, value in self.config['trading_env'].items():
-                    if key in ['window_size', 'max_leverage', 'commission', 'funding_fee_multiplier', 
-                              'base_features', 'tech_features', 'risk_free_rate', 'initial_balance',
-                              'max_drawdown', 'maintenance_margin', 'max_steps', 'max_no_trade_steps', 
-                              'enforce_min_leverage', 'verbose', 'training_mode']:
-                        env_config[key] = value
-            
-            # Create risk limits
-            risk_limits = {
-                'max_position_value_usd': 0.8 * self.initial_balance,
-                'max_portfolio_leverage': self.max_leverage * 0.9,
-                'max_portfolio_drawdown_pct': 0.3,
-                'max_single_order_value_usd': 0.5 * self.initial_balance,
-                'max_portfolio_value_usd': 2.0 * self.initial_balance,
-                'min_available_balance_pct': 0.1,
-            }
-            
-            # Log config
-            logger.info("Initializing institutional perpetual environment with config:")
-            for key, value in env_config.items():
-                if key != 'df':  # Don't log the entire DataFrame
-                    logger.info(f"  {key}: {value}")
+            # Load market data from files if available
+            self.market_data = {}
+            for timeframe in self.config.get('timeframes', ['5m']):
+                df = self._load_data_from_files(timeframe)
+                if not df.empty:
+                    self.market_data[timeframe] = df
+                    self.logger.info(f"Loaded market data for timeframe {timeframe} with shape {df.shape}")
                 else:
-                    logger.info(f"  df: DataFrame with {len(value)} rows, columns: {value.columns.names}")
+                    self.logger.warning(f"No market data loaded for timeframe {timeframe}")
             
-            logger.info(f"Risk limits: {risk_limits}")
+            # Initialize the trading environment
+            timeframe = self.config.get('timeframe', '5m')
             
-            # Initialize the environment
-            self.trading_env = InstitutionalPerpetualEnv(**env_config)
+            if timeframe not in self.market_data or self.market_data[timeframe].empty:
+                raise ValueError(f"No market data available for timeframe {timeframe}")
             
-            # CRITICAL FIX: Manually set current_step to the end of data minus 1
-            # This ensures we're pointing to valid data but still have room to increment
-            self.trading_env.current_step = len(combined_data) - 1
-            logger.info(f"Set environment current_step to {self.trading_env.current_step}")
+            df = self.market_data[timeframe]
             
-            # Initialize last_prices in the environment
-            self.trading_env.last_prices = last_prices
-            
-            # Create update_market_price method if it doesn't exist
-            if not hasattr(self.trading_env, 'update_market_price'):
-                def update_market_price(self_env, asset, price):
-                    """Update the mark price for an asset"""
-                    self_env.last_prices[asset] = float(price)
-                    logger.debug(f"Updated market price for {asset}: {price}")
+            # Set up environment configuration
+            env_config = {
+                # Risk management parameters
+                'max_position_value_usd': self.config.get('max_position_value_usd', 1000),
+                'max_portfolio_leverage': self.config.get('max_portfolio_leverage', 1.0),
+                'max_portfolio_drawdown_pct': self.config.get('max_portfolio_drawdown_pct', 5.0),
+                'position_sizing_method': self.config.get('position_sizing_method', 'fixed_notional'),
+                'initial_capital': self.config.get('initial_capital', 10000),
                 
-                # Add the method to the environment instance
-                import types
-                self.trading_env.update_market_price = types.MethodType(update_market_price, self.trading_env)
+                # Trade execution settings
+                'use_market_orders': self.config.get('use_market_orders', True),
+                'market_order_slippage_pct': self.config.get('market_order_slippage_pct', 0.05),
+                'timeframe': timeframe,
+                'trading_symbols': self.symbols,
+                
+                # ML model settings if enabled
+                'use_ml_model': self.config.get('use_ml_model', False),
+                'ml_model_path': self.config.get('ml_model_path', None),
+                'feature_config': self.config.get('feature_config', {}),
+                
+                # General settings
+                'verbose': self.config.get('verbose', 1)
+            }
             
-            # Initialize risk engine explicitly with risk limits
-            if hasattr(self.trading_env, 'initialize_risk_engine'):
-                try:
-                    self.trading_env.initialize_risk_engine(risk_limits=risk_limits)
-                    logger.info("Risk engine initialized with custom limits")
-                except Exception as e:
-                    logger.error(f"Error initializing risk engine with params: {e}")
-                    logger.warning("Attempting to initialize risk engine without parameters")
-                    self.trading_env.initialize_risk_engine()
+            self.logger.info(f"Environment config: {json.dumps(env_config, indent=2)}")
             
-            # Initialize market conditions
-            if hasattr(self.trading_env, 'initialize_market_conditions'):
-                self.trading_env.initialize_market_conditions()
-                logger.info("Market conditions initialized")
+            # Initialize the environment with our market data
+            try:
+                self.env = InstitutionalPerpetualEnv(df=df, **env_config)
+                self.logger.info("Environment initialized successfully")
+                
+                # Store initial step position for future reference
+                self.initial_step = self.env.current_step
+                self.logger.info(f"Initial environment step set to {self.initial_step}")
+                
+            except Exception as e:
+                self.logger.error(f"Error initializing environment: {str(e)}")
+                self.logger.error(traceback.format_exc())
+                raise
             
-            # Test access to prices to verify environment is working
-            for symbol in self.symbols:
-                try:
-                    price = self.trading_env._get_mark_price(symbol)
-                    logger.info(f"Successfully accessed price for {symbol}: {price}")
-                except Exception as e:
-                    logger.error(f"Error accessing price for {symbol}: {e}")
+            # Initialize the trading client if real trading is enabled
+            if self.config.get('real_trading', False):
+                self._init_trading_client()
             
-            # Reset the environment to ensure proper initialization
-            self.trading_env.reset()
-            
-            logger.info("Trading environment initialized with historical market data")
-            
-            # Log initial state
-            if hasattr(self.trading_env, 'get_state'):
-                initial_state = self.trading_env.get_state()
-                logger.info(f"Initial balance: ${initial_state['balance']:.2f}")
-                logger.info(f"Initial positions: {len([p for p in initial_state['positions'].values() if p['size'] != 0])}")
+            # We're ready to start trading
+            self.logger.info("Trading environment setup complete")
+            return True
             
         except Exception as e:
-            logger.error(f"Error initializing trading environment: {str(e)}")
-            logger.warning("Will use simplified position management")
-            logger.error(traceback.format_exc())
-            self.trading_env = None
-        
-        logger.info("Real-time trading monitor setup complete")
+            self.logger.error(f"Error during setup: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return False
     
-    async def _backfill_initial_data(self):
-        """Backfill initial historical data."""
-        logger.info("Loading initial historical data...")
+    def _backfill_initial_data(self, timeframe):
+        """
+        Backfill initial market data from exchange or load from files if available.
+        
+        Args:
+            timeframe (str): Timeframe to backfill data for (e.g., '5m')
+        """
+        self.logger.info(f"Backfilling initial {timeframe} data")
+        
+        # Try to load existing data first
+        data_dir = os.path.join('data', 'market_data', timeframe)
+        combined_file = os.path.join(data_dir, f'combined_{timeframe}.parquet')
         
         try:
-            # Check for existing data files first
-            data_loaded = await self._load_data_from_files()
-            
-            # If data was successfully loaded from files, no need to fetch from exchange
-            if data_loaded:
-                logger.info("Successfully loaded data from local files")
-                return
-            
-            # No existing data found, need to fetch from exchange
-            logger.info("No existing data files found, fetching from exchange...")
-            
-            # Load markets
-            await self.exchange.load_markets()
-            
-            # Get backfill periods from config
-            backfill_periods = self.config.get('data', {}).get('backfill_periods', 5000)
-            
-            # Fetch data for each symbol
-            for symbol in self.symbols:
-                ohlcv = await self.exchange.fetch_ohlcv(
+            if os.path.exists(combined_file):
+                self.logger.info(f"Loading existing combined data from {combined_file}")
+                all_data = pd.read_parquet(combined_file)
+                
+                # Check if the data has MultiIndex columns
+                if not isinstance(all_data.columns, pd.MultiIndex):
+                    self.logger.warning("Converting loaded data to MultiIndex format")
+                    # Create appropriate MultiIndex columns
+                    columns = all_data.columns
+                    unique_symbols = list(set([col.split('_')[0] for col in columns if '_' in col]))
+                    
+                    # Extract base columns like 'open', 'high', etc.
+                    base_columns = set()
+                    for col in columns:
+                        parts = col.split('_')
+                        if parts[0] in self.symbols:
+                            base_columns.add('_'.join(parts[1:]))
+                    
+                    # Create MultiIndex columns
+                    mi_columns = pd.MultiIndex.from_product([unique_symbols, list(base_columns)])
+                    new_df = pd.DataFrame(index=all_data.index, columns=mi_columns)
+                    
+                    # Copy data to the new DataFrame
+                    for col in columns:
+                        parts = col.split('_')
+                        if parts[0] in self.symbols:
+                            symbol = parts[0]
+                            feature = '_'.join(parts[1:])
+                            new_df[(symbol, feature)] = all_data[col]
+                    
+                    all_data = new_df
+                
+                # Log the latest price for each symbol
+                for symbol in self.symbols:
+                    if (symbol, 'close') in all_data.columns:
+                        latest_close = all_data[(symbol, 'close')].iloc[-1]
+                        self.logger.info(f"Latest {symbol} close price: {latest_close}")
+                    else:
+                        self.logger.warning(f"Column ({symbol}, 'close') not found in data")
+                
+                return all_data
+        except Exception as e:
+            self.logger.error(f"Error loading existing data: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            # Continue to fetch data from exchange
+        
+        # If we couldn't load data or it doesn't exist, fetch from exchange
+        self.logger.info("No existing data found or error loading. Fetching from exchange.")
+        
+        # Create a dictionary to store data for each symbol
+        all_symbol_data = {}
+        
+        # Fetch data for each symbol
+        for symbol in self.symbols:
+            try:
+                # Get OHLCV data
+                self.logger.info(f"Fetching {symbol} {timeframe} data from exchange")
+                since = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)  # Last 30 days
+                
+                # Use ccxt to fetch OHLCV data
+                ohlcv = self.exchange.fetch_ohlcv(
                     symbol, 
-                    self.timeframe, 
-                    limit=backfill_periods
+                    timeframe=timeframe,
+                    since=since, 
+                    limit=1000  # Adjust based on exchange limits
                 )
                 
-                if not ohlcv:
-                    logger.warning(f"No historical data found for {symbol}")
-                    continue
-                
+                # Convert to DataFrame
                 df = pd.DataFrame(
                     ohlcv, 
                     columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
                 )
+                
+                # Convert timestamp to datetime
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df.set_index('timestamp', inplace=True)
                 
-                # Calculate basic technical indicators
-                df = self._calculate_indicators(df)
+                # Calculate indicators
+                df = self._calculate_indicators(df, symbol)
                 
-                # Convert to MultiIndex format for the environment
-                # Get column names and data values
-                columns = df.columns
-                values = df.values
+                # Store in dictionary
+                all_symbol_data[symbol] = df
                 
-                # Create MultiIndex columns
-                multi_columns = pd.MultiIndex.from_product(
-                    [[symbol], columns],
-                    names=['asset', 'feature']
-                )
-                
-                # Create DataFrame with proper MultiIndex columns
-                multi_df = pd.DataFrame(
-                    values, 
-                    index=df.index,
-                    columns=multi_columns
-                )
-                
-                self.market_data[symbol] = multi_df
-                logger.info(f"Backfilled {len(df)} periods for {symbol}")
-                logger.info(f"Latest {symbol} price: {df['close'].iloc[-1]}")
+                self.logger.info(f"Fetched {len(df)} {timeframe} candles for {symbol}")
+            except Exception as e:
+                self.logger.error(f"Error fetching data for {symbol}: {str(e)}")
+                self.logger.error(traceback.format_exc())
+        
+        # Combine data for all symbols into a MultiIndex DataFrame
+        if all_symbol_data:
+            # Create an empty DataFrame to store combined data
+            all_data = None
             
-            # Save the fetched data to files for future use
-            self._save_market_data_to_files()
+            for symbol, df in all_symbol_data.items():
+                # Create a MultiIndex DataFrame for each symbol
+                columns = pd.MultiIndex.from_product([[symbol], df.columns])
+                symbol_df = pd.DataFrame(df.values, index=df.index, columns=columns)
+                
+                if all_data is None:
+                    all_data = symbol_df
+                else:
+                    # Merge with existing data
+                    all_data = all_data.join(symbol_df, how='outer')
             
-            logger.info("Initial data backfill complete")
-        except Exception as e:
-            logger.error(f"Error backfilling initial data: {str(e)}")
-            logger.error(traceback.format_exc())
+            # Sort by timestamp and fill NaN values
+            if all_data is not None:
+                all_data.sort_index(inplace=True)
+                all_data.fillna(method='ffill', inplace=True)
+                
+                # Save the data to files
+                self._save_market_data_to_files(all_data, timeframe)
+                
+                return all_data
+        
+        return None
     
-    def _save_market_data_to_files(self):
-        """Save market data to files for future use in the correct MultiIndex format."""
+    def _save_market_data_to_files(self, df, timeframe):
+        """
+        Save market data to files with proper MultiIndex format.
+        
+        Args:
+            df: DataFrame with MultiIndex columns to save
+            timeframe: Timeframe of the data
+        """
         try:
-            data_dir = os.path.join('data/market_data', self.timeframe)
+            # Ensure the data directory exists
+            data_dir = os.path.join(self.config['market_data_dir'], timeframe)
             os.makedirs(data_dir, exist_ok=True)
             
-            # Save individual symbol data
-            for symbol in self.symbols:
-                if not self.market_data[symbol].empty:
-                    symbol_file = os.path.join(data_dir, f"{symbol}.parquet")
+            # Verify we have a MultiIndex DataFrame
+            if not isinstance(df.columns, pd.MultiIndex):
+                self.logger.warning("DataFrame does not have MultiIndex columns - attempting to fix")
+                
+                # Try to convert to MultiIndex if possible
+                columns = df.columns
+                if any('_' in col for col in columns):
+                    tuples = [col.split('_', 1) for col in columns]
+                    df.columns = pd.MultiIndex.from_tuples(tuples)
+                else:
+                    # If no underscore pattern exists, we can't auto-fix
+                    self.logger.error("Cannot convert DataFrame to MultiIndex format - columns lack pattern")
+                    return False
+            
+            # Save the combined MultiIndex data
+            multi_index_file = os.path.join(data_dir, "multi_index_data.parquet")
+            self.logger.info(f"Saving MultiIndex data to {multi_index_file}")
+            df.to_parquet(multi_index_file)
+            
+            # Also save as CSV for easier inspection
+            csv_file = os.path.join(data_dir, "multi_index_data.csv")
+            df.to_csv(csv_file)
+            
+            # Also save individual files per symbol
+            symbols = list(set([col[0] for col in df.columns]))
+            for symbol in symbols:
+                symbol_data = df.loc[:, (symbol, slice(None))]
+                
+                if not symbol_data.empty:
+                    # Create a clean filename
+                    clean_symbol = symbol.replace('/', '')
+                    symbol_file = os.path.join(data_dir, f"{clean_symbol}.parquet")
+                    self.logger.info(f"Saving data for {symbol} to {symbol_file}")
+                    symbol_data.to_parquet(symbol_file)
                     
-                    # Verify it has MultiIndex columns before saving
-                    if not isinstance(self.market_data[symbol].columns, pd.MultiIndex):
-                        logger.warning(f"DataFrame for {symbol} doesn't have MultiIndex columns - fixing before saving")
-                        
-                        # This shouldn't happen with our current code, but just in case
-                        # Get column names and data values
-                        df = self.market_data[symbol]
-                        columns = df.columns
-                        values = df.values
-                        
-                        # Create MultiIndex columns
-                        multi_columns = pd.MultiIndex.from_product(
-                            [[symbol], columns],
-                            names=['asset', 'feature']
-                        )
-                        
-                        # Create DataFrame with proper MultiIndex columns
-                        multi_df = pd.DataFrame(
-                            values, 
-                            index=df.index,
-                            columns=multi_columns
-                        )
-                        
-                        # Replace DataFrame with MultiIndex version
-                        self.market_data[symbol] = multi_df
-                    
-                    # Now save to file
-                    self.market_data[symbol].to_parquet(symbol_file)
-                    logger.info(f"Saved market data for {symbol} to {symbol_file}")
+                    # Also save as CSV for easier inspection
+                    csv_symbol_file = os.path.join(data_dir, f"{clean_symbol}.csv")
+                    symbol_data.to_csv(csv_symbol_file)
             
-            # Save combined data for future use
-            combined_data = pd.concat([self.market_data[symbol] for symbol in self.symbols 
-                                      if not self.market_data[symbol].empty], axis=1)
-            
-            if not combined_data.empty:
-                combined_file = os.path.join(data_dir, 'combined_data.parquet')
-                combined_data.to_parquet(combined_file)
-                logger.info(f"Saved combined market data to {combined_file}")
-            
+            return True
         except Exception as e:
-            logger.error(f"Error saving market data to files: {str(e)}")
-            logger.error(traceback.format_exc())
+            self.logger.error(f"Error saving market data to files: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return False
     
-    async def _load_data_from_files(self) -> bool:
-        """Load market data from existing files."""
-        try:
-            data_dir = os.path.join('data/market_data', self.timeframe)
+    def _load_data_from_files(self, timeframe=None):
+        """
+        Load market data from files for the specified timeframe.
+        
+        Args:
+            timeframe: Specific timeframe to load, or None for all timeframes
+        
+        Returns:
+            bool: True if data was successfully loaded, False otherwise
+        """
+        if timeframe is None:
+            timeframes = self.config.get('timeframes', ['5m'])
+        else:
+            timeframes = [timeframe]
+        
+        success = False
+        
+        for tf in timeframes:
+            data_dir = os.path.join(self.config['market_data_dir'], tf)
             
+            # Check if directory exists
             if not os.path.exists(data_dir):
-                logger.warning(f"Market data directory not found: {data_dir}")
-                return False
+                self.logger.warning(f"Data directory does not exist: {data_dir}")
+                continue
             
-            # Load individual symbol data
+            # Try to load multi-index data file first
+            multi_index_file = os.path.join(data_dir, "multi_index_data.parquet")
+            if os.path.exists(multi_index_file):
+                try:
+                    self.logger.info(f"Loading multi-index data from {multi_index_file}")
+                    df = pd.read_parquet(multi_index_file)
+                    
+                    # Ensure the DataFrame has MultiIndex columns
+                    if not isinstance(df.columns, pd.MultiIndex):
+                        self.logger.warning(f"File {multi_index_file} doesn't have MultiIndex columns - attempting to fix")
+                        
+                        # Try to convert to MultiIndex if possible
+                        columns = df.columns
+                        tuples = [col if isinstance(col, tuple) else (col.split('_')[0], '_'.join(col.split('_')[1:])) 
+                                  for col in columns]
+                        df.columns = pd.MultiIndex.from_tuples(tuples)
+                    
+                    # Ensure the index is a DateTimeIndex
+                    if not isinstance(df.index, pd.DatetimeIndex):
+                        df.index = pd.to_datetime(df.index)
+                    
+                    # Sort by timestamp
+                    df = df.sort_index()
+                    
+                    # Store in market_data dictionary
+                    self.market_data[tf] = df
+                    self.logger.info(f"Successfully loaded {len(df)} rows for timeframe {tf}")
+                    
+                    # Log info about loaded data
+                    symbols = list(set([col[0] for col in df.columns]))
+                    self.logger.info(f"Loaded data for symbols: {symbols}")
+                    for symbol in symbols:
+                        if (symbol, 'close') in df.columns:
+                            self.logger.info(f"Latest price for {symbol}: {df[(symbol, 'close')].iloc[-1]}")
+                    
+                    success = True
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error loading multi-index data: {str(e)}")
+                    self.logger.error(traceback.format_exc())
+            
+            # If multi-index file doesn't exist, try to load individual symbol files
+            self.logger.info(f"No multi-index file found, trying to load individual symbol files")
+            
+            combined_data = None
             for symbol in self.symbols:
                 symbol_file = os.path.join(data_dir, f"{symbol}.parquet")
                 
-                if os.path.exists(symbol_file):
-                    df = pd.read_parquet(symbol_file)
-                    
-                    # CRITICAL FIX: Check if the loaded DataFrame already has MultiIndex columns
-                    if not isinstance(df.columns, pd.MultiIndex):
-                        logger.info(f"Converting {symbol} data to MultiIndex format")
-                        
-                        # Ensure DataFrame has expected columns
-                        required_columns = ['open', 'high', 'low', 'close', 'volume']
-                        if not all(col in df.columns for col in required_columns):
-                            logger.warning(f"Symbol data for {symbol} is missing required columns.")
-                            continue
-                        
-                        # Get column names and data values
-                        columns = df.columns
-                        values = df.values
-                        
-                        # Create MultiIndex columns
-                        multi_columns = pd.MultiIndex.from_product(
-                            [[symbol], columns],
-                            names=['asset', 'feature']
-                        )
-                        
-                        # Create DataFrame with proper MultiIndex columns
-                        multi_df = pd.DataFrame(
-                            values, 
-                            index=df.index,
-                            columns=multi_columns
-                        )
-                        
-                        # Replace DataFrame with MultiIndex version
-                        df = multi_df
-                    
-                    # Ensure index is DateTimeIndex and sorted
-                    if not isinstance(df.index, pd.DatetimeIndex):
-                        df.index = pd.to_datetime(df.index)
-                    df = df.sort_index()
-                    
-                    # Store in market_data
-                    self.market_data[symbol] = df
-                    logger.info(f"Loaded market data for {symbol} with {len(df)} rows")
-                    logger.info(f"Data columns format: {type(df.columns)}")
-                    logger.info(f"Sample column names: {df.columns[:5]}")
-                else:
-                    logger.warning(f"Symbol data file not found: {symbol_file}")
-                    return False
-            
-            # Also try to load combined data for chatbot
-            combined_file = os.path.join(data_dir, 'combined_data.parquet')
-            if os.path.exists(combined_file) and self.chatbot is not None:
-                combined_data = pd.read_parquet(combined_file)
+                if not os.path.exists(symbol_file):
+                    self.logger.warning(f"No data file found for {symbol} at {symbol_file}")
+                    continue
                 
-                # Check if it's a MultiIndex format
-                if isinstance(combined_data.columns, pd.MultiIndex):
-                    # Get the unique assets from the first level
-                    assets = combined_data.columns.get_level_values(0).unique()
-                    logger.info(f"Found assets in combined data: {assets}")
+                try:
+                    self.logger.info(f"Loading data for {symbol} from {symbol_file}")
+                    symbol_df = pd.read_parquet(symbol_file)
                     
-                    # Make sure our symbols are in the combined data
-                    for symbol in self.symbols:
-                        if symbol not in assets:
-                            logger.warning(f"Symbol {symbol} not found in combined data")
+                    # Check if it already has a MultiIndex
+                    if not isinstance(symbol_df.columns, pd.MultiIndex):
+                        self.logger.warning(f"DataFrame for {symbol} doesn't have MultiIndex columns - attempting to fix")
+                        
+                        # Determine which format the data is in
+                        if any('_' in col for col in symbol_df.columns):
+                            # Format is like "BTC_close"
+                            new_columns = []
+                            for col in symbol_df.columns:
+                                parts = col.split('_', 1)
+                                if len(parts) == 2:
+                                    new_columns.append((parts[0], parts[1]))
+                                else:
+                                    new_columns.append((symbol, col))
+                            symbol_df.columns = pd.MultiIndex.from_tuples(new_columns)
+                        else:
+                            # Standard columns - construct MultiIndex
+                            symbol_df.columns = pd.MultiIndex.from_product(
+                                [[symbol], symbol_df.columns],
+                                names=['asset', 'feature']
+                            )
                     
-                    # Update chatbot with combined data
-                    self.chatbot.update_market_data(combined_data)
-                    logger.info(f"Updated chatbot with combined data containing {len(combined_data)} rows")
-                else:
-                    logger.warning("Combined data file does not have MultiIndex format")
+                    # Ensure the index is a DateTimeIndex
+                    if not isinstance(symbol_df.index, pd.DatetimeIndex):
+                        symbol_df.index = pd.to_datetime(symbol_df.index)
+                    
+                    # Sort by timestamp
+                    symbol_df = symbol_df.sort_index()
+                    
+                    # Combine data
+                    if combined_data is None:
+                        combined_data = symbol_df
+                    else:
+                        # Merge on index (timestamp)
+                        combined_data = combined_data.join(symbol_df, how='outer')
+                    
+                    success = True
+                except Exception as e:
+                    self.logger.error(f"Error loading data for {symbol}: {str(e)}")
+                    self.logger.error(traceback.format_exc())
             
-            # ADDED: Combine data for all symbols (important for proper environment initialization)
-            combined_data = pd.concat([self.market_data[symbol] for symbol in self.symbols 
-                                     if not self.market_data[symbol].empty], axis=1)
-            
-            logger.info(f"Combined data with shape {combined_data.shape}")
-            logger.info(f"Combined columns structure: {type(combined_data.columns)}")
-            
-            # If we got here, we have loaded all necessary data
-            return all(len(df) > 0 for df in self.market_data.values())
-            
-        except Exception as e:
-            logger.error(f"Error loading data from files: {str(e)}")
-            logger.error(traceback.format_exc())
-            return False
+            if combined_data is not None and not combined_data.empty:
+                # Handle NaN values
+                combined_data = combined_data.fillna(method='ffill').fillna(method='bfill')
+                
+                # Store in market_data dictionary
+                self.market_data[tf] = combined_data
+                self.logger.info(f"Combined {len(combined_data)} rows for timeframe {tf}")
+                
+                # Save the combined data as multi-index file for future use
+                self._save_market_data_to_files(combined_data, tf)
+            else:
+                self.logger.warning(f"No data loaded for timeframe {tf}")
+        
+        return success
     
-    def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators for a DataFrame."""
+    def _calculate_indicators(self, df, symbol):
+        """
+        Calculate technical indicators for a given DataFrame.
+        
+        Args:
+            df (pd.DataFrame): DataFrame containing OHLCV data
+            symbol (str): Symbol for which indicators are being calculated
+            
+        Returns:
+            pd.DataFrame: DataFrame with calculated indicators
+        """
         try:
-            # Copy to avoid modifying the original
+            self.logger.info(f"Calculating indicators for {symbol}")
+            
+            # Make a copy to avoid modifying the original
             df = df.copy()
             
-            # Simple Moving Averages
-            df['sma_10'] = df['close'].rolling(window=10).mean()
-            df['sma_20'] = df['close'].rolling(window=20).mean()
+            # Check if we have the required columns
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            for col in required_columns:
+                if col not in df.columns:
+                    self.logger.error(f"Required column '{col}' not found in DataFrame for {symbol}")
+                    return df
             
-            # Exponential Moving Averages
-            df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
-            df['ema_26'] = df['close'].ewm(span=26, adjust=False).mean()
+            # Moving Averages
+            sma_periods = [7, 20, 50, 100, 200]
+            for period in sma_periods:
+                df[f'sma_{period}'] = df['close'].rolling(window=period).mean()
+            
+            ema_periods = [9, 20, 50, 200]
+            for period in ema_periods:
+                df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
+            
+            # Bollinger Bands (20, 2)
+            period = 20
+            std_dev = 2
+            df['bb_middle'] = df['close'].rolling(window=period).mean()
+            df['bb_std'] = df['close'].rolling(window=period).std()
+            df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * std_dev)
+            df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * std_dev)
+            
+            # RSI (14)
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['rsi_14'] = 100 - (100 / (1 + rs))
             
             # MACD
-            df['macd'] = df['ema_12'] - df['ema_26']
+            ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+            ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+            df['macd'] = ema_12 - ema_26
             df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
             df['macd_hist'] = df['macd'] - df['macd_signal']
-            
-            # RSI
-            delta = df['close'].diff()
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
-            avg_gain = gain.rolling(window=14).mean()
-            avg_loss = loss.rolling(window=14).mean()
-            rs = avg_gain / avg_loss
-            df['rsi'] = 100 - (100 / (1 + rs))
-            
-            # Bollinger Bands
-            std_dev = df['close'].rolling(window=20).std()
-            df['bb_middle'] = df['sma_20']
-            df['bb_upper'] = df['bb_middle'] + (std_dev * 2)
-            df['bb_lower'] = df['bb_middle'] - (std_dev * 2)
             
             # Average True Range (ATR)
             high_low = df['high'] - df['low']
             high_close = (df['high'] - df['close'].shift()).abs()
             low_close = (df['low'] - df['close'].shift()).abs()
-            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            df['atr'] = true_range.rolling(window=14).mean()
+            ranges = pd.concat([high_low, high_close, low_close], axis=1)
+            true_range = ranges.max(axis=1)
+            df['atr_14'] = true_range.rolling(14).mean()
             
-            # Fill NaN values - Use proper methods instead of deprecated 'method' parameter
-            df = df.bfill()
-            df = df.ffill()
-            df = df.fillna(0)
+            # Price relative to moving averages
+            df['price_to_sma_50'] = df['close'] / df['sma_50'] - 1
+            df['price_to_sma_200'] = df['close'] / df['sma_200'] - 1
             
+            # Volatility
+            df['volatility_30'] = df['close'].pct_change().rolling(30).std() * (252**0.5)  # Annualized
+            
+            # Volume indicators
+            df['volume_sma_20'] = df['volume'].rolling(20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_sma_20']
+            
+            # Fill NaN values
+            df.fillna(method='bfill', inplace=True)
+            df.fillna(0, inplace=True)
+            
+            self.logger.info(f"Calculated {len(df.columns) - 5} indicators for {symbol}")
             return df
+            
         except Exception as e:
-            logger.error(f"Error calculating indicators: {str(e)}")
-            logger.error(traceback.format_exc())
+            self.logger.error(f"Error calculating indicators for {symbol}: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            # Return the original DataFrame if there was an error
             return df
     
     async def _fetch_latest_data(self):
@@ -825,7 +856,7 @@ class RealTimeTradeMonitor:
                     
                     if not new_df.empty:
                         # Calculate indicators
-                        new_df = self._calculate_indicators(new_df)
+                        new_df = self._calculate_indicators(new_df, symbol)
                         
                         # Get column names and data values
                         columns = new_df.columns
@@ -849,7 +880,7 @@ class RealTimeTradeMonitor:
                         logger.debug(f"Added {len(new_df)} new rows for {symbol}")
                 else:
                     # Calculate indicators
-                    df = self._calculate_indicators(df)
+                    df = self._calculate_indicators(df, symbol)
                     
                     # Get column names and data values
                     columns = df.columns

@@ -239,7 +239,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         self.profitable_holding_bonus = 0.0  # Will accumulate bonuses for holding profitable positions
         
         # Set signal threshold for trade triggering
-        self.signal_threshold = 0.1  # Default signal threshold (action must exceed this to trigger trade)
+        self.signal_threshold = 0.25  # Increased threshold (was 0.1) to filter out weaker signals
         
         # Initialize funding rates and accrued funding
         self.funding_rates = {asset: 0.0 for asset in self.assets}
@@ -308,7 +308,7 @@ class InstitutionalPerpetualEnv(gym.Env):
         # ENHANCEMENT: Add trading cooldown tracker to prevent excessive trading
         self.last_trade_step = {asset: 0 for asset in self.assets}  # Initialize with 0 steps
         self.min_steps_between_trades = 1  # Minimum steps between trades for the same asset
-        self.signal_threshold = 0.15  # Minimum signal strength required for trading (increased from 0.1)
+        self.signal_threshold = 0.25  # Increased from 0.15 to reduce noise and filtering weak signals
         
         # Initialize price history
         self.price_history = {asset: deque(maxlen=1000) for asset in self.assets}
@@ -3542,9 +3542,68 @@ class InstitutionalPerpetualEnv(gym.Env):
         Returns:
             np.ndarray: Adjusted action vector
         """
-        # IMPORTANT: As requested, completely disable uncertainty handling
-        logger.info("Uncertainty handling has been disabled as requested")
-        return action_vector
+        # ENABLED: Re-enable uncertainty handling to address extreme values
+        try:
+            # Make a copy to avoid modifying the original
+            adjusted_action = action_vector.copy()
+            
+            # Calculate action statistics to detect bias
+            action_mean = np.mean(action_vector)
+            action_std = np.std(action_vector)
+            action_abs_mean = np.mean(np.abs(action_vector))
+            
+            # Detect bias in the action distribution
+            bias_detected = abs(action_mean) > 0.2  # Significant overall bias
+            extreme_values = action_abs_mean > 0.7  # Mostly extreme values
+            
+            if bias_detected or extreme_values:
+                logger.info(f"Action bias detected: mean={action_mean:.4f}, std={action_std:.4f}, abs_mean={action_abs_mean:.4f}")
+                
+                # Apply centering correction for bias
+                if bias_detected:
+                    # Center the distribution to reduce directional bias
+                    # Use a softer correction (70% of the bias) to allow some natural tendency
+                    adjusted_action = adjusted_action - (action_mean * 0.7)
+                
+                # Apply non-linear scaling to extreme values
+                if extreme_values:
+                    # Use sigmoid-like scaling to compress extreme values while preserving direction
+                    for i in range(len(adjusted_action)):
+                        # Soften extreme values while preserving direction
+                        sign = np.sign(adjusted_action[i])
+                        magnitude = abs(adjusted_action[i])
+                        
+                        # Non-linear scaling that reduces extremes more than moderate values
+                        # Values near 0 stay near 0, values near 1 get pulled toward 0.8
+                        scaled_magnitude = np.tanh(magnitude * 1.2) * 0.8
+                        
+                        # Apply the scaled magnitude with original sign
+                        adjusted_action[i] = sign * scaled_magnitude
+            
+            # Apply per-asset uncertainty adjustments if available
+            if hasattr(self, 'uncertainty_metrics'):
+                for i, asset in enumerate(self.assets):
+                    if i < len(adjusted_action) and asset in self.uncertainty_metrics:
+                        uncertainty = self.uncertainty_metrics[asset].get('uncertainty_score', 0.5)
+                        
+                        # Scale more aggressively for assets with extreme actions and high uncertainty
+                        if abs(adjusted_action[i]) > 0.7 and uncertainty > 0.6:
+                            confidence = max(0.2, 1.0 - uncertainty)  # Ensure minimum confidence of 0.2
+                            adjusted_action[i] *= confidence
+            
+            # Final safety clipping
+            adjusted_action = np.clip(adjusted_action, -0.95, 0.95)
+            
+            # Log the adjustments if they were significant
+            if np.max(np.abs(adjusted_action - action_vector)) > 0.1:
+                logger.info(f"Action adjustment: original={action_vector}, adjusted={adjusted_action}")
+                
+            return adjusted_action
+            
+        except Exception as e:
+            logger.error(f"Error in model uncertainty handling: {str(e)}")
+            # Fall back to original action vector if there's an error
+            return action_vector
 
     def _analyze_market_conditions(self):
         """Analyze market conditions and regime detection"""
