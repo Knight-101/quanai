@@ -4,400 +4,504 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3 import PPO, A2C
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+from stable_baselines3.common.base_class import BaseAlgorithm
 import gymnasium as gym
 import joblib
 from typing import Dict, List, Tuple, Any, Optional
 import logging
 from pathlib import Path
 from collections import defaultdict
+import pickle
+from gymnasium import spaces
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_environment(env_path: str) -> gym.Env:
-    """Load environment from file"""
-    try:
-        # Try direct loading
-        if env_path.endswith('.pkl'):
-            env = joblib.load(env_path)
-            logger.info(f"Loaded environment from {env_path}")
-            return env
+def unwrap_env(env):
+    """
+    Safely unwrap environment to get base environment without recursion.
+    """
+    if env is None:
+        return None
         
-        # Try finding .pkl file in the path
-        env_files = list(Path(env_path).glob("*.pkl"))
-        if env_files:
-            env = joblib.load(env_files[0])
-            logger.info(f"Loaded environment from {env_files[0]}")
-            return env
+    # If it's already a VecNormalize, return it
+    if isinstance(env, VecNormalize):
+        return env
+        
+    # Maximum depth to prevent infinite recursion
+    max_depth = 10
+    current_depth = 0
+    current_env = env
+    
+    while current_depth < max_depth:
+        if current_env is None:
+            break
             
-        # Try loading from vectorized environment
-        vec_normalize_path = os.path.join(env_path, "vec_normalize.pkl")
-        if os.path.exists(vec_normalize_path):
-            env = joblib.load(vec_normalize_path)
-            logger.info(f"Loaded vectorized environment from {vec_normalize_path}")
-            return env
+        # If we found a VecNormalize, return it
+        if isinstance(current_env, VecNormalize):
+            return current_env
             
-        raise FileNotFoundError(f"No environment file found in {env_path}")
-    except Exception as e:
-        logger.error(f"Error loading environment: {e}")
-        raise
+        # Try different unwrapping attributes
+        if hasattr(current_env, 'venv'):
+            current_env = current_env.venv
+        elif hasattr(current_env, 'env'):
+            current_env = current_env.env
+        elif hasattr(current_env, 'envs') and len(current_env.envs) > 0:
+            current_env = current_env.envs[0]
+        else:
+            # No more wrappers found
+            break
+            
+        current_depth += 1
+    
+    # Return whatever environment we ended up with
+    return current_env
 
-def load_model(model_path: str, env: gym.Env) -> PPO:
-    """Load model from file"""
+def load_environment(env_path: str) -> Optional[gym.Env]:
+    """
+    Load environment from path with error handling.
+    """
     try:
+        # Try loading as pickle first
+        with open(env_path, 'rb') as f:
+            env = pickle.load(f)
+            logger.info("Loaded environment from pickle")
+            
+            # If it's already a VecNormalize, we're good
+            if isinstance(env, VecNormalize):
+                logger.info("Environment is VecNormalize")
+                return env
+                
+            # Try to unwrap to find VecNormalize
+            unwrapped = unwrap_env(env)
+            if unwrapped is not None:
+                if isinstance(unwrapped, VecNormalize):
+                    logger.info("Found VecNormalize wrapper")
+                    return unwrapped
+                else:
+                    logger.info(f"Unwrapped to {unwrapped.__class__.__name__}")
+                    return env
+            else:
+                logger.warning("Could not unwrap environment, using as is")
+                return env
+                
+    except Exception as e:
+        logger.error(f"Failed to load environment: {e}")
+        return None
+
+def get_env_assets(env: gym.Env) -> List[str]:
+    """Safely extract asset list from environment"""
+    try:
+        # First unwrap the environment safely to get the base environment
+        base_env = unwrap_env(env)
+        
+        # Check for InstitutionalPerpetualEnv environment (from trading_env)
+        if hasattr(base_env, 'assets'):
+            logger.info(f"Found assets directly on base environment: {base_env.assets}")
+            return base_env.assets
+        
+        # Attempt to infer assets from environment action space
+        if hasattr(base_env, 'action_space'):
+            action_shape = base_env.action_space.shape
+            if action_shape and len(action_shape) > 0:
+                num_assets = action_shape[0]
+                # Check if asset names are available in action_names
+                if hasattr(base_env, 'action_names'):
+                    return base_env.action_names
+                # Check if we can get asset names from df
+                elif hasattr(base_env, 'df') and hasattr(base_env.df, 'columns') and isinstance(base_env.df.columns, pd.MultiIndex):
+                    asset_names = base_env.df.columns.get_level_values(0).unique().tolist()
+                    if len(asset_names) == num_assets:
+                        return asset_names
+                # Default to generic names based on action_space dimension
+                logger.info(f"Inferred {num_assets} assets from action space")
+                return [f"asset_{i}" for i in range(num_assets)]
+        
+        # For any other case, try to infer from action_space shape
+        if hasattr(env, 'action_space'):
+            action_shape = env.action_space.shape
+            num_assets = action_shape[0] if action_shape and len(action_shape) > 0 else 1
+            logger.info(f"Fallback: inferred {num_assets} assets from action space")
+            return [f"asset_{i}" for i in range(num_assets)]
+            
+        # If we still can't determine, use the most common crypto assets
+        logger.warning("Could not determine assets from environment, using default crypto assets")
+        return ["BTC", "ETH", "SOL"]
+        
+    except Exception as e:
+        logger.warning(f"Error getting assets from environment: {e}")
+        return ["BTC", "ETH", "SOL"]  # Default to common crypto assets
+
+def load_model(model_path: str, env: gym.Env) -> Optional[BaseAlgorithm]:
+    """
+    Load model from path with error handling.
+    """
+    try:
+        # Try loading as PPO first
         model = PPO.load(model_path, env=env)
-        logger.info(f"Loaded model from {model_path}")
+        logger.info("Loaded model as PPO")
         return model
     except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        raise
+        logger.debug(f"Failed to load model as PPO: {e}")
+        
+    try:
+        # Try loading as A2C
+        model = A2C.load(model_path, env=env)
+        logger.info("Loaded model as A2C")
+        return model
+    except Exception as e:
+        logger.debug(f"Failed to load model as A2C: {e}")
+        
+    logger.error("Failed to load model using any known method")
+    return None
 
-def collect_actions(model: PPO, env: gym.Env, num_samples: int = 1000) -> Dict[str, Any]:
+def collect_actions(model: BaseAlgorithm, env: gym.Env, num_samples: int = 1000) -> Dict[str, Any]:
     """
-    Collect model predictions on random observations
-    
-    Returns:
-        Dictionary with collected actions and stats
+    Collect model predictions using environment's normalization statistics
     """
     logger.info(f"Collecting {num_samples} action samples...")
     
-    # Get list of assets
-    if hasattr(env, 'assets'):
-        assets = env.assets
-    elif hasattr(env, 'get_attr') and hasattr(env.envs[0], 'assets'):
-        assets = env.envs[0].assets
-    else:
-        # If we can't determine assets, use generic names
-        obs_shape = env.observation_space.shape
-        action_shape = env.action_space.shape
-        num_assets = action_shape[0] if len(action_shape) > 0 else 1
-        assets = [f"asset_{i}" for i in range(num_assets)]
-    
-    logger.info(f"Detected assets: {assets}")
+    # Get action space to determine number of assets
+    action_space = env.action_space
+    action_shape = action_space.shape[0] if hasattr(action_space, 'shape') else 1
+    assets = ["BTC", "ETH", "SOL"][:action_shape]
+    logger.info(f"Using assets: {assets}")
     
     # Initialize collections
     actions = []
     observations = []
     
-    # Reset environment
-    obs, _ = env.reset()
-    
-    # Collect samples
-    for i in range(num_samples):
-        # Get action from model
-        action, _ = model.predict(obs, deterministic=False)
-        
-        # Store
-        actions.append(action)
-        observations.append(obs)
-        
-        # Step environment
-        obs, _, terminated, truncated, _ = env.step(action)
-        
-        # Reset if needed
-        if terminated or truncated:
-            obs, _ = env.reset()
+    try:
+        # Generate observations using environment stats if available
+        if isinstance(env, VecNormalize) and hasattr(env, 'obs_rms'):
+            obs_mean = env.obs_rms.mean
+            obs_var = env.obs_rms.var
+            obs_shape = obs_mean.shape[0]
             
-        # Log progress
-        if (i + 1) % 100 == 0:
-            logger.info(f"Collected {i + 1}/{num_samples} samples")
+            logger.info(f"Using VecNormalize stats for observations (shape: {obs_shape})")
+            
+            for i in range(num_samples):
+                try:
+                    # Generate normalized observation
+                    obs = np.random.normal(obs_mean, np.sqrt(obs_var + 1e-8))
+                    if env.norm_obs:
+                        obs = np.clip((obs - obs_mean) / np.sqrt(obs_var + env.epsilon),
+                                    -env.clip_obs, env.clip_obs)
+                    
+                    # Ensure observation is the right shape
+                    obs = obs.astype(np.float32)
+                    if len(obs.shape) == 1:
+                        obs = obs[np.newaxis, :]
+                    
+                    # Get action from model
+                    action, _ = model.predict(obs, deterministic=False)
+                    
+                    # Store only if action is valid
+                    if action is not None and action.shape[-1] == len(assets):
+                        actions.append(action[0])
+                        observations.append(obs[0])
+                        
+                    if (i + 1) % 100 == 0:
+                        logger.info(f"Collected {i + 1}/{num_samples} samples")
+                        
+                except Exception as e:
+                    logger.warning(f"Error collecting sample {i}: {e}")
+                    continue
+        else:
+            logger.error("Environment does not have required normalization statistics")
+            return {
+                'actions': np.array([]),
+                'observations': np.array([]),
+                'assets': assets
+            }
+        
+        # Convert to numpy arrays
+        if actions and observations:
+            actions_np = np.vstack(actions)
+            observations_np = np.vstack(observations)
+            
+            # Log action statistics for debugging
+            logger.info(f"\nAction statistics:")
+            for i, asset in enumerate(assets):
+                asset_actions = actions_np[:, i]
+                logger.info(f"{asset}:")
+                logger.info(f"  Mean: {np.mean(asset_actions):.4f}")
+                logger.info(f"  Std: {np.std(asset_actions):.4f}")
+                logger.info(f"  Range: [{np.min(asset_actions):.4f}, {np.max(asset_actions):.4f}]")
+            
+            return {
+                'actions': actions_np,
+                'observations': observations_np,
+                'assets': assets
+            }
+        else:
+            logger.error("No valid samples collected")
+            return {
+                'actions': np.array([]),
+                'observations': np.array([]),
+                'assets': assets
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in collect_actions: {e}")
+        logger.debug("Traceback:", exc_info=True)
+        return {
+            'actions': np.array([]),
+            'observations': np.array([]),
+            'assets': assets
+        }
+
+def generate_synthetic_observations(env: gym.Env) -> np.ndarray:
+    """
+    Generate synthetic observations for testing when environment reset fails.
+    """
+    logger.warning("Generating synthetic observations for testing")
     
-    # Convert to numpy arrays
-    actions_np = np.vstack(actions)
-    observations_np = np.vstack(observations)
+    # Try to infer observation shape from environment
+    if hasattr(env, 'observation_space'):
+        obs_shape = env.observation_space.shape
+        # Generate random observation within bounds
+        low = env.observation_space.low
+        high = env.observation_space.high
+        # Handle infinite bounds
+        low = np.where(np.isinf(low), -1.0, low)
+        high = np.where(np.isinf(high), 1.0, high)
+        
+        return np.random.uniform(low=low, high=high, size=obs_shape)
     
-    # Analysis results
-    results = {
-        'actions': actions_np,
-        'observations': observations_np,
-        'assets': assets
-    }
-    
-    return results
+    # Default to a reasonably-sized observation if we can't infer
+    return np.random.uniform(-1, 1, size=(1, 100))
+
+def perturb_observation(obs: np.ndarray) -> np.ndarray:
+    """
+    Add small random perturbation to observation for next sample.
+    """
+    if isinstance(obs, np.ndarray):
+        # Add small Gaussian noise
+        noise = np.random.normal(0, 0.01, size=obs.shape)
+        return obs + noise
+    else:
+        return obs
 
 def analyze_actions(actions: np.ndarray, assets: List[str]) -> Dict[str, Dict[str, float]]:
     """
-    Analyze collected actions for biases
-    
-    Returns:
-        Dictionary of statistics by asset
+    Analyze actions for each asset and compute statistics.
     """
-    logger.info("Analyzing action distributions...")
-    
     stats = {}
-    num_assets = min(actions.shape[1], len(assets))
-    
-    for i in range(num_assets):
-        asset_name = assets[i]
+    for i, asset in enumerate(assets):
         asset_actions = actions[:, i]
         
-        # Calculate statistics
-        mean = float(np.mean(asset_actions))
-        median = float(np.median(asset_actions))
-        std = float(np.std(asset_actions))
-        min_val = float(np.min(asset_actions))
-        max_val = float(np.max(asset_actions))
-        
-        # Calculate percentages
-        pct_positive = float(np.mean(asset_actions > 0))
-        pct_negative = float(np.mean(asset_actions < 0))
-        pct_zero = float(np.mean(np.abs(asset_actions) < 1e-6))
-        
-        # Extreme values
-        pct_extreme_positive = float(np.mean(asset_actions > 0.9))
-        pct_extreme_negative = float(np.mean(asset_actions < -0.9))
-        
-        # Store statistics
-        stats[asset_name] = {
-            'mean': mean,
-            'median': median,
-            'std': std,
-            'min': min_val,
-            'max': max_val,
-            'pct_positive': pct_positive,
-            'pct_negative': pct_negative,
-            'pct_zero': pct_zero,
-            'pct_extreme_positive': pct_extreme_positive,
-            'pct_extreme_negative': pct_extreme_negative,
-            'bias_level': abs(mean)
+        # Basic statistics
+        stats[asset] = {
+            'mean': float(np.mean(asset_actions)),
+            'median': float(np.median(asset_actions)),
+            'std': float(np.std(asset_actions)),
+            'min': float(np.min(asset_actions)),
+            'max': float(np.max(asset_actions)),
+            'abs_mean': float(np.mean(np.abs(asset_actions))),
+            'pct_positive': float(np.mean(asset_actions > 0)),
+            'pct_negative': float(np.mean(asset_actions < 0)),
+            'pct_zero': float(np.mean(asset_actions == 0)),
+            'pct_extreme_positive': float(np.mean(asset_actions > 0.8)),
+            'pct_extreme_negative': float(np.mean(asset_actions < -0.8))
         }
-    
+        
+        # Calculate bias level
+        mean_abs = stats[asset]['abs_mean']
+        mean = stats[asset]['mean']
+        if mean_abs > 0:
+            bias_level = mean / mean_abs
+        else:
+            bias_level = 0
+        stats[asset]['bias_level'] = float(bias_level)
+        
     return stats
 
-def correct_actions(actions: np.ndarray, stats: Dict[str, Dict[str, float]], 
-                    assets: List[str], method: str = 'mean_centering') -> np.ndarray:
+def apply_bias_correction(actions: np.ndarray, stats: Dict[str, Dict[str, float]], 
+                         assets: List[str]) -> np.ndarray:
     """
-    Apply bias correction to actions
-    
-    Args:
-        actions: Action array
-        stats: Action statistics by asset
-        assets: List of asset names
-        method: Correction method ('mean_centering', 'distribution_scaling', 'nonlinear')
-        
-    Returns:
-        Corrected actions
+    Apply bias correction to actions based on computed statistics.
     """
-    logger.info(f"Applying {method} bias correction...")
-    
     corrected_actions = actions.copy()
-    num_assets = min(actions.shape[1], len(assets))
-    
-    for i in range(num_assets):
-        asset_name = assets[i]
-        asset_stats = stats[asset_name]
-        
-        if method == 'mean_centering':
-            # Correct mean bias (shift distribution)
-            corrected_actions[:, i] = actions[:, i] - (asset_stats['mean'] * 0.7)
-            
-        elif method == 'distribution_scaling':
-            # Scale the distribution to correct skew and extreme values
-            mean = asset_stats['mean']
-            std = asset_stats['std']
-            
-            # Center and normalize
-            centered = actions[:, i] - mean
-            if std > 0:
-                normalized = centered / std
-                # Scale back with target std (slightly reduced to avoid extremes)
-                corrected_actions[:, i] = normalized * (std * 0.9)
-            else:
-                corrected_actions[:, i] = centered
-                
-        elif method == 'nonlinear':
-            # Non-linear correction using tanh to handle extreme values
-            # while preserving direction and relative magnitude
-            mean = asset_stats['mean']
-            
-            # Remove mean bias
-            centered = actions[:, i] - (mean * 0.7)
-            
-            # Apply non-linear transformation to extreme values
-            extreme_mask = np.abs(centered) > 0.7
-            if np.any(extreme_mask):
-                # Apply tanh scaling to extreme values
-                extreme_values = centered[extreme_mask]
-                signs = np.sign(extreme_values)
-                magnitudes = np.abs(extreme_values)
-                
-                # Scaled magnitudes (tanh keeps values in [-1,1] range)
-                scaled_magnitudes = np.tanh(magnitudes * 1.2) * 0.85
-                
-                # Replace extreme values
-                centered[extreme_mask] = signs * scaled_magnitudes
-                
-            corrected_actions[:, i] = centered
-    
-    # Ensure all actions are within valid range
-    corrected_actions = np.clip(corrected_actions, -1, 1)
-    
-    return corrected_actions
-
-def plot_action_distributions(actions: np.ndarray, corrected_actions: np.ndarray, 
-                             assets: List[str], stats: Dict[str, Dict[str, float]],
-                             output_dir: str):
-    """
-    Plot action distributions before and after correction
-    """
-    logger.info("Plotting action distributions...")
-    
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Set seaborn style
-    sns.set(style="whitegrid")
-    
-    # Plot histograms for each asset
-    num_assets = min(actions.shape[1], len(assets))
-    
-    for i in range(num_assets):
-        asset_name = assets[i]
-        asset_stats = stats[asset_name]
-        
-        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f"Action Distribution for {asset_name}", fontsize=16)
-        
-        # Original histogram
-        sns.histplot(actions[:, i], bins=50, kde=True, ax=axs[0, 0], color='blue')
-        axs[0, 0].set_title(f"Original Distribution\nMean: {asset_stats['mean']:.4f}, Std: {asset_stats['std']:.4f}")
-        axs[0, 0].axvline(asset_stats['mean'], color='red', linestyle='--', label=f"Mean: {asset_stats['mean']:.4f}")
-        axs[0, 0].axvline(0, color='black', linestyle='-', alpha=0.3)
-        axs[0, 0].legend()
-        
-        # Corrected histogram
-        corrected_mean = np.mean(corrected_actions[:, i])
-        corrected_std = np.std(corrected_actions[:, i])
-        sns.histplot(corrected_actions[:, i], bins=50, kde=True, ax=axs[0, 1], color='green')
-        axs[0, 1].set_title(f"Corrected Distribution\nMean: {corrected_mean:.4f}, Std: {corrected_std:.4f}")
-        axs[0, 1].axvline(corrected_mean, color='red', linestyle='--', label=f"Mean: {corrected_mean:.4f}")
-        axs[0, 1].axvline(0, color='black', linestyle='-', alpha=0.3)
-        axs[0, 1].legend()
-        
-        # Original vs corrected scatter
-        axs[1, 0].scatter(actions[:, i], corrected_actions[:, i], alpha=0.5, s=10)
-        axs[1, 0].set_title("Original vs Corrected Actions")
-        axs[1, 0].set_xlabel("Original Action")
-        axs[1, 0].set_ylabel("Corrected Action")
-        axs[1, 0].plot([-1, 1], [-1, 1], 'r--', alpha=0.3)  # Diagonal line
-        
-        # Direction change analysis
-        direction_original = np.sign(actions[:, i])
-        direction_corrected = np.sign(corrected_actions[:, i])
-        direction_changed = direction_original != direction_corrected
-        pct_direction_changed = np.mean(direction_changed) * 100
-        
-        categories = ['Positive→Negative', 'Negative→Positive', 'Zero→Nonzero', 'Nonzero→Zero', 'No Change']
-        counts = [0, 0, 0, 0, 0]
-        
-        # Count specific changes
-        for j in range(len(direction_original)):
-            if not direction_changed[j]:
-                counts[4] += 1  # No change
-            elif direction_original[j] > 0 and direction_corrected[j] < 0:
-                counts[0] += 1  # Positive to Negative
-            elif direction_original[j] < 0 and direction_corrected[j] > 0:
-                counts[1] += 1  # Negative to Positive
-            elif abs(direction_original[j]) < 1e-6 and abs(direction_corrected[j]) > 1e-6:
-                counts[2] += 1  # Zero to Nonzero
-            elif abs(direction_original[j]) > 1e-6 and abs(direction_corrected[j]) < 1e-6:
-                counts[3] += 1  # Nonzero to Zero
-        
-        # Convert to percentages
-        counts = [c / len(direction_original) * 100 for c in counts]
-        
-        # Plot direction changes
-        axs[1, 1].bar(categories, counts, color=['red', 'green', 'orange', 'blue', 'gray'])
-        axs[1, 1].set_title(f"Direction Changes: {pct_direction_changed:.1f}% of actions")
-        axs[1, 1].set_xticklabels(categories, rotation=45, ha='right')
-        axs[1, 1].set_ylabel("Percentage of Actions")
-        for i, count in enumerate(counts):
-            if count > 0.5:
-                axs[1, 1].text(i, count + 0.5, f"{count:.1f}%", ha='center')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f"{asset_name}_action_distribution.png"), dpi=300)
-        plt.close(fig)
-    
-    # Create summary plot
-    plt.figure(figsize=(12, 8))
-    
-    # Compare bias before and after correction
-    asset_names = list(stats.keys())
-    original_bias = [stats[asset]['bias_level'] for asset in asset_names]
-    
-    # Calculate corrected bias
-    corrected_bias = []
-    for i, asset in enumerate(asset_names):
-        if i < actions.shape[1]:
-            corrected_actions_i = corrected_actions[:, i]
-            corrected_bias.append(abs(np.mean(corrected_actions_i)))
-        else:
-            corrected_bias.append(0)
-    
-    # Create bar chart
-    bar_width = 0.35
-    x = np.arange(len(asset_names))
-    
-    plt.bar(x - bar_width/2, original_bias, bar_width, label='Original Bias')
-    plt.bar(x + bar_width/2, corrected_bias, bar_width, label='Corrected Bias')
-    
-    plt.xlabel('Assets')
-    plt.ylabel('Absolute Bias Level')
-    plt.title('Bias Comparison Before vs After Correction')
-    plt.xticks(x, asset_names, rotation=45, ha='right')
-    plt.legend()
-    plt.tight_layout()
-    
-    plt.savefig(os.path.join(output_dir, "bias_comparison_summary.png"), dpi=300)
-    plt.close()
-    
-    logger.info(f"Saved plots to {output_dir}")
-
-def save_action_data(actions: np.ndarray, corrected_actions: np.ndarray, 
-                    stats: Dict[str, Dict[str, float]], assets: List[str],
-                    output_dir: str):
-    """
-    Save action data to CSV files
-    """
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Save statistics to CSV
-    stats_rows = []
-    for asset, asset_stats in stats.items():
-        row = {'asset': asset}
-        row.update(asset_stats)
-        stats_rows.append(row)
-    
-    stats_df = pd.DataFrame(stats_rows)
-    stats_path = os.path.join(output_dir, "action_statistics.csv")
-    stats_df.to_csv(stats_path, index=False)
-    logger.info(f"Saved statistics to {stats_path}")
-    
-    # Save sample of raw actions to CSV
-    max_samples = min(1000, actions.shape[0])
-    action_data = {}
-    corrected_data = {}
     
     for i, asset in enumerate(assets):
-        if i < actions.shape[1]:
-            action_data[f"{asset}_action"] = actions[:max_samples, i]
-            corrected_data[f"{asset}_corrected"] = corrected_actions[:max_samples, i]
+        asset_stats = stats[asset]
+        asset_actions = actions[:, i]
+        
+        # Skip correction if no significant bias
+        if abs(asset_stats['bias_level']) < 0.1:
+            continue
+            
+        # Calculate correction factors
+        mean = asset_stats['mean']
+        std = asset_stats['std']
+        
+        # Center the actions around zero
+        centered_actions = asset_actions - mean
+        
+        # Scale extreme values
+        if asset_stats['pct_extreme_positive'] > 0.1 or asset_stats['pct_extreme_negative'] > 0.1:
+            scale_factor = 0.8 / max(abs(asset_stats['max']), abs(asset_stats['min']))
+            centered_actions *= scale_factor
+            
+        # Apply smoothing for high variance
+        if std > 0.5:
+            smoothing_factor = 0.5 / std
+            centered_actions *= smoothing_factor
+            
+        corrected_actions[:, i] = centered_actions
+        
+    return corrected_actions
+
+def calculate_bias_reduction(original_stats: Dict[str, Dict[str, float]], 
+                           corrected_stats: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    """
+    Calculate the reduction in bias after correction.
+    """
+    reduction_stats = {}
     
-    actions_df = pd.DataFrame(action_data)
-    corrected_df = pd.DataFrame(corrected_data)
+    for asset in original_stats.keys():
+        orig_bias = abs(original_stats[asset]['bias_level'])
+        corr_bias = abs(corrected_stats[asset]['bias_level'])
+        
+        if orig_bias > 0:
+            reduction = (orig_bias - corr_bias) / orig_bias * 100
+        else:
+            reduction = 0
+            
+        reduction_stats[asset] = {
+            'original_bias': orig_bias,
+            'corrected_bias': corr_bias,
+            'reduction_percent': reduction
+        }
+        
+    return reduction_stats
+
+def plot_action_distributions(actions: np.ndarray, corrected_actions: np.ndarray, 
+                             assets: List[str], output_dir: str):
+    """
+    Plot original and corrected action distributions.
+    """
+    plt.style.use('default')  # Use default style instead of seaborn
+    num_assets = len(assets)
     
-    actions_path = os.path.join(output_dir, "sample_actions.csv")
-    corrected_path = os.path.join(output_dir, "sample_corrected_actions.csv")
+    # Create subplots for each asset
+    fig, axes = plt.subplots(num_assets, 2, figsize=(15, 5*num_assets))
+    if num_assets == 1:
+        axes = axes.reshape(1, -1)
     
-    actions_df.to_csv(actions_path, index=False)
-    corrected_df.to_csv(corrected_path, index=False)
+    for i, asset in enumerate(assets):
+        # Histogram plot
+        axes[i, 0].hist(actions[:, i], bins=50, alpha=0.5, label='Original', color='blue')
+        axes[i, 0].hist(corrected_actions[:, i], bins=50, alpha=0.5, label='Corrected', color='green')
+        axes[i, 0].set_title(f'{asset} Action Distribution')
+        axes[i, 0].set_xlabel('Action Value')
+        axes[i, 0].set_ylabel('Frequency')
+        axes[i, 0].legend()
+        axes[i, 0].grid(True)
+        
+        # Scatter plot
+        axes[i, 1].scatter(actions[:, i], corrected_actions[:, i], alpha=0.5, s=20)
+        axes[i, 1].plot([-1, 1], [-1, 1], 'r--', alpha=0.5)  # Identity line
+        axes[i, 1].set_title(f'{asset} Original vs Corrected Actions')
+        axes[i, 1].set_xlabel('Original Action')
+        axes[i, 1].set_ylabel('Corrected Action')
+        axes[i, 1].grid(True)
+        
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'action_distributions.png'))
+    plt.close()
+
+def plot_bias_metrics(stats: Dict[str, Dict[str, float]], 
+                     reduction_stats: Dict[str, float], 
+                     output_dir: str):
+    """
+    Plot bias metrics and reduction statistics.
+    """
+    plt.style.use('default')  # Use default style instead of seaborn
+    assets = list(stats.keys())
+    num_assets = len(assets)
     
-    logger.info(f"Saved action samples to {actions_path} and {corrected_path}")
+    # Create figure for bias metrics
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot bias levels
+    bias_levels = [stats[asset]['bias_level'] for asset in assets]
+    abs_means = [stats[asset]['abs_mean'] for asset in assets]
+    
+    x = np.arange(num_assets)
+    width = 0.35
+    
+    ax1.bar(x - width/2, bias_levels, width, label='Bias Level')
+    ax1.bar(x + width/2, abs_means, width, label='Absolute Mean')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(assets)
+    ax1.set_title('Bias Metrics by Asset')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Plot bias reduction
+    reductions = [reduction_stats[asset]['reduction_percent'] for asset in assets]
+    ax2.bar(assets, reductions, color='green', alpha=0.7)
+    ax2.set_title('Bias Reduction Percentage')
+    ax2.set_ylabel('Reduction (%)')
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'bias_metrics.png'))
+    plt.close()
+
+def save_analysis_results(stats: Dict[str, Dict[str, float]], 
+                         reduction_stats: Dict[str, float],
+                         output_dir: str):
+    """
+    Save analysis results to CSV files.
+    """
+    # Save action statistics
+    stats_df = pd.DataFrame.from_dict(stats, orient='index')
+    stats_df.to_csv(os.path.join(output_dir, 'action_statistics.csv'))
+    
+    # Save bias reduction statistics
+    reduction_df = pd.DataFrame.from_dict(reduction_stats, orient='index')
+    reduction_df.to_csv(os.path.join(output_dir, 'bias_reduction.csv'))
+
+def save_action_data(actions: np.ndarray, corrected_actions: np.ndarray, stats: Dict, assets: List[str], output_dir: str):
+    """
+    Save action data and statistics to CSV files.
+    """
+    # Save raw actions
+    actions_df = pd.DataFrame(actions, columns=assets)
+    actions_df.to_csv(os.path.join(output_dir, 'raw_actions.csv'), index=False)
+    
+    # Save corrected actions
+    corrected_df = pd.DataFrame(corrected_actions, columns=assets)
+    corrected_df.to_csv(os.path.join(output_dir, 'corrected_actions.csv'), index=False)
+    
+    # Save statistics
+    stats_data = []
+    for asset in assets:
+        asset_stats = stats[asset]
+        stats_data.append({
+            'asset': asset,
+            'mean': asset_stats['mean'],
+            'median': asset_stats['median'],
+            'std': asset_stats['std'],
+            'min': asset_stats['min'],
+            'max': asset_stats['max'],
+            'bias_level': asset_stats['bias_level'],
+            'pct_positive': asset_stats['pct_positive'],
+            'pct_negative': asset_stats['pct_negative'],
+            'pct_extreme_positive': asset_stats['pct_extreme_positive'],
+            'pct_extreme_negative': asset_stats['pct_extreme_negative']
+        })
+    
+    stats_df = pd.DataFrame(stats_data)
+    stats_df.to_csv(os.path.join(output_dir, 'action_statistics.csv'), index=False)
+    
+    logger.info(f"Saved action data and statistics to {output_dir}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Analyze model bias for any asset")
@@ -421,47 +525,131 @@ def main():
     try:
         # Load environment and model
         env = load_environment(args.env_path)
-        model = load_model(args.model_path, env)
-        
+        if env is None:
+            logger.error("Failed to load environment")
+            return
+            
+        # Validate environment
+        if not hasattr(env, 'observation_space') or not hasattr(env, 'action_space'):
+            logger.error("Invalid environment: missing observation_space or action_space")
+            return
+            
+        # Load model
+        try:
+            model = load_model(args.model_path, env)
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            return
+            
         # Collect actions
         results = collect_actions(model, env, num_samples=args.num_samples)
+        
+        # Validate results
+        if len(results['actions']) == 0:
+            logger.error("No valid actions collected")
+            return
+            
         actions = results['actions']
         assets = results['assets']
         
+        # Validate shapes
+        if len(actions.shape) != 2:
+            logger.error(f"Invalid action shape: {actions.shape}")
+            return
+            
+        if actions.shape[1] != len(assets):
+            logger.warning(f"Mismatch between number of actions ({actions.shape[1]}) and assets ({len(assets)})")
+            # Try to fix by taking min
+            num_dims = min(actions.shape[1], len(assets))
+            actions = actions[:, :num_dims]
+            assets = assets[:num_dims]
+        
         # Analyze actions
-        stats = analyze_actions(actions, assets)
+        try:
+            stats = analyze_actions(actions, assets)
+        except Exception as e:
+            logger.error(f"Error analyzing actions: {e}")
+            return
         
         # Print summary statistics
-        logger.info("=== Action Statistics Summary ===")
+        logger.info("\n=== Action Statistics Summary ===")
         for asset, asset_stats in stats.items():
             bias_level = asset_stats['bias_level']
             bias_category = "HIGH" if bias_level > 0.2 else "MEDIUM" if bias_level > 0.1 else "LOW"
             
-            logger.info(f"Asset: {asset} - Bias Level: {bias_level:.4f} ({bias_category})")
+            logger.info(f"\nAsset: {asset} - Bias Level: {bias_level:.4f} ({bias_category})")
             logger.info(f"  Mean: {asset_stats['mean']:.4f}, Median: {asset_stats['median']:.4f}, Std: {asset_stats['std']:.4f}")
             logger.info(f"  Range: [{asset_stats['min']:.4f}, {asset_stats['max']:.4f}]")
             logger.info(f"  Positive: {asset_stats['pct_positive']*100:.1f}%, Negative: {asset_stats['pct_negative']*100:.1f}%")
             logger.info(f"  Extreme: +{asset_stats['pct_extreme_positive']*100:.1f}%, -{asset_stats['pct_extreme_negative']*100:.1f}%")
-            logger.info("")
         
         # Apply bias correction
-        corrected_actions = correct_actions(actions, stats, assets, method=args.correction_method)
+        try:
+            corrected_actions = apply_bias_correction(actions, stats, assets)
+        except Exception as e:
+            logger.error(f"Error applying bias correction: {e}")
+            return
         
         # Create output directory
-        os.makedirs(args.output_dir, exist_ok=True)
+        try:
+            os.makedirs(args.output_dir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Error creating output directory: {e}")
+            return
         
         # Plot distributions
-        plot_action_distributions(actions, corrected_actions, assets, stats, args.output_dir)
+        try:
+            plot_action_distributions(actions, corrected_actions, assets, args.output_dir)
+        except Exception as e:
+            logger.error(f"Error creating plots: {e}")
+            logger.debug("Traceback:", exc_info=True)
+            # Continue anyway - plotting failure shouldn't stop everything
         
         # Save data
-        save_action_data(actions, corrected_actions, stats, assets, args.output_dir)
+        try:
+            save_action_data(actions, corrected_actions, stats, assets, args.output_dir)
+        except Exception as e:
+            logger.error(f"Error saving data: {e}")
+            return
         
+        # Print final summary
+        logger.info("\n=== Bias Analysis Summary ===")
+        logger.info(f"Total samples analyzed: {len(actions)}")
+        logger.info(f"Number of assets: {len(assets)}")
+        
+        high_bias_assets = [asset for asset, stats in stats.items() if stats['bias_level'] > 0.2]
+        if high_bias_assets:
+            logger.warning(f"Assets with high bias: {', '.join(high_bias_assets)}")
+        
+        # Calculate overall bias reduction
+        original_mean_bias = np.mean([stats[asset]['bias_level'] for asset in assets])
+        corrected_mean_bias = np.mean([abs(np.mean(corrected_actions[:, i])) for i in range(len(assets))])
+        
+        logger.info(f"\nOverall mean bias: {original_mean_bias:.4f} -> {corrected_mean_bias:.4f}")
+        logger.info(f"Bias reduction: {((original_mean_bias - corrected_mean_bias) / original_mean_bias * 100):.1f}%")
+        
+        # Calculate bias reduction statistics
+        reduction_stats = calculate_bias_reduction(stats, stats)
+        
+        # Plot bias metrics
+        try:
+            plot_bias_metrics(stats, reduction_stats, args.output_dir)
+        except Exception as e:
+            logger.error(f"Error creating bias metrics plot: {e}")
+            logger.debug("Traceback:", exc_info=True)
+        
+        # Save analysis results
+        try:
+            save_analysis_results(stats, reduction_stats, args.output_dir)
+        except Exception as e:
+            logger.error(f"Error saving analysis results: {e}")
+        
+        logger.info(f"\nResults saved to: {args.output_dir}")
         logger.info("Analysis completed successfully")
         
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
-        import traceback
-        traceback.print_exc()
-
+        logger.debug("Traceback:", exc_info=True)
+        
 if __name__ == "__main__":
     main() 

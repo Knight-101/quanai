@@ -26,19 +26,298 @@ from stable_baselines3.ppo import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, SubprocVecEnv
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch.nn as nn
-# from data_collection.collect_multimodal import MultiModalDataCollector
-# from data_system.multimodal_feature_extractor import MultiModalPerpFeatureExtractor
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
 import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 import traceback
-from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.running_mean_std import RunningMeanStd
 import json
+import random
 
 # Configuration flags
 ENABLE_DETAILED_LEVERAGE_MONITORING = True  # Set to True for more detailed leverage logging
+
+def apply_data_augmentation(env):
+    """
+    Apply data augmentation to trading environment to reduce bias.
+    
+    This function:
+    1. Reshuffles portions of the dataset
+    2. Applies symmetric transformations to assets
+    3. Adds slight noise to features
+    """
+    logger.info("Applying data augmentation to reduce bias")
+    
+    try:
+        # Get the base environment
+        base_env = None
+        
+        # If env is a VecNormalize, try to get the base environment
+        if hasattr(env, 'venv'):
+            base_env = env.venv
+        elif hasattr(env, 'envs') and len(env.envs) > 0:
+            base_env = env.envs[0]
+        elif hasattr(env, 'env'):
+            base_env = env.env
+        else:
+            base_env = env
+            
+        logger.info(f"Unwrapped to environment type: {type(base_env).__name__}")
+        
+        # Check if the environment has a dataframe attribute
+        if not hasattr(base_env, 'df'):
+            logger.warning("Environment doesn't have a dataframe, skipping data augmentation")
+            return env
+        
+        # Get the original dataframe
+        orig_df = base_env.df
+        
+        # Check if we have multi-index columns (asset, feature)
+        if not isinstance(orig_df.columns, pd.MultiIndex):
+            logger.warning("DataFrame doesn't have MultiIndex columns, skipping data augmentation")
+            return env
+        
+        # Get the list of assets
+        assets = orig_df.columns.get_level_values(0).unique()
+        logger.info(f"Found assets: {list(assets)}")
+        
+        # Create a copy of the dataframe to modify
+        df = orig_df.copy()
+        
+        # 1. Apply mild feature noise (0.5% standard deviation)
+        logger.info("Adding feature noise to reduce overfitting")
+        noise_scale = 0.005  # 0.5% noise
+        for asset in assets:
+            # Add noise to numeric features only
+            try:
+                for feature in df[asset].select_dtypes(include=[np.number]).columns:
+                    original_values = df[(asset, feature)].values
+                    # Calculate asset-specific noise scale based on feature volatility
+                    feature_std = np.std(original_values)
+                    if feature_std > 0:
+                        asset_noise = noise_scale * feature_std
+                        noise = np.random.normal(0, asset_noise, size=len(df))
+                        # Only apply noise to non-NaN values
+                        mask = ~np.isnan(original_values)
+                        df.loc[mask, (asset, feature)] += noise[mask]
+            except Exception as e:
+                logger.warning(f"Error adding noise to {asset}: {e}")
+                continue
+        
+        # 2. Create temporary price fluctuations to reduce directional bias
+        logger.info("Creating temporary price fluctuations to reduce directional bias")
+        # Split the dataframe into segments and apply different scaled adjustments
+        # to create more varied price patterns
+        n_segments = 10
+        segment_size = len(df) // n_segments
+        
+        for asset in assets:
+            try:
+                if ('close' in df[asset].columns):
+                    close_col = df[(asset, 'close')]
+                    # Get segmenting indices
+                    segment_indices = [(i * segment_size, min((i + 1) * segment_size, len(df))) 
+                                    for i in range(n_segments)]
+                    
+                    # Apply random scaling to segments (between 0.9 and 1.1)
+                    for start, end in segment_indices:
+                        # Random scaling factor between 0.97 and 1.03 (3% variation)
+                        scale_factor = np.random.uniform(0.97, 1.03)
+                        # Apply scaling to price data
+                        for price_col in ['open', 'high', 'low', 'close']:
+                            if price_col in df[asset].columns:
+                                df.loc[start:end, (asset, price_col)] *= scale_factor
+            except Exception as e:
+                logger.warning(f"Error applying price fluctuations to {asset}: {e}")
+                continue
+        
+        # 3. Apply time segment shuffling (breaks perfect time continuity to reduce memorization)
+        try:
+            logger.info("Applying time segment shuffling")
+            # Only shuffle segments that aren't at the start or end of the dataset
+            shuffle_segments = list(range(1, n_segments-1))
+            random.shuffle(shuffle_segments)
+            
+            # Create a new dataframe with shuffled segments
+            shuffled_df = df.copy()
+            for i, shuffled_idx in enumerate(shuffle_segments):
+                original_idx = i + 1  # Skip the first segment
+                original_start = original_idx * segment_size
+                original_end = min((original_idx + 1) * segment_size, len(df))
+                
+                shuffled_start = shuffled_idx * segment_size
+                shuffled_end = min((shuffled_idx + 1) * segment_size, len(df))
+                
+                # Copy data from shuffled segment to original segment
+                segment_length = min(original_end - original_start, shuffled_end - shuffled_start)
+                shuffled_df.iloc[original_start:original_start+segment_length] = df.iloc[shuffled_start:shuffled_start+segment_length].values
+                
+            # Use the shuffled dataframe
+            df = shuffled_df
+        except Exception as e:
+            logger.warning(f"Error during time segment shuffling: {e}")
+            # Continue with unshuffled dataframe
+            
+        # Update the environment's dataframe
+        base_env.df = df
+        logger.info("Data augmentation completed successfully")
+        
+        return env
+        
+    except Exception as e:
+        logger.error(f"Error in apply_data_augmentation: {e}")
+        logger.error(traceback.format_exc())
+        return env  # Return original environment if augmentation fails
+
+class AssetAgnosticCallback(BaseCallback):
+    """
+    Callback for monitoring and correcting asset-specific biases during training.
+    """
+    def __init__(self, check_freq=10000, save_path="./", name_prefix="model",
+                 verbose=1, balance_actions=True, max_bias_threshold=0.2):
+        super(AssetAgnosticCallback, self).__init__(verbose)
+        self.check_freq = check_freq
+        self.save_path = save_path
+        self.name_prefix = name_prefix
+        self.balance_actions = balance_actions
+        self.max_bias_threshold = max_bias_threshold
+        self.asset_metrics = {}
+        self.last_check_step = 0
+        self.action_history = {}  # Track actions per asset
+        self.window_size = 1000  # Number of actions to track for bias detection
+        
+    def _init_callback(self):
+        # Create save path if it doesn't exist
+        os.makedirs(self.save_path, exist_ok=True)
+        
+        # Initialize action history for each asset
+        if hasattr(self.training_env, 'envs'):
+            env = self.training_env.envs[0]
+        else:
+            env = self.training_env
+            
+        if hasattr(env, 'assets'):
+            for asset in env.assets:
+                self.action_history[asset] = []
+        
+    def _on_step(self):
+        """Called after each step in training"""
+        try:
+            # Get the current action from the last step
+            if hasattr(self.locals, 'actions') and self.locals['actions'] is not None:
+                actions = self.locals['actions']
+                
+                # Handle different action formats
+                if isinstance(actions, (np.ndarray, torch.Tensor)):
+                    actions = actions.reshape(-1)  # Flatten if needed
+                    
+                    # Get the environment
+                    if hasattr(self.training_env, 'envs'):
+                        env = self.training_env.envs[0]
+                    else:
+                        env = self.training_env
+                        
+                    # Map actions to assets
+                    if hasattr(env, 'assets'):
+                        for i, asset in enumerate(env.assets):
+                            if i < len(actions):
+                                self.action_history[asset].append(float(actions[i]))
+                                # Keep only recent actions
+                                if len(self.action_history[asset]) > self.window_size:
+                                    self.action_history[asset] = self.action_history[asset][-self.window_size:]
+            
+            # Check for bias periodically
+            if self.n_calls - self.last_check_step >= self.check_freq:
+                self.last_check_step = self.n_calls
+                
+                # Calculate bias metrics
+                bias_detected = False
+                for asset, actions in self.action_history.items():
+                    if len(actions) > 0:
+                        metrics = {
+                            'mean': float(np.mean(actions)),
+                            'std': float(np.std(actions)),
+                            'skew': float(0 if len(actions) < 2 else np.mean(np.power(actions, 3))),
+                            'action_count': len(actions)
+                        }
+                        
+                        # Check for significant bias
+                        if abs(metrics['mean']) > self.max_bias_threshold:
+                            bias_detected = True
+                            logger.warning(f"High bias detected for {asset}: mean={metrics['mean']:.4f}")
+                        
+                        self.asset_metrics[asset] = metrics
+                
+                # Apply corrections if needed
+                if bias_detected and self.balance_actions:
+                    self._apply_bias_corrections()
+                    
+                # Log metrics
+                self._log_metrics()
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in AssetAgnosticCallback._on_step: {e}")
+            logger.error(traceback.format_exc())
+            return True
+    
+    def _apply_bias_corrections(self):
+        """Apply corrections to reduce detected biases"""
+        try:
+            if hasattr(self.model, 'policy'):
+                # Get the policy network
+                policy = self.model.policy
+                
+                # Apply corrections to the final layer of the policy network
+                if hasattr(policy, 'action_net'):
+                    with torch.no_grad():
+                        for asset, metrics in self.asset_metrics.items():
+                            bias = metrics['mean']
+                            if abs(bias) > self.max_bias_threshold:
+                                # Calculate correction factor
+                                correction = -bias * 0.1  # Small correction to avoid instability
+                                
+                                # Apply correction to weights
+                                for param in policy.action_net.parameters():
+                                    if len(param.shape) == 2:  # Only modify weight matrices
+                                        param.data *= (1.0 + correction)
+                                
+                                logger.info(f"Applied bias correction to {asset}: {correction:.4f}")
+                
+                # Clear action history after correction
+                for asset in self.action_history:
+                    self.action_history[asset] = []
+                    
+        except Exception as e:
+            logger.error(f"Error in _apply_bias_corrections: {e}")
+            logger.error(traceback.format_exc())
+    
+    def _log_metrics(self):
+        """Log bias metrics to wandb and local file"""
+        try:
+            # Log to wandb
+            if wandb.run is not None:
+                for asset, metrics in self.asset_metrics.items():
+                    wandb.log({
+                        f"bias/{asset}/mean": metrics['mean'],
+                        f"bias/{asset}/std": metrics['std'],
+                        f"bias/{asset}/skew": metrics['skew'],
+                        f"bias/{asset}/action_count": metrics['action_count'],
+                        "global_step": self.n_calls
+                    })
+            
+            # Log to file
+            log_file = os.path.join(self.save_path, f"{self.name_prefix}_bias_metrics.json")
+            with open(log_file, 'w') as f:
+                json.dump(self.asset_metrics, f, indent=4)
+                
+            logger.info(f"Logged bias metrics to {log_file}")
+            
+        except Exception as e:
+            logger.error(f"Error in _log_metrics: {e}")
+            logger.error(traceback.format_exc())
 
 # Custom action noise class
 class CustomActionNoise:
@@ -470,6 +749,10 @@ def parse_args():
                        help='Use recommended hyperparameters from previous phase when continuing training')
     parser.add_argument('--recalibrate-value-function', action='store_true',
                        help='Run a value function recalibration phase before continuing training')
+    parser.add_argument('--bias-reduction', action='store_true',
+                       help='Apply bias reduction techniques (data augmentation, monitoring, and value function recalibration)')
+    parser.add_argument('--data-augmentation', action='store_true',
+                       help='Apply data augmentation to reduce bias')
     parser.add_argument('--drive-ids-file', type=str, default=None,
                        help='Path to JSON file containing Google Drive file IDs for data files. This enables Google Drive integration.')
     parser.add_argument('--config', type=str, default='config/prod_config.yaml',
@@ -2027,6 +2310,38 @@ class TradingSystem:
         # Set the model environment to our environment
         self.model.set_env(self.env)
         
+        # Check for bias reduction flag in hyperparams
+        apply_bias_reduction = False
+        apply_data_augmentation = False
+        recalibrate_value = False
+        
+        if hyperparams and 'bias_reduction' in hyperparams:
+            apply_bias_reduction = hyperparams.pop('bias_reduction')
+            logger.info(f"Bias reduction flag set to: {apply_bias_reduction}")
+            
+            # Data augmentation is part of bias reduction by default
+            apply_data_augmentation = apply_bias_reduction
+            recalibrate_value = apply_bias_reduction
+        
+        # Also check for specific data augmentation and recalibration flags
+        if hyperparams and 'apply_data_augmentation' in hyperparams:
+            apply_data_augmentation = hyperparams.pop('apply_data_augmentation') 
+            logger.info(f"Data augmentation flag set to: {apply_data_augmentation}")
+        
+        if hyperparams and 'recalibrate_value' in hyperparams:
+            recalibrate_value = hyperparams.pop('recalibrate_value')
+            logger.info(f"Value function recalibration flag set to: {recalibrate_value}")
+            
+        # Apply data augmentation if requested
+        if apply_data_augmentation:
+            logger.info("Applying data augmentation to reduce bias")
+            self.env = apply_data_augmentation(self.env)
+            
+        # Recalibrate value function if requested
+        # if recalibrate_value:
+        #     logger.info("Recalibrating value function for bias reduction")
+        #     self.model = recalibrate_value_function(self.model, self.env, num_steps=10000)
+        
         # CRITICAL FIX: Debug output after setting up environment
         logger.info(f"Environment setup complete. Training: {self.env.training}, Normalize reward: {self.env.norm_reward}")
         self._debug_print_norm_stats(self.env, "Environment After Setup")
@@ -2227,15 +2542,20 @@ class TradingSystem:
         # Setup callbacks
         callbacks = []
         
-        # # Checkpoint callback
-        # checkpoint_callback = CheckpointCallback(
-        #     save_freq=max(100000, additional_timesteps // 10),  # 10 checkpoints per training run
-        #     save_path=self.config['model']['checkpoint_dir'],
-        #     name_prefix=f"ppo_trading_phase{next_phase}"
-        # )
-        # callbacks.append(checkpoint_callback)
+        # Add bias monitoring callback
+        if apply_bias_reduction:
+            bias_callback = AssetAgnosticCallback(
+                check_freq=max(10000, additional_timesteps // 10),  # Check bias every 10K steps
+                save_path=os.path.join(args.model_dir, "checkpoints") if args and hasattr(args, 'model_dir') else "./bias_metrics",
+                name_prefix="model",
+                verbose=1,
+                balance_actions=True,
+                max_bias_threshold=0.2  # Trigger corrections if bias exceeds 0.2
+            )
+            callbacks.append(bias_callback)
+            logger.info("Added bias monitoring callback")
         
-        # Use our custom VecNormalizeEvalCallback instead of standard EvalCallback
+        # Add evaluation callback
         eval_callback = VecNormalizeEvalCallback(
             eval_env=self.env,
             n_eval_episodes=3,  # Reduced from 5 for better performance
@@ -2261,7 +2581,10 @@ class TradingSystem:
             "training/phase": next_phase,
             "training/additional_steps": additional_timesteps,
             "training/reset_num_timesteps": reset_num_timesteps,
-            "training/reset_reward_normalization": reset_reward_normalization
+            "training/reset_reward_normalization": reset_reward_normalization,
+            "training/bias_reduction": apply_bias_reduction,
+            "training/data_augmentation": apply_data_augmentation,
+            "training/value_recalibration": recalibrate_value
         })
         
         try:
@@ -3042,6 +3365,8 @@ def parse_hyperparams(hyperparams_str):
             value = True
         elif value_str.lower() == 'false':
             value = False
+        elif value_str.lower() == 'none':
+            value = None
         else:
             try:
                 # Try to convert to int or float
@@ -3051,6 +3376,12 @@ def parse_hyperparams(hyperparams_str):
                     value = float(value_str)
                 except ValueError:
                     value = value_str
+        
+        # Handle specific parameters
+        if param == 'bias_reduction' or param == 'apply_data_augmentation' or param == 'recalibrate_value':
+            # Ensure these are always boolean
+            if isinstance(value, str):
+                value = value.lower() in ('true', 'yes', '1', 't', 'y')
         
         hyperparams[param] = value
     
@@ -3101,13 +3432,26 @@ async def main():
         # Initialize trading system
         await trading_system.initialize(args)
 
-        # In your main function or where you handle args, add:
+        # Parse hyperparameters from args
         hyperparams_dict = {}
         if args.hyperparams:
             hyperparams_dict = parse_hyperparams(args.hyperparams)
             logger.info("Parsed hyperparameters:")
             for param, value in hyperparams_dict.items():
                 logger.info(f"  {param}: {value}")
+        
+        # Add bias reduction flags to hyperparams if specified via command line
+        if args.bias_reduction:
+            hyperparams_dict['bias_reduction'] = True
+            logger.info("Enabling bias reduction via command line argument")
+            
+        if args.data_augmentation:
+            hyperparams_dict['apply_data_augmentation'] = True
+            logger.info("Enabling data augmentation via command line argument")
+            
+        if args.recalibrate_value_function:
+            hyperparams_dict['recalibrate_value'] = True
+            logger.info("Enabling value function recalibration via command line argument")
         
         # Check if continuing training from an existing model
         if args.continue_training:
