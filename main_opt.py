@@ -1733,7 +1733,7 @@ class TradingSystem:
             
             while not done and step_count < max_episode_steps:
                 # Get action from model
-                action, _ = model.predict(obs, deterministic=True)  # Use stochastic actions for evaluation
+                action, _ = model.predict(obs, deterministic=False)  # Use stochastic actions for evaluation
                 
                 # CRITICAL FIX: Add much stronger exploration noise for more steps during evaluation
                 # This is crucial to ensure trades are executed during evaluation
@@ -2310,30 +2310,31 @@ class TradingSystem:
         # Set the model environment to our environment
         self.model.set_env(self.env)
         
-        # Check for bias reduction flag in hyperparams
+        # Initialize flags
         apply_bias_reduction = False
-        apply_data_augmentation = False
+        should_apply_augmentation = False
         recalibrate_value = False
         
+        # Check for bias reduction flag in hyperparams
         if hyperparams and 'bias_reduction' in hyperparams:
             apply_bias_reduction = hyperparams.pop('bias_reduction')
             logger.info(f"Bias reduction flag set to: {apply_bias_reduction}")
             
             # Data augmentation is part of bias reduction by default
-            apply_data_augmentation = apply_bias_reduction
+            should_apply_augmentation = apply_bias_reduction
             recalibrate_value = apply_bias_reduction
         
         # Also check for specific data augmentation and recalibration flags
         if hyperparams and 'apply_data_augmentation' in hyperparams:
-            apply_data_augmentation = hyperparams.pop('apply_data_augmentation') 
-            logger.info(f"Data augmentation flag set to: {apply_data_augmentation}")
+            should_apply_augmentation = hyperparams.pop('apply_data_augmentation') 
+            logger.info(f"Data augmentation flag set to: {should_apply_augmentation}")
         
         if hyperparams and 'recalibrate_value' in hyperparams:
             recalibrate_value = hyperparams.pop('recalibrate_value')
             logger.info(f"Value function recalibration flag set to: {recalibrate_value}")
             
         # Apply data augmentation if requested
-        if apply_data_augmentation:
+        if should_apply_augmentation:
             logger.info("Applying data augmentation to reduce bias")
             self.env = apply_data_augmentation(self.env)
             
@@ -2562,7 +2563,7 @@ class TradingSystem:
             eval_freq=max(25000, additional_timesteps // 5),  # 10 evaluations per training run
             log_path=self.config['logging']['log_dir'],
             best_model_save_path=os.path.join(self.config['model']['checkpoint_dir'], f"best_phase{next_phase}"),
-            deterministic=True,
+            deterministic=False,  # Changed to False for realistic evaluation
             verbose=1  # Enable verbose to see training mode changes
         )
         callbacks.append(eval_callback)
@@ -2583,7 +2584,7 @@ class TradingSystem:
             "training/reset_num_timesteps": reset_num_timesteps,
             "training/reset_reward_normalization": reset_reward_normalization,
             "training/bias_reduction": apply_bias_reduction,
-            "training/data_augmentation": apply_data_augmentation,
+            "training/data_augmentation": should_apply_augmentation,
             "training/value_recalibration": recalibrate_value
         })
         

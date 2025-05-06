@@ -62,6 +62,10 @@ show_help() {
     echo ""
     echo "  # Using Google Drive data:"
     echo "  $0 init 500000 --drive-ids-file drive_file_ids.json # Train using data from Google Drive"
+    echo "  # Bias correction and phase transition:"
+    echo "  $0 bias_correction 6 200000 --training-mode # Run 200K steps of bias correction after phase 6"
+    echo "  $0 continue 7 6 2000000 --training-mode --use-recommendations # Then continue with regular phase 7"
+    echo ""
 }
 
 # Process global arguments that apply to all commands
@@ -452,6 +456,110 @@ continue_training() {
     echo ""
 }
 
+# Add new bias_correction function before the main command processing
+bias_correction() {
+    local phase=$1
+    local steps=$2
+    local verbose=$3
+    local training_mode=$4
+    
+    echo "===================================================================="
+    echo "  RUNNING BIAS CORRECTION AFTER PHASE $phase"
+    echo "  WITH $steps STEPS"
+    if [ "$training_mode" = true ]; then
+        echo "  WITH TRAINING OPTIMIZATIONS ENABLED"
+    fi
+    if [ "$verbose" = true ]; then
+        echo "  WITH VERBOSE LOGGING ENABLED"
+    fi
+    echo "===================================================================="
+    echo ""
+    
+    # Create directories
+    PHASE_DIR="$MODEL_BASE_DIR/phase${phase}"
+    BIAS_CORRECTION_DIR="$MODEL_BASE_DIR/phase${phase}_bias_correction"
+    mkdir -p "$PHASE_DIR"
+    mkdir -p "$BIAS_CORRECTION_DIR"
+    
+    # Find previous model
+    PREV_MODEL_PATH=""
+    if [ -f "$PHASE_DIR/phase${phase}_model.zip" ]; then
+        PREV_MODEL_PATH="$PHASE_DIR/phase${phase}_model.zip"
+    elif [ -f "$PHASE_DIR/final_model.zip" ]; then
+        PREV_MODEL_PATH="$PHASE_DIR/final_model.zip"
+    elif [ -f "$PHASE_DIR/phase${phase}_model" ]; then
+        PREV_MODEL_PATH="$PHASE_DIR/phase${phase}_model"
+    elif [ -f "$PHASE_DIR/final_model" ]; then
+        PREV_MODEL_PATH="$PHASE_DIR/final_model"
+    else
+        echo "❌ ERROR: No model files found in $PHASE_DIR"
+        exit 1
+    fi
+    
+    # Find previous environment
+    PREV_ENV_PATH=""
+    if [ -f "$PHASE_DIR/phase${phase}_env.pkl" ]; then
+        PREV_ENV_PATH="$PHASE_DIR/phase${phase}_env.pkl"
+    elif [ -f "$PHASE_DIR/final_env.pkl" ]; then
+        PREV_ENV_PATH="$PHASE_DIR/final_env.pkl"
+    elif [ -f "$PHASE_DIR/vec_normalize.pkl" ]; then
+        PREV_ENV_PATH="$PHASE_DIR/vec_normalize.pkl"
+    fi
+    
+    # Set bias reduction hyperparameters
+    BIAS_HYPERPARAMS="ent_coef=0.04,bias_reduction=true,apply_data_augmentation=true,max_bias_threshold=0.15"
+    if [ -n "$HYPERPARAMS" ]; then
+        BIAS_HYPERPARAMS="$BIAS_HYPERPARAMS,$HYPERPARAMS"
+    fi
+    
+    # Build command
+    COMMAND="python main_opt.py --continue-training --model-path \"$PREV_MODEL_PATH\""
+    if [ -n "$PREV_ENV_PATH" ]; then
+        COMMAND="$COMMAND --env-path \"$PREV_ENV_PATH\""
+    fi
+    COMMAND="$COMMAND --additional-steps $steps --model-dir \"$BIAS_CORRECTION_DIR\""
+    
+    # Add flags
+    if [ "$verbose" = true ]; then
+        COMMAND="$COMMAND --verbose"
+    fi
+    if [ "$training_mode" = true ]; then
+        COMMAND="$COMMAND --training-mode"
+    fi
+    COMMAND="$COMMAND --hyperparams \"$BIAS_HYPERPARAMS\""
+    
+    # Add Google Drive integration if specified
+    if [ -n "$DRIVE_IDS_FILE" ]; then
+        COMMAND="$COMMAND --drive-ids-file \"$DRIVE_IDS_FILE\""
+    fi
+    
+    # Run command
+    if [ "$ENABLE_LOGGING" = true ]; then
+        mkdir -p "$LOG_BASE_DIR/phase${phase}_bias_correction"
+        echo "Output will be logged to $LOG_BASE_DIR/phase${phase}_bias_correction/training.log"
+        eval "$COMMAND 2>&1 | tee \"$LOG_BASE_DIR/phase${phase}_bias_correction/training.log\""
+    else
+        echo "Showing live progress (not logging to file)..."
+        eval "$COMMAND"
+    fi
+    
+    echo ""
+    echo "✅ Bias correction complete!"
+    echo "Model saved to $BIAS_CORRECTION_DIR"
+    echo ""
+    echo "📋 NEXT SUGGESTED COMMAND:"
+    next_phase=$((phase + 1))
+    suggestion_cmd="./scripts/manual_incremental.sh continue $next_phase ${phase} 2000000"
+    
+    if [ "$training_mode" = true ]; then
+        suggestion_cmd="$suggestion_cmd --training-mode"
+    fi
+    suggestion_cmd="$suggestion_cmd --use-recommendations"
+    
+    echo "$suggestion_cmd"
+    echo ""
+}
+
 # Main command processing
 case "$1" in
     "init")
@@ -505,6 +613,32 @@ case "$1" in
     
     "help" | "-h" | "--help")
         show_help
+        ;;
+    
+    "bias_correction")
+        VERBOSE=false
+        TRAINING_MODE=false
+        
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "❌ ERROR: Please specify the phase number and steps for bias correction"
+            show_help
+            exit 1
+        fi
+        
+        PHASE="$2"
+        STEPS="$3"
+        
+        # Check for flags
+        for arg in "$@"; do
+            if [ "$arg" = "--verbose" ]; then
+                VERBOSE=true
+            fi
+            if [ "$arg" = "--training-mode" ]; then
+                TRAINING_MODE=true
+            fi
+        done
+        
+        bias_correction $PHASE $STEPS $VERBOSE $TRAINING_MODE
         ;;
     
     *)
