@@ -1,4 +1,4 @@
-# Quantum AI Trading System
+# Quant AI Trading System
 
 <!-- ./scripts/manual_incremental.sh init 500000 --training-mode --drive-ids-file drive_file_ids.json  -->
 
