@@ -52,183 +52,200 @@ The system combines multiple data sources to form a comprehensive market view:
   - Implements iceberg orders when needed
   - Considers funding rates for perpetual futures
 
-## System Architecture
+# Quantitative Trading System Workflow
 
-### 1. Data Collection (`data_collection/`)
+## System Architecture Diagram
 
-#### MultiModalDataCollector (`collect_multimodal.py`)
-
-- **Purpose**: Collects and processes multiple types of data sources for trading
-- **Data Types**:
-  - Price/Market Data (OHLCV)
-  - Technical Indicators
-  - News Sentiment (currently commented out)
-  - Social Media Sentiment (currently commented out)
-  - On-chain Metrics (currently commented out)
-- **Key Features**:
-  - Rate limiting for API calls
-  - Robust error handling
-  - Data normalization and preprocessing
-
-### 2. Trading Environment (`trading_env/`)
-
-#### InstitutionalPerpetualEnv (`institutional_perp_env.py`)
-
-- **Purpose**: Custom OpenAI Gym environment for perpetual futures trading
-- **Features**:
-  - Multi-asset support
-  - Realistic trading mechanics:
-    - Funding rates
-    - Transaction fees
-    - Price impact modeling
-    - Spread costs
-  - Risk management integration
-  - Position tracking
-
-### 3. Training System (`training/`)
-
-#### HierarchicalPPO (`hierarchical_ppo.py`)
-
-- **Purpose**: Implementation of Hierarchical Proximal Policy Optimization for training the trading agent
-- **Architecture**:
-  - Market Transformer: Processes market data using attention mechanisms
-  - Text Encoder: Processes news and social media (using RoBERTa)
-  - Risk LSTM: Processes risk metrics
-  - Cross-asset attention mechanism
-  - Feature fusion layer
-- **Components**:
-  - Custom Actor-Critic Policy
-  - Multiple action heads for different aspects of trading
-  - GAE (Generalized Advantage Estimation)
-
-### 4. Risk Management System (`risk_management/`)
-
-#### InstitutionalRiskEngine (`risk_engine.py`)
-
-- **Purpose**: Comprehensive risk management and monitoring system
-- **Features**:
-  - Position Risk Management:
-    - Value at Risk (VaR) calculations
-    - Expected Shortfall (ES) metrics
-    - Stress testing scenarios
-  - Portfolio Risk Controls:
-    - Dynamic position sizing
-    - Correlation-based exposure limits
-    - Drawdown management
-  - Market Risk Monitoring:
-    - Volatility regime detection
-    - Liquidity risk assessment
-    - Counterparty risk tracking
-  - Risk Reporting:
-    - Real-time risk metrics
-    - Historical risk analysis
-    - Risk limit breach alerts
-
-## Key Technologies and Libraries
-
-### Machine Learning
-
-- PyTorch: Deep learning framework
-- Transformers: For NLP tasks
-- Stable-Baselines3: RL algorithms base
-- Gymnasium: Environment framework
-
-### Data Processing
-
-- Pandas: Data manipulation
-- NumPy: Numerical computations
-- ta: Technical analysis
-
-### APIs and Services
-
-- CCXT: Cryptocurrency exchange interface
-- News API (commented)
-- Twitter API (commented)
-- On-chain data APIs (commented)
-
-## Trading Strategy Components
-
-### 1. Feature Processing
-
-- **Market Data**:
-  ```python
-  class MarketTransformer(nn.Module):
-      # Processes market data using transformer architecture
-      # Captures temporal dependencies and cross-asset relationships
-  ```
-
-### 2. Risk Management
-
-- **Risk Metrics**:
-  ```python
-  class RiskLSTM(nn.Module):
-      # Processes risk-related features
-      # Uses LSTM with attention for temporal risk patterns
-  ```
-
-### 3. Decision Making
-
-- **Actor-Critic Architecture**:
-  ```python
-  class CustomActorCriticPolicy(nn.Module):
-      # Multiple action heads for:
-      # - Trade decisions
-      # - Position sizing
-      # - Risk limits
-      # - Execution parameters
-  ```
-
-## Configuration and Hyperparameters
-
-### Environment Parameters
-
-- Initial Balance: 1M USDC
-- Max Leverage: 20x
-- Transaction Fee: 0.04%
-- Funding Fee Multiplier: 0.8
-- Risk-free Rate: 3%
-- Max Drawdown: 30%
-
-### Training Parameters
-
-- Learning Rate: 3e-4
-- Batch Size: 64
-- Training Steps: 2048
-- Epochs: 10
-- Gamma (discount factor): 0.99
-- GAE Lambda: 0.95
-- Clip Range: 0.2
-
-## Usage
-
-### 1. Data Collection
-
-```python
-collector = MultiModalDataCollector()
-collector.collect_and_save_data(
-    start_date=start_date,
-    end_date=end_date,
-    output_path='data/train_data.parquet'
-)
+```mermaid
+graph TD
+    A[Data Collection] --> B[Data System]
+    B --> C[Feature Processing]
+    C --> D[Training]
+    D --> E[Trading Environment]
+    E --> F[Risk Management]
+    F --> E
+    E --> D
 ```
 
-### 2. Training
+## 1. Data Collection Layer
+
+The data collection layer is responsible for gathering multi-modal data from various sources:
+
+- Market data (prices, volumes, order book)
+- Sentiment data (social media, news)
+- On-chain data (whale movements, network metrics)
+
+Key components:
+
+- `collect_multimodal.py`: Coordinates collection of data from different sources
+- `whale_tracker.py`: Monitors large wallet movements and blockchain activity
+- `test_apis.py`: Tests API connections and data validity
+
+## 2. Data System Layer
+
+The data system processes and manages the collected data:
+
+### Data Management
+
+- `data_manager.py`: Core data processing and storage
+- `enhanced_data_manager.py`: Advanced data processing features
+- `multimodal_feature_extractor.py`: Extracts features from different data types
+
+### Feature Processing
+
+- `feature_extractors.py`: Contains various feature extraction methods
+  - Market features (price, volume, volatility)
+  - Sentiment features (sentiment scores, social metrics)
+  - On-chain features (network activity, whale movements)
+
+## 3. Training Layer
+
+The training system uses hierarchical reinforcement learning:
+
+### Hierarchical PPO Implementation
+
+- `hierarchical_ppo.py`: Implements hierarchical proximal policy optimization
+  - High-level policy: Strategic decisions
+  - Low-level policy: Tactical execution
+  - Reward shaping based on PnL and risk metrics
+
+## 4. Trading Environment
+
+The institutional perpetual futures trading environment:
+
+### Key Components (`institutional_perp_env.py`):
+
+- Observation Space:
+
+  ```python
+  # Market, sentiment, onchain, and portfolio features
+  self.observation_space = spaces.Box(
+      low=-np.inf,
+      high=np.inf,
+      shape=(total_features,),
+      dtype=np.float32
+  )
+  ```
+
+- Action Space:
+  ```python
+  # Trade decisions (-1 to 1) and position sizes (0 to 1)
+  self.action_space = spaces.Box(
+      low=np.array([-1] * n_assets + [0] * n_assets),
+      high=np.array([1] * n_assets + [1] * n_assets),
+      dtype=np.float32
+  )
+  ```
+
+### Key Methods:
+
+1. Trade Execution:
 
 ```python
-env = InstitutionalPerpetualEnv(
-    df=data,
-    initial_balance=1e6,
-    max_leverage=20
-)
-
-model = HierarchicalPPO(
-    env=env,
-    learning_rate=3e-4,
-    n_steps=2048
-)
-
-model.learn(total_timesteps=100_000)
+def _execute_trade(self, asset: str, trade_decision: float, position_size: float):
+    # Calculates target position
+    # Handles transaction costs
+    # Updates positions and balance
 ```
+
+2. Risk-Adjusted Rewards:
+
+```python
+def _calculate_risk_adjusted_reward(self, risk_metrics: Dict):
+    # Incorporates multiple risk factors:
+    # - Sharpe ratio
+    # - Sortino ratio
+    # - Calmar ratio
+    # - Diversification score
+    # - Leverage penalty
+```
+
+## 5. Risk Management Layer
+
+Comprehensive risk management system:
+
+### Risk Engine (`risk_engine.py`):
+
+- Risk Limits:
+  - Maximum drawdown
+  - Leverage limits
+  - VaR limits
+  - Position concentration
+  - Correlation limits
+  - Liquidity ratios
+
+### Key Risk Functions:
+
+1. Portfolio Risk Calculation:
+
+```python
+def calculate_portfolio_risk(self, positions, market_data, portfolio_value):
+    # Calculates VaR
+    # Measures Expected Shortfall
+    # Monitors position concentration
+    # Tracks correlation risk
+```
+
+2. Liquidation Risk:
+
+```python
+def check_risk_limits(self, risk_metrics):
+    # Verifies all risk limits
+    # Returns violations if any
+    # Triggers liquidation if necessary
+```
+
+## System Workflow
+
+1. **Data Pipeline**:
+
+   - Continuous data collection from multiple sources
+   - Feature extraction and preprocessing
+   - Data storage and management
+
+2. **Training Process**:
+
+   - Hierarchical PPO training with two policy levels
+   - Risk-aware reward shaping
+   - Continuous model updates based on performance
+
+3. **Trading Execution**:
+
+   - Environment state observation
+   - Policy-based action selection
+   - Smart order execution with transaction cost consideration
+   - Real-time risk monitoring and management
+
+4. **Risk Management**:
+   - Continuous risk metric calculation
+   - Limit monitoring and enforcement
+   - Automated risk-based position adjustment
+   - Liquidation protection
+
+## Key Features
+
+1. **Multi-modal Data Integration**:
+
+   - Market data analysis
+   - Sentiment incorporation
+   - On-chain metrics utilization
+
+2. **Advanced Risk Management**:
+
+   - Real-time risk monitoring
+   - Multiple risk metric tracking
+   - Automated risk limit enforcement
+
+3. **Smart Execution**:
+
+   - Transaction cost optimization
+   - Price impact consideration
+   - Liquidity-aware trading
+
+4. **Hierarchical Learning**:
+   - Strategic high-level decisions
+   - Tactical execution optimization
+   - Risk-adjusted reward optimization
 
 ## Future Enhancements
 
@@ -258,3 +275,5 @@ A new institutional-grade backtesting module has been added to the repository. T
 - **Comprehensive Metrics**: Calculate performance metrics, risk metrics, and trade statistics
 - **Visualization Tools**: Create visualizations of performance, drawdowns, returns distribution, and more
 - **Bias Reduction**: Techniques to minimize look-ahead bias and data leakage
+
+
