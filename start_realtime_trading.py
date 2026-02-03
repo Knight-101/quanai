@@ -49,21 +49,31 @@ def parse_arguments():
                        help='Directory to save trade logs')
     
     parser.add_argument('--backfill-days', type=int,
-                       default=5,
+                       default=100,
                        help='Number of days to backfill data if no historical data provided')
+    
+    # Add timeframe control options
+    parser.add_argument('--force-timeframe', type=str,
+                       default=None,
+                       help='Force a specific timeframe for API calls (e.g., "5m")')
+    
+    parser.add_argument('--disable-resampling', action='store_true',
+                       help='Disable automatic resampling of 1m data to match training timeframe')
+    
+    # Add report generation options
+    parser.add_argument('--disable-reports', action='store_true',
+                       help='Disable detailed daily trading reports')
+                       
+    # Add symbols parameter
+    parser.add_argument('--symbols', type=str,
+                       default=None,
+                       help='Comma-separated list of symbols to trade (e.g., "BTCUSDT,ETHUSDT,SOLUSDT")')
     
     return parser.parse_args()
 
 async def main():
     """Main function to start the real-time paper trading system."""
     args = parse_arguments()
-    
-    # Import realtime_trading module
-    try:
-        from realtime_trading import RealTimeTrader
-    except ImportError:
-        print("Error: Could not import RealTimeTrader. Make sure realtime_trading.py is in the same directory.")
-        sys.exit(1)
     
     # Check if model exists
     if not os.path.exists(args.model):
@@ -79,20 +89,53 @@ async def main():
     print(f"Max leverage: {args.max_leverage}x")
     print(f"Websocket server will be available on port: {args.websocket_port}")
     print(f"Trade logs will be saved to: {args.save_path}")
+    if args.use_llm:
+        print(f"LLM market commentary enabled using model: {args.llm_model}")
+    else:
+        print("LLM market commentary disabled")
     print("Press Ctrl+C to stop trading and close all positions")
+    
+    # Import and run the trading system
+    from realtime_trading import RealTimeTrader
     
     # Initialize trader
     trader = RealTimeTrader(
         model_path=args.model,
         env_path=args.env,
         config_path=args.config,
-        initial_balance=args.balance,
-        historical_data_path=args.historical_data,
-        max_leverage=args.max_leverage,
-        websocket_port=args.websocket_port,
-        save_trades_path=args.save_path,
-        backfill_days=args.backfill_days
-    )
+                initial_balance=args.balance,
+                historical_data_path=args.historical_data,
+                max_leverage=args.max_leverage,
+                websocket_port=args.websocket_port,
+                save_trades_path=args.save_path,
+                backfill_days=args.backfill_days,
+                force_timeframe=args.force_timeframe,
+                resample_data=not args.disable_resampling,
+                enable_reports=not args.disable_reports
+            )
+    else:
+        # Import realtime_trading module for basic trading
+        try:
+            from realtime_trading import RealTimeTrader
+        except ImportError:
+            print("Error: Could not import RealTimeTrader. Make sure realtime_trading.py is in the same directory.")
+            sys.exit(1)
+        
+        # Initialize trader
+        trader = RealTimeTrader(
+            model_path=args.model,
+            env_path=args.env,
+            config_path=args.config,
+            initial_balance=args.balance,
+            historical_data_path=args.historical_data,
+            max_leverage=args.max_leverage,
+            websocket_port=args.websocket_port,
+            save_trades_path=args.save_path,
+            backfill_days=args.backfill_days,
+            force_timeframe=args.force_timeframe,
+            resample_data=not args.disable_resampling,
+            enable_reports=not args.disable_reports
+        )
     
     try:
         # Set up trader
@@ -106,6 +149,8 @@ async def main():
         print("\nTrading interrupted. Closing positions and shutting down...")
     except Exception as e:
         print(f"Error during trading: {str(e)}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Ensure proper shutdown
         if trader:

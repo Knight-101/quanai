@@ -23,13 +23,11 @@ from monitoring.dashboard import TradingDashboard
 import warnings
 from data_system.data_manager import DataManager
 from stable_baselines3.ppo import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch.nn as nn
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
-import optuna
-from optuna.pruners import MedianPruner
-from optuna.samplers import TPESampler
+# Optuna imports removed - optimization code is unused
 import traceback
 from stable_baselines3.common.running_mean_std import RunningMeanStd
 import json
@@ -441,167 +439,8 @@ class CustomFeatureExtractor(BaseFeaturesExtractor):
         
         return x
 
-class ResNetFeatureExtractor(BaseFeaturesExtractor):
-    """
-    Custom feature extractor using residual connections for better gradient flow.
-    This network architecture is better at capturing complex patterns across time
-    and relationships between different assets and features.
-    """
-    def __init__(self, observation_space, features_dim=128, dropout_rate=0.1, use_layer_norm=True):
-        super().__init__(observation_space, features_dim)
-        
-        # Get input dim from observation space
-        n_input_features = int(np.prod(observation_space.shape))
-        
-        # Save parameters
-        self.dropout_rate = dropout_rate
-        self.use_layer_norm = use_layer_norm
-        
-        # Define network architecture
-        # First layer processes the raw input
-        self.first_layer = nn.Sequential(
-            nn.Linear(n_input_features, 256),
-            nn.LayerNorm(256) if use_layer_norm else nn.Identity(),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout_rate)
-        )
-        
-        # Residual blocks for better gradient flow
-        self.res_block1 = self._make_res_block(256, 256)
-        self.res_block2 = self._make_res_block(256, 256)
-        
-        # Feature reduction and transformation
-        self.feature_transform = nn.Sequential(
-            nn.Linear(256, features_dim),
-            nn.LayerNorm(features_dim) if use_layer_norm else nn.Identity(),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout_rate)
-        )
-        
-        # Track uncertainty for position sizing
-        self.uncertainty_head = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.LayerNorm(64) if use_layer_norm else nn.Identity(),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, 1)  # One uncertainty value per forward pass
-        )
-        
-    def _make_res_block(self, in_features, out_features):
-        """Create a residual block with the same input/output dimension"""
-        return nn.Sequential(
-            nn.Linear(in_features, out_features),
-            nn.LayerNorm(out_features) if self.use_layer_norm else nn.Identity(),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(self.dropout_rate),
-            nn.Linear(out_features, out_features),
-            nn.LayerNorm(out_features) if self.use_layer_norm else nn.Identity(),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(self.dropout_rate)
-        )
-        
-    def forward(self, observations):
-        # Initial feature processing
-        features = self.first_layer(observations)
-        
-        # Apply residual connections
-        res1 = features + self.res_block1(features)
-        res2 = res1 + self.res_block2(res1)
-        
-        # Generate uncertainty estimates (side path)
-        # This allows the network to explicitly model uncertainty which can be
-        # used for position sizing in the environment
-        uncertainty = torch.sigmoid(self.uncertainty_head(res2))
-        
-        # Final feature transformation
-        transformed_features = self.feature_transform(res2)
-        
-        # Store uncertainty for potential use in position sizing
-        self._last_uncertainty = uncertainty
-        
-        return transformed_features
-
-class TransformerFeatureExtractor(BaseFeaturesExtractor):
-    """
-    Transformer-based feature extractor for time series data.
-    This architecture is specifically designed to capture long-range dependencies 
-    and temporal patterns in market data.
-    """
-    def __init__(self, observation_space, features_dim=128, dropout_rate=0.1, 
-                 d_model=64, nhead=4, num_layers=2, use_layer_norm=True):
-        super().__init__(observation_space, features_dim)
-        
-        # Get input dimension from observation space
-        n_input_features = int(np.prod(observation_space.shape))
-        
-        # Save parameters
-        self.dropout_rate = dropout_rate
-        self.use_layer_norm = use_layer_norm
-        self.d_model = d_model
-        self.nhead = nhead
-        self.num_layers = num_layers
-        
-        # Input embedding layer
-        self.input_embedding = nn.Sequential(
-            nn.Linear(n_input_features, d_model),
-            nn.LayerNorm(d_model) if use_layer_norm else nn.Identity(),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout_rate)
-        )
-        
-        # Transformer encoder layer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model*4,
-            dropout=dropout_rate,
-            activation='gelu',
-            batch_first=True
-        )
-        
-        # Transformer encoder
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers
-        )
-        
-        # Output projection
-        self.output_projection = nn.Sequential(
-            nn.Linear(d_model, features_dim),
-            nn.LayerNorm(features_dim) if use_layer_norm else nn.Identity(),
-            nn.LeakyReLU(0.2)
-        )
-        
-        # Uncertainty head for risk estimation
-        self.uncertainty_head = nn.Sequential(
-            nn.Linear(d_model, 32),
-            nn.LayerNorm(32) if use_layer_norm else nn.Identity(),
-            nn.LeakyReLU(0.2),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, observations):
-        # Input embedding
-        x = self.input_embedding(observations)
-        
-        # Reshape for transformer (batch_size, sequence_length=1, d_model)
-        # For now, we treat each observation as a sequence of length 1
-        x = x.unsqueeze(1)
-        
-        # Apply transformer encoder
-        transformer_output = self.transformer_encoder(x)
-        
-        # Extract output and squeeze sequence dimension
-        transformer_output = transformer_output.squeeze(1)
-        
-        # Calculate uncertainty estimate
-        uncertainty = self.uncertainty_head(transformer_output)
-        self._last_uncertainty = uncertainty
-        
-        # Output projection
-        features = self.output_projection(transformer_output)
-        
-        return features
+# ResNetFeatureExtractor and TransformerFeatureExtractor removed - not used
+# Only HybridFeatureExtractor is actually used in the codebase
 
 class HybridFeatureExtractor(BaseFeaturesExtractor):
     """
@@ -878,7 +717,7 @@ class TradingSystem:
         self.env = None
         self.model = None
         self.processed_data = None
-        self.study = None
+        # Removed: self.study = None (Optuna optimization not used)
         
     async def initialize(self, args=None):
         """Single entry point for all initialization"""
@@ -1294,26 +1133,13 @@ class TradingSystem:
         
         return model
         
-    def create_study(self):
-        """Create Optuna study for hyperparameter optimization"""
-        storage = optuna.storages.InMemoryStorage()
-        sampler = TPESampler(seed=42)
-        pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=10)
-        
-        self.study = optuna.create_study(
-            study_name="ppo_optimization",
-            direction="maximize",  # We want to maximize returns
-            sampler=sampler,
-            pruner=pruner,
-            storage=storage
-        )
-        
-    def optimize_hyperparameters(self, n_trials=30, n_jobs=5, total_timesteps=100000):
-        """Run hyperparameter optimization"""
-        if not self.study:
-            self.create_study()
-            
-        logger.info(f"\nStarting hyperparameter optimization with {n_trials} trials")
+    # Optuna hyperparameter optimization code removed - was never called
+    # (optimize_hyperparameters, objective, create_study, update_model_with_best_params, _evaluate_model)
+    
+    def train(self, args=None):
+        """Optimized training method with early stopping and best model saving"""
+        if not self.model or not self.env:
+            raise RuntimeError("System not initialized. Call initialize() first.")
         logger.info(f"Number of parallel jobs: {n_jobs}")
         logger.info(f"Total timesteps per trial: {total_timesteps}")
         

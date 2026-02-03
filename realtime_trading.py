@@ -24,7 +24,7 @@ import numpy as np
 import ccxt.async_support as ccxt_async
 import yaml
 from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 import traceback
 import threading
@@ -33,6 +33,9 @@ import websockets
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
 
 # Local imports
 from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
@@ -50,6 +53,708 @@ logging.basicConfig(
 )
 logger = logging.getLogger('realtime_trading')
 
+# Add DailyReportGenerator class
+class DailyReportGenerator:
+    """
+    Generates comprehensive daily trading reports with performance metrics.
+    
+    Includes:
+    - PnL metrics (daily, cumulative)
+    - Risk metrics (Sharpe, Sortino, drawdown)
+    - Trading statistics (win rate, avg trade, etc.)
+    - Symbol-specific performance
+    """
+    
+    def __init__(self, reports_dir: str, risk_free_rate: float = 0.02/365):
+        """
+        Initialize the report generator.
+        
+        Args:
+            reports_dir: Directory to save reports
+            risk_free_rate: Daily risk-free rate for Sharpe calculation
+        """
+        self.reports_dir = reports_dir
+        self.risk_free_rate = risk_free_rate
+        self.daily_stats = {}
+        self.all_days_stats = {}
+        self.current_date = date.today()
+        
+        # Ensure reports directory exists
+        os.makedirs(self.reports_dir, exist_ok=True)
+        # Create subdirectories
+        os.makedirs(os.path.join(self.reports_dir, 'daily'), exist_ok=True)
+        os.makedirs(os.path.join(self.reports_dir, 'charts'), exist_ok=True)
+        os.makedirs(os.path.join(self.reports_dir, 'trades'), exist_ok=True)
+        
+        # Configure logging
+        self.logger = logging.getLogger('report_generator')
+    
+    def process_day_trades(self, trades: List[Dict], positions: Dict, 
+                          pnl_history: List[Dict], start_balance: float,
+                          symbols: List[str], day: Optional[date] = None):
+        """
+        Process all trades for a specific day and generate performance metrics.
+        
+        Args:
+            trades: List of all trades executed
+            positions: Current positions
+            pnl_history: PnL history with timestamps
+            start_balance: Starting balance for the day
+            symbols: List of trading symbols
+            day: Specific day to process (defaults to today)
+        
+        Returns:
+            Dict with daily performance metrics
+        """
+        if day is None:
+            day = date.today()
+            
+        day_str = day.strftime('%Y-%m-%d')
+        self.logger.info(f"Generating daily report for {day_str}")
+        
+        # Filter trades for the specified day
+        day_trades = []
+        for trade in trades:
+            trade_time = datetime.fromisoformat(trade['timestamp'].replace('Z', '+00:00') 
+                                              if trade['timestamp'].endswith('Z') 
+                                              else trade['timestamp'])
+            if trade_time.date() == day:
+                day_trades.append(trade)
+        
+        # Filter PnL history for the specified day
+        day_pnl = []
+        for pnl_record in pnl_history:
+            pnl_time = datetime.fromisoformat(pnl_record['timestamp'].replace('Z', '+00:00') 
+                                             if pnl_record['timestamp'].endswith('Z') 
+                                             else pnl_record['timestamp'])
+            if pnl_time.date() == day:
+                day_pnl.append(pnl_record)
+        
+        # Initialize performance metrics
+        metrics = {
+            'date': day_str,
+            'total_trades': len(day_trades),
+            'trades_by_symbol': {symbol: 0 for symbol in symbols},
+            'pnl': {
+                'realized': 0.0,
+                'unrealized': 0.0,
+                'total': 0.0,
+                'by_symbol': {symbol: 0.0 for symbol in symbols}
+            },
+            'balance': {
+                'start': start_balance,
+                'end': pnl_history[-1]['balance'] if pnl_history else start_balance,
+                'change': 0.0,
+                'change_pct': 0.0
+            },
+            'sharpe': 0.0,
+            'sortino': 0.0,
+            'drawdown': {
+                'max_drawdown': 0.0,
+                'max_drawdown_pct': 0.0,
+                'current_drawdown': 0.0,
+                'current_drawdown_pct': 0.0
+            },
+            'win_rate': 0.0,
+            'profit_factor': 0.0,
+            'avg_win': 0.0,
+            'avg_loss': 0.0,
+            'best_trade': 0.0,
+            'worst_trade': 0.0,
+            'trade_details': day_trades,
+            'hourly_performance': {}
+        }
+        
+        # Calculate trade statistics
+        if day_trades:
+            # Count trades by symbol
+            for trade in day_trades:
+                if 'symbol' in trade:
+                    symbol = trade['symbol']
+                    metrics['trades_by_symbol'][symbol] = metrics['trades_by_symbol'].get(symbol, 0) + 1
+            
+            # Calculate realized PnL from trades
+            total_realized_pnl = 0.0
+            realized_by_symbol = {symbol: 0.0 for symbol in symbols}
+            win_trades = []
+            loss_trades = []
+            
+            for trade in day_trades:
+                # Sum up realized PnL
+                if 'pnl' in trade:
+                    pnl = trade['pnl']
+                    total_realized_pnl += pnl
+                    
+                    # Track by symbol
+                    if 'symbol' in trade:
+                        symbol = trade['symbol']
+                        realized_by_symbol[symbol] = realized_by_symbol.get(symbol, 0.0) + pnl
+                    
+                    # Track win/loss trades
+                    if pnl > 0:
+                        win_trades.append(pnl)
+                    elif pnl < 0:
+                        loss_trades.append(pnl)
+            
+            # Calculate win rate and related metrics
+            if win_trades or loss_trades:
+                metrics['win_rate'] = len(win_trades) / (len(win_trades) + len(loss_trades)) if (len(win_trades) + len(loss_trades)) > 0 else 0.0
+                metrics['avg_win'] = sum(win_trades) / len(win_trades) if win_trades else 0.0
+                metrics['avg_loss'] = sum(loss_trades) / len(loss_trades) if loss_trades else 0.0
+                metrics['best_trade'] = max(win_trades) if win_trades else 0.0
+                metrics['worst_trade'] = min(loss_trades) if loss_trades else 0.0
+                metrics['profit_factor'] = abs(sum(win_trades) / sum(loss_trades)) if loss_trades and sum(loss_trades) != 0 else float('inf')
+            
+            metrics['pnl']['realized'] = total_realized_pnl
+            for symbol in symbols:
+                metrics['pnl']['by_symbol'][symbol] = realized_by_symbol.get(symbol, 0.0)
+        
+        # Calculate current unrealized PnL
+        total_unrealized_pnl = 0.0
+        for symbol, position in positions.items():
+            if isinstance(position, dict) and 'unrealized_pnl' in position:
+                total_unrealized_pnl += position['unrealized_pnl']
+        
+        metrics['pnl']['unrealized'] = total_unrealized_pnl
+        metrics['pnl']['total'] = metrics['pnl']['realized'] + metrics['pnl']['unrealized']
+        
+        # Calculate balance changes
+        if day_pnl:
+            start_value = day_pnl[0]['total_value'] if day_pnl else start_balance
+            end_value = day_pnl[-1]['total_value'] if day_pnl else (start_balance + total_realized_pnl + total_unrealized_pnl)
+            
+            metrics['balance']['start'] = start_value
+            metrics['balance']['end'] = end_value
+            metrics['balance']['change'] = end_value - start_value
+            metrics['balance']['change_pct'] = ((end_value / start_value) - 1) * 100 if start_value > 0 else 0.0
+        
+        # Calculate drawdown
+        if day_pnl:
+            # Convert PnL history to DataFrame for easier analysis
+            pnl_df = pd.DataFrame(day_pnl)
+            pnl_df['timestamp'] = pd.to_datetime(pnl_df['timestamp'])
+            pnl_df = pnl_df.set_index('timestamp')
+            
+            # Calculate running maximum
+            pnl_df['peak'] = pnl_df['total_value'].cummax()
+            
+            # Calculate drawdown in dollars and percentage
+            pnl_df['drawdown'] = pnl_df['peak'] - pnl_df['total_value']
+            pnl_df['drawdown_pct'] = (pnl_df['drawdown'] / pnl_df['peak']) * 100
+            
+            # Get maximum drawdown
+            metrics['drawdown']['max_drawdown'] = pnl_df['drawdown'].max()
+            metrics['drawdown']['max_drawdown_pct'] = pnl_df['drawdown_pct'].max()
+            
+            # Get current drawdown
+            metrics['drawdown']['current_drawdown'] = pnl_df['drawdown'].iloc[-1]
+            metrics['drawdown']['current_drawdown_pct'] = pnl_df['drawdown_pct'].iloc[-1]
+            
+            # Calculate hourly performance
+            pnl_df['hour'] = pnl_df.index.hour
+            hourly_pnl = pnl_df.groupby('hour')['total_value'].last() - pnl_df.groupby('hour')['total_value'].first()
+            metrics['hourly_performance'] = hourly_pnl.to_dict()
+            
+            # Calculate returns for Sharpe/Sortino calculation
+            pnl_df['returns'] = pnl_df['total_value'].pct_change()
+            
+            # Drop NaN values (first row will have NaN return)
+            pnl_df = pnl_df.dropna(subset=['returns'])
+            
+            if len(pnl_df) > 1:
+                # Calculate Sharpe ratio (annualized)
+                excess_returns = pnl_df['returns'] - self.risk_free_rate
+                sharpe = excess_returns.mean() / excess_returns.std() if excess_returns.std() > 0 else 0
+                metrics['sharpe'] = sharpe * (252 ** 0.5)  # Annualized
+                
+                # Calculate Sortino ratio (downside risk only)
+                downside_returns = pnl_df[pnl_df['returns'] < 0]['returns']
+                sortino = excess_returns.mean() / downside_returns.std() if len(downside_returns) > 0 and downside_returns.std() > 0 else 0
+                metrics['sortino'] = sortino * (252 ** 0.5)  # Annualized
+        
+        # Store the metrics
+        self.daily_stats[day_str] = metrics
+        return metrics
+    
+    def generate_daily_report(self, day: Optional[date] = None):
+        """
+        Generate a detailed daily report and save it to disk.
+        
+        Args:
+            day: Day to generate report for (defaults to today)
+        
+        Returns:
+            Path to the generated report
+        """
+        if day is None:
+            day = date.today()
+            
+        day_str = day.strftime('%Y-%m-%d')
+        
+        if day_str not in self.daily_stats:
+            self.logger.warning(f"No data available for {day_str}, cannot generate report")
+            return None
+        
+        # Get the day's metrics
+        metrics = self.daily_stats[day_str]
+        
+        # Create report file path
+        report_path = os.path.join(self.reports_dir, 'daily', f"report_{day_str}.json")
+        
+        # Save full metrics to JSON
+        with open(report_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        
+        # Generate HTML report
+        html_report_path = os.path.join(self.reports_dir, 'daily', f"report_{day_str}.html")
+        self._generate_html_report(metrics, html_report_path)
+        
+        # Generate charts
+        charts_path = os.path.join(self.reports_dir, 'charts', f"performance_{day_str}.png")
+        self._generate_performance_chart(metrics, charts_path)
+        
+        # Save trades detail to CSV
+        trades_path = os.path.join(self.reports_dir, 'trades', f"trades_{day_str}.csv")
+        if metrics['trade_details']:
+            pd.DataFrame(metrics['trade_details']).to_csv(trades_path, index=False)
+        
+        self.logger.info(f"Daily report generated at {report_path}")
+        return report_path
+    
+    def _generate_html_report(self, metrics: Dict, output_path: str):
+        """Generate an HTML report from the metrics."""
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Trading Report {metrics['date']}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                h1, h2 {{ color: #333; }}
+                .container {{ max-width: 1200px; margin: 0 auto; }}
+                .metrics-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; }}
+                .metric-box {{ background-color: #f9f9f9; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+                .metric-title {{ font-weight: bold; margin-bottom: 10px; color: #555; }}
+                .metric-value {{ font-size: 24px; font-weight: bold; color: #333; }}
+                .positive {{ color: green; }}
+                .negative {{ color: red; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+                th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }}
+                th {{ background-color: #f2f2f2; }}
+                tr:hover {{ background-color: #f5f5f5; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Trading Report - {metrics['date']}</h1>
+                
+                <div class="metrics-grid">
+                    <div class="metric-box">
+                        <div class="metric-title">PnL (Total)</div>
+                        <div class="metric-value {('positive' if metrics['pnl']['total'] >= 0 else 'negative')}">${metrics['pnl']['total']:.2f}</div>
+                    </div>
+                    
+                    <div class="metric-box">
+                        <div class="metric-title">PnL (%)</div>
+                        <div class="metric-value {('positive' if metrics['balance']['change_pct'] >= 0 else 'negative')}">{metrics['balance']['change_pct']:.2f}%</div>
+                    </div>
+                    
+                    <div class="metric-box">
+                        <div class="metric-title">Sharpe Ratio</div>
+                        <div class="metric-value">{metrics['sharpe']:.2f}</div>
+                    </div>
+                    
+                    <div class="metric-box">
+                        <div class="metric-title">Sortino Ratio</div>
+                        <div class="metric-value">{metrics['sortino']:.2f}</div>
+                    </div>
+                    
+                    <div class="metric-box">
+                        <div class="metric-title">Win Rate</div>
+                        <div class="metric-value">{metrics['win_rate']*100:.2f}%</div>
+                    </div>
+                    
+                    <div class="metric-box">
+                        <div class="metric-title">Max Drawdown</div>
+                        <div class="metric-value negative">{metrics['drawdown']['max_drawdown_pct']:.2f}%</div>
+                    </div>
+                    
+                    <div class="metric-box">
+                        <div class="metric-title">Total Trades</div>
+                        <div class="metric-value">{metrics['total_trades']}</div>
+                    </div>
+                    
+                    <div class="metric-box">
+                        <div class="metric-title">Profit Factor</div>
+                        <div class="metric-value">{metrics['profit_factor']:.2f}</div>
+                    </div>
+                </div>
+                
+                <h2>PnL by Symbol</h2>
+                <table>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>PnL</th>
+                        <th>Trades</th>
+                    </tr>
+        """
+        
+        # Add rows for each symbol
+        for symbol, pnl in metrics['pnl']['by_symbol'].items():
+            trades_count = metrics['trades_by_symbol'].get(symbol, 0)
+            html += f"""
+                    <tr>
+                        <td>{symbol}</td>
+                        <td class="{('positive' if pnl >= 0 else 'negative')}">${pnl:.2f}</td>
+                        <td>{trades_count}</td>
+                    </tr>
+            """
+            
+        html += f"""
+                </table>
+                
+                <h2>Trade Summary</h2>
+                <table>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Value</th>
+                    </tr>
+                    <tr>
+                        <td>Average Win</td>
+                        <td class="positive">${metrics['avg_win']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td>Average Loss</td>
+                        <td class="negative">${metrics['avg_loss']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td>Best Trade</td>
+                        <td class="positive">${metrics['best_trade']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td>Worst Trade</td>
+                        <td class="negative">${metrics['worst_trade']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td>Starting Balance</td>
+                        <td>${metrics['balance']['start']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td>Ending Balance</td>
+                        <td>${metrics['balance']['end']:.2f}</td>
+                    </tr>
+                </table>
+                
+                <h2>Hourly Performance</h2>
+                <table>
+                    <tr>
+                        <th>Hour</th>
+                        <th>PnL</th>
+                    </tr>
+        """
+        
+        # Add rows for hourly performance
+        for hour, hour_pnl in metrics['hourly_performance'].items():
+            html += f"""
+                    <tr>
+                        <td>{hour}:00</td>
+                        <td class="{('positive' if hour_pnl >= 0 else 'negative')}">${hour_pnl:.2f}</td>
+                    </tr>
+            """
+            
+        html += """
+                </table>
+            </div>
+        </body>
+        </html>
+        """
+        
+        with open(output_path, 'w') as f:
+            f.write(html)
+    
+    def _generate_performance_chart(self, metrics: Dict, output_path: str):
+        """Generate performance charts and save to disk."""
+        # Only generate chart if we have hourly performance data
+        if not metrics['hourly_performance']:
+            return
+        
+        try:
+            plt.figure(figsize=(12, 6))
+            
+            # Plot PnL by hour
+            hours = list(metrics['hourly_performance'].keys())
+            pnl_values = list(metrics['hourly_performance'].values())
+            
+            plt.bar(hours, pnl_values, color=['g' if p >= 0 else 'r' for p in pnl_values])
+            plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+            plt.title(f"Hourly PnL - {metrics['date']}")
+            plt.xlabel("Hour")
+            plt.ylabel("PnL ($)")
+            plt.grid(axis='y', alpha=0.3)
+            plt.tight_layout()
+            
+            plt.savefig(output_path)
+            plt.close()
+        except Exception as e:
+            self.logger.error(f"Error generating performance chart: {str(e)}")
+    
+    def update_all_time_stats(self):
+        """Update all-time statistics across all days."""
+        if not self.daily_stats:
+            return
+        
+        # Aggregate data across all days
+        all_time_metrics = {
+            'total_days': len(self.daily_stats),
+            'total_trades': 0,
+            'winning_days': 0,
+            'losing_days': 0,
+            'best_day': {
+                'date': None,
+                'pnl': 0.0
+            },
+            'worst_day': {
+                'date': None,
+                'pnl': 0.0
+            },
+            'cumulative_pnl': 0.0,
+            'avg_daily_pnl': 0.0,
+            'total_fees': 0.0,
+            'max_drawdown': 0.0,
+            'max_drawdown_pct': 0.0,
+            'sharpe_ratio': 0.0,
+            'sortino_ratio': 0.0,
+            'win_rate': 0.0,
+            'profit_factor': 0.0,
+            'daily_returns': [],
+            'pnl_by_symbol': {},
+            'trades_by_symbol': {}
+        }
+        
+        # Calculate daily returns for each day
+        winning_days = 0
+        losing_days = 0
+        all_daily_returns = []
+        best_pnl = float('-inf')
+        worst_pnl = float('inf')
+        
+        for day_str, day_stats in sorted(self.daily_stats.items()):
+            # Count winning and losing days
+            daily_pnl = day_stats['pnl']['total']
+            all_time_metrics['total_trades'] += day_stats['total_trades']
+            
+            if daily_pnl > 0:
+                winning_days += 1
+            elif daily_pnl < 0:
+                losing_days += 1
+            
+            # Track best and worst days
+            if daily_pnl > best_pnl:
+                best_pnl = daily_pnl
+                all_time_metrics['best_day']['date'] = day_str
+                all_time_metrics['best_day']['pnl'] = best_pnl
+            
+            if daily_pnl < worst_pnl:
+                worst_pnl = daily_pnl
+                all_time_metrics['worst_day']['date'] = day_str
+                all_time_metrics['worst_day']['pnl'] = worst_pnl
+            
+            # Accumulate returns
+            daily_return = day_stats['balance']['change_pct'] / 100  # Convert percentage to decimal
+            all_daily_returns.append(daily_return)
+            
+            # Accumulate PnL
+            all_time_metrics['cumulative_pnl'] += daily_pnl
+            
+            # Track fees
+            daily_fees = sum(trade.get('cost', 0) for trade in day_stats['trade_details'] if 'cost' in trade)
+            all_time_metrics['total_fees'] += daily_fees
+            
+            # Track PnL and trades by symbol
+            for symbol, symbol_pnl in day_stats['pnl']['by_symbol'].items():
+                if symbol not in all_time_metrics['pnl_by_symbol']:
+                    all_time_metrics['pnl_by_symbol'][symbol] = 0.0
+                    all_time_metrics['trades_by_symbol'][symbol] = 0
+                
+                all_time_metrics['pnl_by_symbol'][symbol] += symbol_pnl
+                all_time_metrics['trades_by_symbol'][symbol] += day_stats['trades_by_symbol'].get(symbol, 0)
+        
+        # Update counts
+        all_time_metrics['winning_days'] = winning_days
+        all_time_metrics['losing_days'] = losing_days
+        
+        # Calculate win rate
+        all_time_metrics['win_rate'] = winning_days / len(self.daily_stats) if self.daily_stats else 0.0
+        
+        # Calculate average daily PnL
+        all_time_metrics['avg_daily_pnl'] = all_time_metrics['cumulative_pnl'] / len(self.daily_stats) if self.daily_stats else 0.0
+        
+        # Calculate Sharpe and Sortino ratios
+        if all_daily_returns:
+            returns_array = np.array(all_daily_returns)
+            excess_returns = returns_array - self.risk_free_rate
+            
+            if len(excess_returns) > 1:
+                returns_std = np.std(excess_returns, ddof=1)
+                returns_mean = np.mean(excess_returns)
+                
+                # Sharpe ratio (annualized)
+                if returns_std > 0:
+                    all_time_metrics['sharpe_ratio'] = (returns_mean / returns_std) * np.sqrt(252)
+                
+                # Sortino ratio (annualized)
+                downside_returns = excess_returns[excess_returns < 0]
+                if len(downside_returns) > 1:
+                    downside_std = np.std(downside_returns, ddof=1)
+                    if downside_std > 0:
+                        all_time_metrics['sortino_ratio'] = (returns_mean / downside_std) * np.sqrt(252)
+        
+        # Calculate maximum drawdown across all days
+        # Convert daily stats to a DataFrame for cumulative metrics
+        dates = []
+        daily_values = []
+        
+        for day_str, day_stats in sorted(self.daily_stats.items()):
+            dates.append(day_str)
+            daily_values.append(day_stats['balance']['end'])
+        
+        if daily_values:
+            # Create DataFrame with daily values
+            df = pd.DataFrame({'value': daily_values}, index=dates)
+            
+            # Calculate running maximum
+            df['peak'] = df['value'].cummax()
+            
+            # Calculate drawdown in dollars and percentage
+            df['drawdown'] = df['peak'] - df['value']
+            df['drawdown_pct'] = (df['drawdown'] / df['peak']) * 100
+            
+            # Get maximum drawdown
+            all_time_metrics['max_drawdown'] = df['drawdown'].max()
+            all_time_metrics['max_drawdown_pct'] = df['drawdown_pct'].max()
+        
+        # Calculate profit factor across all trades
+        win_pnl = sum(day_stats['pnl']['total'] for day_stats in self.daily_stats.values() 
+                    if day_stats['pnl']['total'] > 0)
+        loss_pnl = abs(sum(day_stats['pnl']['total'] for day_stats in self.daily_stats.values() 
+                         if day_stats['pnl']['total'] < 0))
+        
+        if loss_pnl > 0:
+            all_time_metrics['profit_factor'] = win_pnl / loss_pnl
+        else:
+            all_time_metrics['profit_factor'] = float('inf') if win_pnl > 0 else 0.0
+        
+        # Store the updated all-time metrics
+        self.all_days_stats = all_time_metrics
+        
+        # Save to disk
+        summary_path = os.path.join(self.reports_dir, 'all_time_summary.json')
+        with open(summary_path, 'w') as f:
+            json.dump(all_time_metrics, f, indent=2)
+        
+        # Generate summary chart
+        chart_path = os.path.join(self.reports_dir, 'charts', 'all_time_performance.png')
+        self._generate_all_time_chart(chart_path)
+        
+        return all_time_metrics
+    
+    def _generate_all_time_chart(self, output_path: str):
+        """Generate all-time performance chart."""
+        if not self.daily_stats:
+            return
+        
+        try:
+            # Extract dates and daily PnL values
+            dates = []
+            daily_pnl = []
+            cumulative_pnl = []
+            running_pnl = 0
+            
+            for day_str, day_stats in sorted(self.daily_stats.items()):
+                dates.append(day_str)
+                daily_pnl.append(day_stats['pnl']['total'])
+                running_pnl += day_stats['pnl']['total']
+                cumulative_pnl.append(running_pnl)
+            
+            # Create figure with two subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+            
+            # Plot daily PnL
+            ax1.bar(dates, daily_pnl, color=['g' if p >= 0 else 'r' for p in daily_pnl])
+            ax1.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+            ax1.set_title('Daily PnL')
+            ax1.set_ylabel('PnL ($)')
+            ax1.grid(axis='y', alpha=0.3)
+            
+            # Format x-axis for better readability
+            if len(dates) > 10:
+                ax1.xaxis.set_major_locator(plt.MaxNLocator(10))
+                plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+            
+            # Plot cumulative PnL
+            ax2.plot(dates, cumulative_pnl, color='b', marker='o', markersize=4)
+            ax2.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+            ax2.set_title('Cumulative PnL')
+            ax2.set_xlabel('Date')
+            ax2.set_ylabel('Cumulative PnL ($)')
+            ax2.grid(alpha=0.3)
+            
+            # Format x-axis for better readability
+            if len(dates) > 10:
+                ax2.xaxis.set_major_locator(plt.MaxNLocator(10))
+                plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+            
+            plt.tight_layout()
+            plt.savefig(output_path)
+            plt.close()
+            
+            # Generate PnL by symbol chart
+            symbol_chart_path = os.path.join(os.path.dirname(output_path), 'symbol_performance.png')
+            self._generate_symbol_performance_chart(symbol_chart_path)
+            
+        except Exception as e:
+            self.logger.error(f"Error generating all-time performance chart: {str(e)}")
+            self.logger.error(traceback.format_exc())
+    
+    def _generate_symbol_performance_chart(self, output_path: str):
+        """Generate symbol performance chart."""
+        if not self.all_days_stats or not self.all_days_stats.get('pnl_by_symbol'):
+            return
+        
+        try:
+            # Extract symbols and PnL values
+            symbols = list(self.all_days_stats['pnl_by_symbol'].keys())
+            pnl_values = list(self.all_days_stats['pnl_by_symbol'].values())
+            
+            # Sort by PnL
+            sorted_data = sorted(zip(symbols, pnl_values), key=lambda x: x[1], reverse=True)
+            sorted_symbols, sorted_pnl = zip(*sorted_data) if sorted_data else ([], [])
+            
+            plt.figure(figsize=(12, 6))
+            bars = plt.bar(sorted_symbols, sorted_pnl, color=['g' if p >= 0 else 'r' for p in sorted_pnl])
+            
+            # Add data labels
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2.,
+                        height + (5 if height > 0 else -15),
+                        f'${height:.2f}',
+                        ha='center', va='bottom' if height > 0 else 'top')
+            
+            plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+            plt.title('PnL by Symbol')
+            plt.xlabel('Symbol')
+            plt.ylabel('PnL ($)')
+            plt.grid(axis='y', alpha=0.3)
+            plt.tight_layout()
+            
+            plt.savefig(output_path)
+            plt.close()
+            
+        except Exception as e:
+            self.logger.error(f"Error generating symbol performance chart: {str(e)}")
+            self.logger.error(traceback.format_exc())
+
 class RealTimeTrader:
     """
     Real-time trading system that loads a trained RL model and executes paper trades
@@ -65,7 +770,10 @@ class RealTimeTrader:
         max_leverage: float = 20.0,
         websocket_port: int = 8765,
         save_trades_path: str = 'data/trades',
-        backfill_days: int = 5
+        backfill_days: int = 5,
+        force_timeframe: str = None,  # Add parameter to force a specific timeframe
+        resample_data: bool = True,   # Add parameter to enable/disable resampling
+        enable_reports: bool = True   # New parameter to enable/disable reporting
     ):
         """
         Initialize the real-time trading system.
@@ -80,6 +788,9 @@ class RealTimeTrader:
             websocket_port: Port for websocket server
             save_trades_path: Directory to save trade logs
             backfill_days: Number of days of historical data to backfill
+            force_timeframe: Force a specific timeframe for API calls (e.g., '5m')
+            resample_data: Whether to resample 1m data to match training timeframe
+            enable_reports: Whether to enable detailed reporting
         """
         self.model_path = model_path
         self.env_path = env_path
@@ -90,14 +801,39 @@ class RealTimeTrader:
         self.websocket_port = websocket_port
         self.save_trades_path = save_trades_path
         self.backfill_days = backfill_days
+        self.force_timeframe = force_timeframe
+        self.resample_data = resample_data
+        self.enable_reports = enable_reports
         
         # Create necessary directories
         os.makedirs(self.save_trades_path, exist_ok=True)
         
+        # Create reports directory if enabled
+        if self.enable_reports:
+            self.reports_path = os.path.join(self.save_trades_path, 'reports')
+            os.makedirs(self.reports_path, exist_ok=True)
+            
+            # Initialize report generator
+            self.report_generator = DailyReportGenerator(self.reports_path)
+            
+            # Track last report generation time
+            self.last_report_time = None
+        
         # Load configuration
         self.config = self._load_config()
         self.symbols = self.config['trading']['symbols']
-        self.timeframe = '1m'  # Using 1-minute data for real-time trading
+        
+        # Determine timeframe handling
+        # Default to 1m for live trading if not forced
+        self.api_timeframe = force_timeframe or '1m'
+        # Training timeframe from config (default to 5m which is typically used in training)
+        self.training_timeframe = self.config['trading'].get('timeframe', '5m')
+        
+        # Log timeframe information
+        logger.info(f"API data timeframe: {self.api_timeframe}")
+        logger.info(f"Model training timeframe: {self.training_timeframe}")
+        if self.resample_data and self.api_timeframe != self.training_timeframe:
+            logger.info(f"Will resample {self.api_timeframe} data to {self.training_timeframe}")
         
         # Transaction costs from config
         self.commission = self.config['trading'].get('commission', 0.0004)
@@ -244,30 +980,31 @@ class RealTimeTrader:
             logger.error(f"Error loading model: {str(e)}")
             raise
         
-        # Initialize trading environment with risk engine
+        # Initialize risk engine with identical settings to those used in training
+        # These settings should match what's in main_opt.py for consistency
         risk_limits = RiskLimits(
-            account_max_leverage=self.max_leverage * 0.8,
+            account_max_leverage=self.max_leverage * 0.8,  # 80% of max to provide buffer
             position_max_leverage=self.max_leverage,
-            max_drawdown_pct=self.config['risk_management']['limits']['max_drawdown'],
-            position_concentration=self.config['risk_management']['limits']['position_concentration'],
-            daily_loss_limit_pct=0.15
+            max_drawdown_pct=self.config['risk_management']['limits'].get('max_drawdown', 0.2),
+            position_concentration=self.config['risk_management']['limits'].get('position_concentration', 0.33),
+            daily_loss_limit_pct=self.config['risk_management']['limits'].get('daily_loss_limit', 0.15)
         )
         
         self.risk_engine = InstitutionalRiskEngine(
             initial_balance=self.initial_balance,
             risk_limits=risk_limits,
-            use_dynamic_limits=True,
-            use_vol_scaling=True
+            use_dynamic_limits=self.config['risk_management'].get('use_dynamic_limits', True),
+            use_vol_scaling=self.config['risk_management'].get('use_vol_scaling', True)
         )
         
         # Load historical data or start with empty data
         if self.historical_data_path and os.path.exists(self.historical_data_path):
             await self._load_historical_data()
         else:
-            # Backfill some historical data
+            # Backfill some historical data (important to match training data format)
             await self._backfill_data()
         
-        # Create environment for inference
+        # Create environment for inference - MUST MATCH TRAINING ENVIRONMENT
         await self._create_environment()
         
         # Setup websocket server
@@ -435,7 +1172,7 @@ class RealTimeTrader:
             self.historical_df = pd.DataFrame()
     
     async def _create_environment(self):
-        """Create trading environment for inference."""
+        """Create trading environment for inference that matches training environment."""
         logger.info("Creating trading environment for inference...")
         
         try:
@@ -443,22 +1180,33 @@ class RealTimeTrader:
             if self.env_path and os.path.exists(self.env_path):
                 logger.info(f"Loading environment from: {self.env_path}")
                 
-                # First create base environment
+                # First create base environment with identical settings to training
+                # These settings should exactly match those used in InstitutionalPerpetualEnv during training
                 base_env = InstitutionalPerpetualEnv(
                     df=self.historical_df,
                     assets=self.symbols,
-                    window_size=100,
+                    window_size=100,  # Should match training window size
                     max_leverage=self.max_leverage,
                     commission=self.commission,
                     risk_engine=self.risk_engine,
                     initial_balance=self.initial_balance,
+                    funding_fee_multiplier=self.config.get('trading', {}).get('funding_fee_multiplier', 1.0),
+                    base_features=self.config.get('feature_engineering', {}).get('base_features', ['open', 'high', 'low', 'close', 'volume']),
+                    tech_features=self.config.get('feature_engineering', {}).get('tech_features', [
+                        'rsi', 'macd', 'macd_signal', 'macd_hist', 'bb_upper', 'bb_middle', 'bb_lower',
+                        'atr', 'sma_10', 'ema_10', 'obv'
+                    ]),
+                    risk_free_rate=self.config.get('trading', {}).get('risk_free_rate', 0.02),
+                    max_drawdown=self.config.get('risk_management', {}).get('limits', {}).get('max_drawdown', 0.2),
+                    maintenance_margin=self.config.get('trading', {}).get('maintenance_margin', 0.05),
+                    max_steps=10000,  # Large value for inference
                     verbose=False
                 )
                 
                 # Wrap it in a DummyVecEnv
                 vec_env = DummyVecEnv([lambda: base_env])
                 
-                # Load environment with normalization
+                # Load environment with normalization (CRITICAL for proper inference)
                 self.env = VecNormalize.load(self.env_path, vec_env)
                 
                 # Reset training mode and reward normalization for inference
@@ -467,17 +1215,28 @@ class RealTimeTrader:
                 
                 logger.info("Environment loaded successfully with normalization stats")
             else:
-                logger.info("No environment file provided, creating new environment")
+                logger.warning("No environment file provided, creating new environment (NOT RECOMMENDED)")
+                logger.warning("Performance may not match training without proper normalization stats")
                 
-                # Create a fresh environment
+                # Create a fresh environment - try to match training config
                 base_env = InstitutionalPerpetualEnv(
                     df=self.historical_df,
                     assets=self.symbols,
-                    window_size=100,
+                    window_size=100,  # Should match training window size
                     max_leverage=self.max_leverage,
                     commission=self.commission,
                     risk_engine=self.risk_engine,
                     initial_balance=self.initial_balance,
+                    funding_fee_multiplier=self.config.get('trading', {}).get('funding_fee_multiplier', 1.0),
+                    base_features=self.config.get('feature_engineering', {}).get('base_features', ['open', 'high', 'low', 'close', 'volume']),
+                    tech_features=self.config.get('feature_engineering', {}).get('tech_features', [
+                        'rsi', 'macd', 'macd_signal', 'macd_hist', 'bb_upper', 'bb_middle', 'bb_lower',
+                        'atr', 'sma_10', 'ema_10', 'obv'
+                    ]),
+                    risk_free_rate=self.config.get('trading', {}).get('risk_free_rate', 0.02),
+                    max_drawdown=self.config.get('risk_management', {}).get('limits', {}).get('max_drawdown', 0.2),
+                    maintenance_margin=self.config.get('trading', {}).get('maintenance_margin', 0.05),
+                    max_steps=10000,  # Large value for inference
                     verbose=False
                 )
                 
@@ -523,8 +1282,8 @@ class RealTimeTrader:
             for symbol in self.symbols:
                 exchange_symbol = self.symbol_mappings.get(symbol, symbol)
                 
-                # Fetch latest OHLCV candle
-                ohlcv = await self.exchange.fetch_ohlcv(exchange_symbol, self.timeframe, limit=2)
+                # Fetch latest OHLCV candle using the API timeframe (typically 1m)
+                ohlcv = await self.exchange.fetch_ohlcv(exchange_symbol, self.api_timeframe, limit=2)
                 if not ohlcv or len(ohlcv) < 2:
                     logger.warning(f"No OHLCV data found for {symbol}")
                     continue
@@ -582,6 +1341,90 @@ class RealTimeTrader:
             if dfs:
                 combined_df = pd.concat(dfs, axis=1)
                 
+                # Check if we need to resample to training timeframe
+                if self.resample_data and self.api_timeframe != self.training_timeframe:
+                    # Fetch additional historical data for proper resampling
+                    need_additional_data = True
+                    # Log the resampling attempt
+                    logger.info(f"Attempting to resample from {self.api_timeframe} to {self.training_timeframe}")
+                    
+                    # If we have historical data, use it for resampling context
+                    if hasattr(self, 'historical_df') and not self.historical_df.empty:
+                        # Get required number of bars for resampling to the training timeframe
+                        if self.api_timeframe == '1m' and self.training_timeframe == '5m':
+                            bars_needed = 5
+                        elif self.api_timeframe == '1m' and self.training_timeframe == '15m':
+                            bars_needed = 15
+                        elif self.api_timeframe == '1m' and self.training_timeframe == '30m':
+                            bars_needed = 30
+                        elif self.api_timeframe == '1m' and self.training_timeframe == '1h':
+                            bars_needed = 60
+                        else:
+                            bars_needed = 10  # Default fallback
+                            
+                        # Try to fetch additional bars for proper resampling
+                        additional_bars = {}
+                        for symbol in self.symbols:
+                            exchange_symbol = self.symbol_mappings.get(symbol, symbol)
+                            
+                            try:
+                                # Fetch additional bars for proper resampling
+                                ohlcv_history = await self.exchange.fetch_ohlcv(
+                                    exchange_symbol, 
+                                    self.api_timeframe, 
+                                    limit=bars_needed
+                                )
+                                
+                                if ohlcv_history and len(ohlcv_history) >= bars_needed:
+                                    df_hist = pd.DataFrame(
+                                        ohlcv_history, 
+                                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                                    )
+                                    df_hist['timestamp'] = pd.to_datetime(df_hist['timestamp'], unit='ms')
+                                    df_hist.set_index('timestamp', inplace=True)
+                                    
+                                    # Add missing columns that might be needed
+                                    df_hist['funding_rate'] = latest_data[symbol]['funding_rate'].iloc[0] if 'funding_rate' in latest_data[symbol] else 0
+                                    df_hist['bid_depth'] = 0
+                                    df_hist['ask_depth'] = 0
+                                    
+                                    # Store historical bars
+                                    additional_bars[symbol] = df_hist
+                                else:
+                                    logger.warning(f"Could not fetch enough historical bars for {symbol} resampling")
+                            except Exception as e:
+                                logger.error(f"Error fetching historical bars for {symbol}: {str(e)}")
+                        
+                        # If we got additional bars for all symbols, create combined historical data
+                        if len(additional_bars) == len(self.symbols):
+                            # Create MultiIndex DataFrame with historical data
+                            hist_dfs = []
+                            for symbol, df in additional_bars.items():
+                                # Create MultiIndex columns
+                                df.columns = pd.MultiIndex.from_product([[symbol], df.columns])
+                                hist_dfs.append(df)
+                                
+                            if hist_dfs:
+                                historical_combined = pd.concat(hist_dfs, axis=1)
+                                historical_combined = historical_combined.sort_index()
+                                
+                                # Resample to training timeframe
+                                resampled = self._resample_ohlcv(historical_combined, self.training_timeframe)
+                                
+                                if not resampled.empty:
+                                    # Process through feature engine
+                                    processed_df = self.feature_engine.engineer_features(
+                                        {'binance': {sym: additional_bars[sym] for sym in self.symbols}}
+                                    )
+                                    
+                                    logger.info(f"Successfully resampled data to {self.training_timeframe}")
+                                    return processed_df
+                                else:
+                                    logger.warning(f"Resampling produced empty DataFrame")
+                    
+                    # If we're here, either no historical data or resampling failed
+                    logger.warning(f"Could not properly resample data, using raw {self.api_timeframe} data")
+                
                 # Process through feature engine for additional features
                 processed_df = self.feature_engine.engineer_features({'binance': latest_data})
                 
@@ -597,6 +1440,105 @@ class RealTimeTrader:
             logger.error(traceback.format_exc())
             return None
     
+    def _resample_ohlcv(self, df, target_timeframe):
+        """
+        Resample OHLCV data to a different timeframe.
+        
+        Args:
+            df: DataFrame with OHLCV data
+            target_timeframe: Target timeframe (e.g., '5m', '15m')
+            
+        Returns:
+            Resampled DataFrame
+        """
+        logger.info(f"Resampling data to {target_timeframe}")
+        
+        try:
+            # Convert the target_timeframe string to pandas offset alias
+            # Map common trading timeframes
+            timeframe_map = {
+                '1m': '1min',
+                '3m': '3min',
+                '5m': '5min',
+                '15m': '15min',
+                '30m': '30min',
+                '1h': '1H',
+                '2h': '2H',
+                '4h': '4H',
+                '6h': '6H',
+                '8h': '8H',
+                '12h': '12H',
+                '1d': '1D',
+            }
+            
+            if target_timeframe not in timeframe_map:
+                logger.error(f"Unsupported target timeframe: {target_timeframe}")
+                return pd.DataFrame()
+            
+            pandas_timeframe = timeframe_map[target_timeframe]
+            
+            # Create an empty DataFrame to store the resampled data
+            resampled_dfs = []
+            
+            # Process each symbol separately
+            for symbol in self.symbols:
+                # Extract columns for this symbol
+                symbol_cols = [col for col in df.columns if col[0] == symbol]
+                if not symbol_cols:
+                    logger.warning(f"No data found for {symbol}")
+                    continue
+                
+                # Get the data for this symbol
+                symbol_data = df[symbol_cols].copy()
+                
+                # Get the column names without the symbol prefix
+                col_names = [col[1] for col in symbol_cols]
+                
+                # Flatten the MultiIndex columns temporarily for resampling
+                symbol_data.columns = col_names
+                
+                # Resample OHLCV data
+                resampled = pd.DataFrame()
+                
+                if 'open' in col_names and 'high' in col_names and 'low' in col_names and 'close' in col_names and 'volume' in col_names:
+                    # Resample OHLCV data using proper aggregation methods
+                    ohlcv_resampled = pd.DataFrame()
+                    ohlcv_resampled['open'] = symbol_data['open'].resample(pandas_timeframe).first()
+                    ohlcv_resampled['high'] = symbol_data['high'].resample(pandas_timeframe).max()
+                    ohlcv_resampled['low'] = symbol_data['low'].resample(pandas_timeframe).min()
+                    ohlcv_resampled['close'] = symbol_data['close'].resample(pandas_timeframe).last()
+                    ohlcv_resampled['volume'] = symbol_data['volume'].resample(pandas_timeframe).sum()
+                    
+                    # Add to the main resampled DataFrame
+                    resampled = ohlcv_resampled
+                
+                # Process other columns if they exist
+                for col in col_names:
+                    if col not in ['open', 'high', 'low', 'close', 'volume']:
+                        # For other columns, use mean as the aggregation method
+                        # This is a reasonable default for most technical indicators
+                        if col in symbol_data.columns:
+                            resampled[col] = symbol_data[col].resample(pandas_timeframe).mean()
+                
+                # Restore the MultiIndex columns
+                resampled.columns = pd.MultiIndex.from_product([[symbol], resampled.columns])
+                
+                # Add to the list of resampled DataFrames
+                resampled_dfs.append(resampled)
+            
+            # Combine all resampled DataFrames
+            if resampled_dfs:
+                combined_resampled = pd.concat(resampled_dfs, axis=1)
+                return combined_resampled
+            else:
+                logger.warning("No data was resampled")
+                return pd.DataFrame()
+        
+        except Exception as e:
+            logger.error(f"Error resampling data: {str(e)}")
+            logger.error(traceback.format_exc())
+            return pd.DataFrame()
+    
     async def generate_signals(self, new_data: pd.DataFrame):
         """Generate trading signals using the RL model."""
         logger.info("Generating trading signals...")
@@ -609,6 +1551,8 @@ class RealTimeTrader:
             obs = self.env.reset()
             
             # Get model prediction (action)
+            # IMPORTANT: Use deterministic=False during trading to match training behavior
+            # This allows the model to explore and consider uncertainty in its decision
             action, _ = self.model.predict(obs, deterministic=False)
             
             # Log the raw action vector
@@ -926,6 +1870,20 @@ class RealTimeTrader:
                             'trades': trades
                         })
                         
+                        # Check if we need to generate a daily report
+                        if self.enable_reports:
+                            # Generate daily reports at midnight or when the day changes
+                            if (self.last_report_time is None or 
+                                current_time.date() > self.last_report_time.date()):
+                                
+                                # If we have a previous day to report on
+                                if self.last_report_time is not None:
+                                    previous_day = self.last_report_time.date()
+                                    await self._generate_daily_report(previous_day)
+                                
+                                # Update last report time
+                                self.last_report_time = current_time
+                        
                         # Update last observation time
                         self.last_observation_time = current_time
                     else:
@@ -941,6 +1899,11 @@ class RealTimeTrader:
             logger.error(f"Error in trading loop: {str(e)}")
             logger.error(traceback.format_exc())
         finally:
+            # Generate final report for the current day
+            if self.enable_reports and self.last_report_time is not None:
+                current_day = datetime.now().date()
+                await self._generate_daily_report(current_day)
+            
             logger.info("Trading loop stopped")
             self.is_running = False
     
@@ -1010,6 +1973,11 @@ class RealTimeTrader:
         # Save final state
         self._save_trade_data()
         
+        # Generate final report if reporting is enabled
+        if self.enable_reports:
+            current_day = datetime.now().date()
+            await self._generate_daily_report(current_day)
+        
         # Close exchange connection
         await self.exchange.close()
         
@@ -1019,6 +1987,53 @@ class RealTimeTrader:
             await self.websocket_server.wait_closed()
         
         logger.info("Real-time trading system shutdown complete")
+
+    async def _generate_daily_report(self, day: date):
+        """Generate a daily trading report."""
+        if not self.enable_reports:
+            return
+        
+        logger.info(f"Generating daily report for {day}")
+        
+        try:
+            # Compute start balance for the day
+            # Use previous day's end balance or initial balance
+            day_str = day.strftime('%Y-%m-%d')
+            
+            # Check if we have existing reports to determine start balance
+            all_reports = self.report_generator.daily_stats
+            previous_days = [d for d in all_reports.keys() if d < day_str]
+            
+            if previous_days:
+                latest_previous_day = max(previous_days)
+                start_balance = all_reports[latest_previous_day]['balance']['end']
+            else:
+                start_balance = self.initial_balance
+            
+            # Process the day's trades
+            day_metrics = self.report_generator.process_day_trades(
+                trades=self.trades,
+                positions=self.positions,
+                pnl_history=self.pnl_history,
+                start_balance=start_balance,
+                symbols=self.symbols,
+                day=day
+            )
+            
+            # Generate the report file
+            report_path = self.report_generator.generate_daily_report(day)
+            
+            # Update all-time statistics
+            all_time_stats = self.report_generator.update_all_time_stats()
+            
+            logger.info(f"Daily report generated at {report_path}")
+            
+            return report_path
+        
+        except Exception as e:
+            logger.error(f"Error generating daily report: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None
 
 async def main():
     """Main function to set up and run the real-time trader."""
@@ -1032,6 +2047,13 @@ async def main():
     parser.add_argument('--websocket-port', type=int, default=8765, help='Websocket server port')
     parser.add_argument('--save-path', type=str, default='data/trades', help='Directory to save trade logs')
     parser.add_argument('--backfill-days', type=int, default=5, help='Number of days to backfill data')
+    
+    # Add new timeframe control parameters
+    parser.add_argument('--force-timeframe', type=str, help='Force a specific timeframe for API calls (e.g., "5m")')
+    parser.add_argument('--disable-resampling', action='store_true', help='Disable automatic resampling of 1m to 5m data')
+    
+    # Add reporting control
+    parser.add_argument('--disable-reports', action='store_true', help='Disable detailed daily reports generation')
     
     args = parser.parse_args()
     
@@ -1058,7 +2080,10 @@ async def main():
         max_leverage=args.max_leverage,
         websocket_port=args.websocket_port,
         save_trades_path=args.save_path,
-        backfill_days=args.backfill_days
+        backfill_days=args.backfill_days,
+        force_timeframe=args.force_timeframe,
+        resample_data=not args.disable_resampling,
+        enable_reports=not args.disable_reports
     )
     
     # Set up trader
