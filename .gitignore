@@ -11,6 +11,8 @@ test_results/
 logs/
 tensorboard/
 
+venv312/
+
 # Python
 __pycache__/
 *.py[cod]

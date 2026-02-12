@@ -49,6 +49,14 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
+class PolicyOnlyWrapper:
+    """Wrapper to expose a predict() API on a policy-only model."""
+    def __init__(self, policy):
+        self.policy = policy
+
+    def predict(self, obs, deterministic: bool = False):
+        return self.policy.predict(obs, deterministic=deterministic)
+
 class InstitutionalBacktester:
     """
     Institutional-grade backtester for cryptocurrency trading models with 
@@ -610,51 +618,93 @@ class InstitutionalBacktester:
             if not os.path.exists(self.model_path):
                 raise FileNotFoundError(f"Model not found at {self.model_path}")
             
-            # Load the model
-            model = PPO.load(self.model_path)
-            logger.info(f"Model loaded successfully: {type(model).__name__}")
-            
-            # Look for env file alongside model
-            env_path = None
-            if os.path.isdir(self.model_path):
-                # Try common env file patterns in the directory
-                env_patterns = [
-                    os.path.join(self.model_path, "final_env.pkl"),  # Added final_env.pkl
-                    os.path.join(self.model_path, "vec_normalize.pkl"),
-                    os.path.join(self.model_path, "env.pkl"),
-                    os.path.join(self.model_path, "vec_env.pkl")
-                ]
-                for pattern in env_patterns:
-                    if os.path.exists(pattern):
-                        env_path = pattern
-                        break
-            else:
-                # Check if there's a corresponding .pkl file in the same directory
-                model_dir = os.path.dirname(self.model_path)
-                model_name = os.path.splitext(os.path.basename(self.model_path))[0]
-                env_patterns = [
-                    os.path.join(model_dir, "final_env.pkl"),  # Added final_env.pkl first
-                    os.path.join(model_dir, f"{model_name}_env.pkl"),
-                    os.path.join(model_dir, "vec_normalize.pkl"),
-                    os.path.join(model_dir, "env.pkl")
-                ]
-                for pattern in env_patterns:
-                    if os.path.exists(pattern):
-                        env_path = pattern
-                        break
-            
-            if env_path:
-                logger.info(f"Found environment file at {env_path}")
-                self.env_path = env_path
-            else:
-                logger.warning("No environment file found. Will create a new environment.")
-                self.env_path = None
-            
-            self.model = model
-            return model
+            # Prefer policy-only load (avoids PPO.load crashes in some environments)
+            policy_model = self._load_policy_only()
+            if policy_model is not None:
+                logger.info("Policy-only model loaded successfully")
+                self._detect_env_path()
+                self.model = policy_model
+                return policy_model
+
+            # Optional fallback to full PPO.load if explicitly enabled
+            if os.environ.get("SB3_FULL_LOAD") == "1":
+                model = PPO.load(self.model_path)
+                logger.info(f"Model loaded successfully: {type(model).__name__}")
+                self._detect_env_path()
+                self.model = model
+                return model
+
+            raise RuntimeError("Policy-only load failed. Set SB3_FULL_LOAD=1 to attempt PPO.load.")
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
             raise
+
+    def _detect_env_path(self) -> None:
+        """Locate VecNormalize/environment file next to the model if available."""
+        env_path = None
+        if os.path.isdir(self.model_path):
+            env_patterns = [
+                os.path.join(self.model_path, "final_env.pkl"),
+                os.path.join(self.model_path, "vec_normalize.pkl"),
+                os.path.join(self.model_path, "env.pkl"),
+                os.path.join(self.model_path, "vec_env.pkl")
+            ]
+            for pattern in env_patterns:
+                if os.path.exists(pattern):
+                    env_path = pattern
+                    break
+        else:
+            model_dir = os.path.dirname(self.model_path)
+            model_name = os.path.splitext(os.path.basename(self.model_path))[0]
+            env_patterns = [
+                os.path.join(model_dir, "final_env.pkl"),
+                os.path.join(model_dir, f"{model_name}_env.pkl"),
+                os.path.join(model_dir, "vec_normalize.pkl"),
+                os.path.join(model_dir, "env.pkl")
+            ]
+            for pattern in env_patterns:
+                if os.path.exists(pattern):
+                    env_path = pattern
+                    break
+
+        if env_path:
+            logger.info(f"Found environment file at {env_path}")
+            self.env_path = env_path
+        else:
+            logger.warning("No environment file found. Will create a new environment.")
+            self.env_path = None
+
+    def _load_policy_only(self):
+        """Load only the policy weights without full PPO reconstruction."""
+        try:
+            from stable_baselines3.common.save_util import load_from_zip_file
+            from stable_baselines3.common.policies import ActorCriticPolicy
+            import __main__
+            import main_opt
+
+            # Ensure features extractor class is resolvable
+            __main__.HybridFeatureExtractor = main_opt.HybridFeatureExtractor
+
+            data, params, _ = load_from_zip_file(self.model_path)
+            policy_kwargs = dict(data.get('policy_kwargs', {}))
+            policy_kwargs['features_extractor_class'] = main_opt.HybridFeatureExtractor
+
+            lr_schedule = lambda _: 0.0  # Not used during inference
+
+            policy = ActorCriticPolicy(
+                data['observation_space'],
+                data['action_space'],
+                lr_schedule=lr_schedule,
+                use_sde=data.get('use_sde', False),
+                **policy_kwargs
+            )
+            policy.load_state_dict(params['policy'])
+            policy = policy.to('cpu')
+
+            return PolicyOnlyWrapper(policy)
+        except Exception as e:
+            logger.error(f"Policy-only load failed: {e}")
+            return None
     
     def _fix_data_structure(self, data: pd.DataFrame) -> Optional[pd.DataFrame]:
         """

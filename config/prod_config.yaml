@@ -9,7 +9,7 @@ trading:
     - "BTCUSDT"  # Binance perpetual futures format
     - "ETHUSDT"
     - "SOLUSDT"
-  initial_balance: 10000.0  # $10K USD
+  initial_balance: 100000.0  # $100K USD
   max_leverage: 20.0
   min_position_size: 1000  # $1K USD
   max_position_size: 200000  # $200K USD

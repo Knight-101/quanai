@@ -1,279 +1,185 @@
 # Quant AI Trading System
 
-<!-- ./scripts/manual_incremental.sh init 500000 --training-mode --drive-ids-file drive_file_ids.json  -->
+A multi‑asset **perpetual futures** trading system built around **PPO (Stable‑Baselines3)**, a custom **institutional‑style trading environment**, and a technical‑feature pipeline for crypto markets (BTC/ETH/SOL). The system supports **backtesting**, **paper trading (live or replay)**, and **fine‑tuning** on newer data.
 
-A sophisticated AI-powered perpetual futures trading system that utilizes multiple data sources and advanced machine learning techniques to make trading decisions across multiple cryptocurrencies. The system employs a hierarchical reinforcement learning approach with attention mechanisms to process various types of data and generate trading signals.
+> **Scope note:** The current running pipeline is **market data + technical features**. Sentiment/on‑chain modules exist in docs but are **not wired into training or realtime** in this repository.
 
-## Trading Strategies
+---
 
-### 1. Multi-Modal Market Analysis
-
-The system combines multiple data sources to form a comprehensive market view:
-
-#### Technical Analysis
-
-- **Trend Analysis**: Uses transformers to process price action and identify trends across multiple timeframes
-- **Momentum Indicators**: RSI, MACD, and Bollinger Bands with adaptive thresholds
-- **Volume Analysis**: Volume-weighted metrics for trade confirmation
-- **Cross-Asset Correlations**: Analyzes relationships between different cryptocurrencies
-
-#### Sentiment Analysis (Planned)
-
-- **News Impact**: Processes news articles using RoBERTa for sentiment scoring
-- **Social Media**: Analyzes Twitter and other social media platforms for market sentiment
-- **Market Psychology**: Measures fear/greed through various indicators
-
-#### On-Chain Analysis (Planned)
-
-- **Whale Tracking**: Monitors large wallet movements
-- **Network Health**: Analyzes transaction volumes, active addresses, and network growth
-- **Smart Contract Activity**: Monitors DeFi and other protocol usage
-
-### 2. Risk Management
-
-- **Dynamic Position Sizing**: Adjusts position sizes based on:
-  - Market volatility
-  - Account equity
-  - Cross-asset correlation risk
-  - Current market regime
-- **Stop Loss Strategies**:
-  - Volatility-adjusted stops
-  - Time-based stops
-  - Profit protection mechanisms
-
-### 3. Execution Strategy
-
-- **Smart Order Routing**:
-  - Minimizes market impact
-  - Considers liquidity pools
-  - Adapts to market microstructure
-- **Entry/Exit Optimization**:
-  - Uses TWAP/VWAP for large orders
-  - Implements iceberg orders when needed
-  - Considers funding rates for perpetual futures
-
-# Quantitative Trading System Workflow
-
-## System Architecture Diagram
+## System Architecture (High Level)
 
 ```mermaid
 graph TD
-    A[Data Collection] --> B[Data System]
-    B --> C[Feature Processing]
-    C --> D[Training]
-    D --> E[Trading Environment]
-    E --> F[Risk Management]
-    F --> E
-    E --> D
+    A[Market Data (CCXT or Cached Parquet)] --> B[Feature Engineering]
+    B --> C[Institutional Env (Perp Futures)]
+    C --> D[PPO Policy]
+    D --> E[Risk Engine]
+    E --> C
+    C --> F[Paper Trading / Backtest]
 ```
 
-## 1. Data Collection Layer
+---
 
-The data collection layer is responsible for gathering multi-modal data from various sources:
+## Data & Feature Pipeline
 
-- Market data (prices, volumes, order book)
-- Sentiment data (social media, news)
-- On-chain data (whale movements, network metrics)
-
-Key components:
-
-- `collect_multimodal.py`: Coordinates collection of data from different sources
-- `whale_tracker.py`: Monitors large wallet movements and blockchain activity
-- `test_apis.py`: Tests API connections and data validity
-
-## 2. Data System Layer
-
-The data system processes and manages the collected data:
-
-### Data Management
-
-- `data_manager.py`: Core data processing and storage
-- `enhanced_data_manager.py`: Advanced data processing features
-- `multimodal_feature_extractor.py`: Extracts features from different data types
-
-### Feature Processing
-
-- `feature_extractors.py`: Contains various feature extraction methods
-  - Market features (price, volume, volatility)
-  - Sentiment features (sentiment scores, social metrics)
-  - On-chain features (network activity, whale movements)
-
-## 3. Training Layer
-
-The training system uses hierarchical reinforcement learning:
-
-### Hierarchical PPO Implementation
-
-- `hierarchical_ppo.py`: Implements hierarchical proximal policy optimization
-  - High-level policy: Strategic decisions
-  - Low-level policy: Tactical execution
-  - Reward shaping based on PnL and risk metrics
-
-## 4. Trading Environment
-
-The institutional perpetual futures trading environment:
-
-### Key Components (`institutional_perp_env.py`):
-
-- Observation Space:
-
-  ```python
-  # Market, sentiment, onchain, and portfolio features
-  self.observation_space = spaces.Box(
-      low=-np.inf,
-      high=np.inf,
-      shape=(total_features,),
-      dtype=np.float32
-  )
-  ```
-
-- Action Space:
-  ```python
-  # Trade decisions (-1 to 1) and position sizes (0 to 1)
-  self.action_space = spaces.Box(
-      low=np.array([-1] * n_assets + [0] * n_assets),
-      high=np.array([1] * n_assets + [1] * n_assets),
-      dtype=np.float32
-  )
-  ```
-
-### Key Methods:
-
-1. Trade Execution:
-
-```python
-def _execute_trade(self, asset: str, trade_decision: float, position_size: float):
-    # Calculates target position
-    # Handles transaction costs
-    # Updates positions and balance
+```mermaid
+graph LR
+    A[Raw OHLCV + Funding + Orderbook] --> B[DerivativesFeatureEngine]
+    B --> C[Technical Indicators]
+    C --> D[Regime/Volatility Features]
+    D --> E[MultiIndex Feature Frame]
+    E --> F[Trading Env Observation]
 ```
 
-2. Risk-Adjusted Rewards:
+- Data comes from **Binance perpetuals** via CCXT or cached parquet in `data/`.
+- Training timeframe: **5m** (config: `data.timeframe`).
+- Realtime uses **1m** polling but resamples to **5m** for consistency.
 
-```python
-def _calculate_risk_adjusted_reward(self, risk_metrics: Dict):
-    # Incorporates multiple risk factors:
-    # - Sharpe ratio
-    # - Sortino ratio
-    # - Calmar ratio
-    # - Diversification score
-    # - Leverage penalty
+---
+
+## Models & Why
+
+### PPO (Stable‑Baselines3)
+**Why PPO?**
+- Works well with **continuous action spaces** (position sizing).
+- Stable updates (clipped objective).
+- Strong baseline for non‑stationary environments like markets.
+
+### Feature Extractor (Actual)
+**Used in this repo:** `HybridFeatureExtractor` (in `main_opt.py`)
+- Combines **ResNet‑style MLP blocks** + **Transformer encoder**.
+- Designed to capture both **pattern recognition** and **temporal dependencies**.
+
+---
+
+## Trading Environment
+
+- **Environment:** `trading_env/institutional_perp_env.py`
+- **Action space:** continuous, shape `(n_assets,)`
+- **Observations:** technical + regime features + portfolio state
+- **Risk engine:** `risk_management/risk_engine.py`
+
+Risk controls include:
+- Max drawdown limits
+- Leverage caps
+- Position concentration
+- VaR / volatility controls
+
+---
+
+## Realtime Paper Trading
+
+### Live (5m model, 1m polling)
+```bash
+MPLCONFIGDIR=/tmp venv312/bin/python start_realtime_trading.py \
+  --data-source live \
+  --model-mode sb3 \
+  --poll-interval 10 \
+  --metrics-interval 30 \
+  --disable-reports
 ```
 
-## 5. Risk Management Layer
-
-Comprehensive risk management system:
-
-### Risk Engine (`risk_engine.py`):
-
-- Risk Limits:
-  - Maximum drawdown
-  - Leverage limits
-  - VaR limits
-  - Position concentration
-  - Correlation limits
-  - Liquidity ratios
-
-### Key Risk Functions:
-
-1. Portfolio Risk Calculation:
-
-```python
-def calculate_portfolio_risk(self, positions, market_data, portfolio_value):
-    # Calculates VaR
-    # Measures Expected Shortfall
-    # Monitors position concentration
-    # Tracks correlation risk
+### Replay
+```bash
+MPLCONFIGDIR=/tmp venv312/bin/python start_realtime_trading.py \
+  --data-source replay \
+  --replay-start 2021-01-01 \
+  --replay-end 2021-01-07 \
+  --replay-speed 0.5 \
+  --model-mode sb3 \
+  --disable-reports
 ```
 
-2. Liquidation Risk:
+**Realtime logs are minimal** (by design):
+- `TRADE ...`
+- `PORTFOLIO ...`
+- `POSITIONS ...`
+- `METRICS ...` (rolling window)
 
-```python
-def check_risk_limits(self, risk_metrics):
-    # Verifies all risk limits
-    # Returns violations if any
-    # Triggers liquidation if necessary
+---
+
+## Strategy Presets (5 scenarios)
+Configs live in `config/strategies/`:
+
+- `fortress_100k.yaml` — conservative
+- `core_100k.yaml` — balanced baseline
+- `momentum_50k.yaml` — higher risk
+- `aggressive_25k.yaml` — stress test
+- `capital_preserve_250k.yaml` — large‑account low‑volatility
+
+Run one like this:
+```bash
+MPLCONFIGDIR=/tmp venv312/bin/python start_realtime_trading.py \
+  --config config/strategies/core_100k.yaml \
+  --data-source live \
+  --model-mode sb3 \
+  --poll-interval 10 \
+  --metrics-interval 30 \
+  --disable-reports
 ```
 
-## System Workflow
+---
 
-1. **Data Pipeline**:
+## Backtesting
+```bash
+MPLCONFIGDIR=/tmp venv312/bin/python backtesting/run_backtest.py \
+  --model-path models/manual/phase6/phase6_model.zip \
+  --start-date 2021-01-01 \
+  --end-date 2021-02-01 \
+  --no-visualizations \
+  --no-env-check
+```
 
-   - Continuous data collection from multiple sources
-   - Feature extraction and preprocessing
-   - Data storage and management
+Results are saved to `results/backtest/`.
 
-2. **Training Process**:
+---
 
-   - Hierarchical PPO training with two policy levels
-   - Risk-aware reward shaping
-   - Continuous model updates based on performance
+## Fine‑Tuning (Continue Training)
+Fine‑tuning updates weights on newer data without full retrain.
 
-3. **Trading Execution**:
+Example (Apr 2025 → Feb 2026, 200k steps):
+```bash
+MPLCONFIGDIR=/tmp venv312/bin/python main_opt.py \
+  --continue-training \
+  --model-path models/manual/phase6/phase6_model.zip \
+  --env-path models/manual/phase6/vec_normalize.pkl \
+  --additional-steps 200000 \
+  --start-date 2025-04-01 \
+  --end-date 2026-02-04 \
+  --no-wandb \
+  --gpus 1
+```
 
-   - Environment state observation
-   - Policy-based action selection
-   - Smart order execution with transaction cost consideration
-   - Real-time risk monitoring and management
+---
 
-4. **Risk Management**:
-   - Continuous risk metric calculation
-   - Limit monitoring and enforcement
-   - Automated risk-based position adjustment
-   - Liquidation protection
+## Config & Defaults
+Main config: `config/prod_config.yaml`
 
-## Key Features
+Key settings:
+- `trading.initial_balance`
+- `trading.max_leverage`
+- `risk_management.limits.*`
+- `data.timeframe` (5m)
 
-1. **Multi-modal Data Integration**:
+CLI arguments override config **only if passed**.
 
-   - Market data analysis
-   - Sentiment incorporation
-   - On-chain metrics utilization
+---
 
-2. **Advanced Risk Management**:
+## Project Structure
+```
+quan/
+├── main_opt.py                     # Training / fine‑tuning
+├── start_realtime_trading.py       # Realtime launcher
+├── realtime_trading.py             # Live/replay engine
+├── trading_env/                    # Institutional env
+├── data_system/                    # Data + feature engine
+├── risk_management/                # Risk engine
+├── backtesting/                    # Institutional backtester
+├── config/                         # Base config + strategy presets
+└── models/                         # Trained models
+```
 
-   - Real-time risk monitoring
-   - Multiple risk metric tracking
-   - Automated risk limit enforcement
-
-3. **Smart Execution**:
-
-   - Transaction cost optimization
-   - Price impact consideration
-   - Liquidity-aware trading
-
-4. **Hierarchical Learning**:
-   - Strategic high-level decisions
-   - Tactical execution optimization
-   - Risk-adjusted reward optimization
-
-## Future Enhancements
-
-1. Integration of news and social media sentiment analysis
-2. On-chain data integration
-3. Enhanced risk management features
-4. Multi-exchange support
-5. Advanced order execution strategies
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+---
 
 ## Disclaimer
-
-This software is for educational purposes only. Do not risk money which you are afraid to lose. USE THE SOFTWARE AT YOUR OWN RISK. THE AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING RESULTS.
-
-## Institutional Backtesting Module
-
-A new institutional-grade backtesting module has been added to the repository. This module provides comprehensive backtesting capabilities with a focus on eliminating bias, analyzing market regimes, and providing detailed performance metrics.
-
-### Features
-
-- **Robust Backtesting**: Evaluate trading models with proper observation and reward normalization
-- **Market Regime Analysis**: Identify and analyze performance across different market regimes
-- **Walk-Forward Validation**: Test model robustness across multiple time windows
-- **Comprehensive Metrics**: Calculate performance metrics, risk metrics, and trade statistics
-- **Visualization Tools**: Create visualizations of performance, drawdowns, returns distribution, and more
-- **Bias Reduction**: Techniques to minimize look-ahead bias and data leakage
-
-
+This software is for educational purposes only. Do not risk money you are afraid to lose. USE AT YOUR OWN RISK.

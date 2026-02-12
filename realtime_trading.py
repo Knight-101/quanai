@@ -30,17 +30,13 @@ import traceback
 import threading
 import signal
 import websockets
-import gymnasium as gym
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import defaultdict
+from data_system.data_manager import DataManager
 
 # Local imports
-from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
 from risk_management.risk_engine import InstitutionalRiskEngine, RiskLimits
-from data_system.feature_engine import DerivativesFeatureEngine
 
 # Configure logging
 logging.basicConfig(
@@ -52,6 +48,98 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('realtime_trading')
+
+# Reduce noise from other modules; keep warnings/errors only
+logging.getLogger('data_system').setLevel(logging.ERROR)
+logging.getLogger('data_system.feature_engine').setLevel(logging.ERROR)
+logging.getLogger('ccxt').setLevel(logging.WARNING)
+logging.getLogger('websockets').setLevel(logging.WARNING)
+
+
+class TradeOnlyFilter(logging.Filter):
+    """Allow trade/position logs and all warnings/errors."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        msg = record.getMessage()
+        return (
+            msg.startswith("TRADE")
+            or msg.startswith("POSITIONS")
+            or msg.startswith("PORTFOLIO")
+            or msg.startswith("METRICS")
+        )
+
+
+# Apply filter to realtime_trading logger handlers
+for _handler in logger.handlers:
+    _handler.addFilter(TradeOnlyFilter())
+
+def _import_sb3():
+    """
+    Import Stable-Baselines3 components lazily.
+    This avoids hard dependency at module import time.
+    """
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+    return PPO, VecNormalize, DummyVecEnv
+
+
+def _import_env():
+    """Import the trading environment lazily."""
+    from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
+    return InstitutionalPerpetualEnv
+
+
+def _import_feature_engine():
+    """Import the feature engine lazily."""
+    from data_system.feature_engine import DerivativesFeatureEngine
+    return DerivativesFeatureEngine
+
+
+class SimpleFeatureEngine:
+    """Minimal feature engine fallback (base OHLCV only)."""
+    def engineer_features(self, data_dict):
+        combined_frames = []
+        for _exchange, exchange_data in data_dict.items():
+            if isinstance(exchange_data, dict):
+                for symbol, df in exchange_data.items():
+                    if df is None or df.empty:
+                        continue
+                    temp = df.copy()
+                    temp.columns = pd.MultiIndex.from_product([[symbol], temp.columns], names=['asset', 'feature'])
+                    combined_frames.append(temp)
+            elif isinstance(exchange_data, pd.DataFrame):
+                temp = exchange_data.copy()
+                if not isinstance(temp.columns, pd.MultiIndex):
+                    temp.columns = pd.MultiIndex.from_product([['asset'], temp.columns], names=['asset', 'feature'])
+                combined_frames.append(temp)
+        if not combined_frames:
+            return pd.DataFrame()
+        combined = pd.concat(combined_frames, axis=1).sort_index()
+        return combined
+
+
+class StubPolicy:
+    """Fallback policy used when SB3 is unavailable."""
+    def __init__(self, action_dim: int, seed: int = 7):
+        self.action_dim = action_dim
+        self.rng = np.random.default_rng(seed)
+
+    def predict(self, obs, deterministic: bool = False):
+        if deterministic:
+            action = np.zeros(self.action_dim, dtype=np.float32)
+        else:
+            action = np.tanh(self.rng.normal(0, 0.35, size=self.action_dim)).astype(np.float32)
+        return action, None
+
+
+class PolicyOnlyWrapper:
+    """Wrapper to expose a predict API compatible with SB3 models."""
+    def __init__(self, policy):
+        self.policy = policy
+
+    def predict(self, obs, deterministic: bool = False):
+        return self.policy.predict(obs, deterministic=deterministic)
 
 # Add DailyReportGenerator class
 class DailyReportGenerator:
@@ -765,15 +853,25 @@ class RealTimeTrader:
         model_path: str,
         env_path: str = None,
         config_path: str = 'config/prod_config.yaml',
-        initial_balance: float = 10000.0,
+        initial_balance: Optional[float] = None,
         historical_data_path: str = None,
-        max_leverage: float = 20.0,
+        max_leverage: Optional[float] = None,
         websocket_port: int = 8765,
         save_trades_path: str = 'data/trades',
         backfill_days: int = 5,
         force_timeframe: str = None,  # Add parameter to force a specific timeframe
         resample_data: bool = True,   # Add parameter to enable/disable resampling
-        enable_reports: bool = True   # New parameter to enable/disable reporting
+        enable_reports: bool = True,  # New parameter to enable/disable reporting
+        symbols_override: Optional[List[str]] = None,
+        data_source: str = 'live',
+        replay_speed: float = 1.0,
+        replay_start: Optional[str] = None,
+        replay_end: Optional[str] = None,
+        model_mode: str = 'sb3',
+        deterministic_policy: bool = False,
+        feature_lookback: int = 500,
+        poll_interval: int = 60,
+        metrics_interval_minutes: int = 30
     ):
         """
         Initialize the real-time trading system.
@@ -782,9 +880,9 @@ class RealTimeTrader:
             model_path: Path to the trained RL model
             env_path: Path to the saved trading environment (optional)
             config_path: Path to the configuration file
-            initial_balance: Initial account balance for paper trading
+            initial_balance: Initial account balance for paper trading (overrides config)
             historical_data_path: Path to historical data for backfilling (optional)
-            max_leverage: Maximum allowed leverage
+            max_leverage: Maximum allowed leverage (overrides config)
             websocket_port: Port for websocket server
             save_trades_path: Directory to save trade logs
             backfill_days: Number of days of historical data to backfill
@@ -804,6 +902,16 @@ class RealTimeTrader:
         self.force_timeframe = force_timeframe
         self.resample_data = resample_data
         self.enable_reports = enable_reports
+        self.symbols_override = symbols_override
+        self.data_source = data_source
+        self.replay_speed = replay_speed
+        self.replay_start = replay_start
+        self.replay_end = replay_end
+        self.model_mode = model_mode
+        self.deterministic_policy = deterministic_policy
+        self.feature_lookback = feature_lookback
+        self.poll_interval = max(int(poll_interval), 1)
+        self.metrics_interval_minutes = max(int(metrics_interval_minutes), 1)
         
         # Create necessary directories
         os.makedirs(self.save_trades_path, exist_ok=True)
@@ -821,19 +929,42 @@ class RealTimeTrader:
         
         # Load configuration
         self.config = self._load_config()
-        self.symbols = self.config['trading']['symbols']
+        self.symbols = self.symbols_override or self.config['trading']['symbols']
+
+        # Resolve config defaults if CLI values were not provided
+        config_trading = self.config.get('trading', {})
+        if self.initial_balance is None:
+            self.initial_balance = float(config_trading.get('initial_balance', 10000.0))
+        if self.max_leverage is None:
+            self.max_leverage = float(config_trading.get('max_leverage', 20.0))
         
         # Determine timeframe handling
-        # Default to 1m for live trading if not forced
-        self.api_timeframe = force_timeframe or '1m'
-        # Training timeframe from config (default to 5m which is typically used in training)
-        self.training_timeframe = self.config['trading'].get('timeframe', '5m')
+        self.training_timeframe = self.config.get('data', {}).get('timeframe', '5m')
+        # Default to 1m for live trading if not forced; replay uses training timeframe
+        if self.data_source == 'replay':
+            self.api_timeframe = self.training_timeframe
+        else:
+            self.api_timeframe = force_timeframe or '1m'
         
         # Log timeframe information
         logger.info(f"API data timeframe: {self.api_timeframe}")
         logger.info(f"Model training timeframe: {self.training_timeframe}")
         if self.resample_data and self.api_timeframe != self.training_timeframe:
             logger.info(f"Will resample {self.api_timeframe} data to {self.training_timeframe}")
+        if self.data_source == 'live':
+            logger.info(f"Polling live data every {self.poll_interval} seconds")
+        logger.info(f"Rolling metrics interval: {self.metrics_interval_minutes} minutes")
+        self.backfill_timeframe = self.training_timeframe
+
+        # Feature schema (keep consistent with training environment)
+        self.base_features = ['open', 'high', 'low', 'close', 'volume']
+        self.tech_features = [
+            'returns_1d', 'returns_5d', 'returns_10d',
+            'volatility_5d', 'volatility_10d', 'volatility_20d',
+            'rsi_14', 'macd', 'bb_upper', 'bb_lower', 'bb_middle',
+            'atr_14', 'adx_14', 'cci_14',
+            'market_regime', 'hurst_exponent', 'volatility_regime'
+        ]
         
         # Transaction costs from config
         self.commission = self.config['trading'].get('commission', 0.0004)
@@ -850,27 +981,26 @@ class RealTimeTrader:
         self.trades = []  # Trade history
         self.pnl_history = []  # PnL history
         self.total_pnl = 0.0  # Total PnL
-        self.balance = initial_balance  # Current balance
-        self.total_value = initial_balance  # Current total value (balance + unrealized PnL)
+        self.balance = self.initial_balance  # Current balance
+        self.total_value = self.initial_balance  # Current total value (balance + unrealized PnL)
         
         # Setup feature engine
-        self.feature_engine = DerivativesFeatureEngine(
-            volatility_window=self.config['feature_engineering']['volatility_window'],
-            n_components=self.config['feature_engineering']['n_components']
-        )
+        self.feature_engine = self._load_feature_engine()
         
         # Initialize positions
         self._initialize_positions()
         
-        # Initialize exchange client (for data only)
-        self.exchange = ccxt_async.binance({
-            'options': {
-                'defaultType': 'future',
-                'defaultMarket': 'linear',
-                'defaultMarginMode': 'cross'
-            },
-            'enableRateLimit': True
-        })
+        # Initialize exchange client (for data only) when using live data
+        self.exchange = None
+        if self.data_source == 'live':
+            self.exchange = ccxt_async.binance({
+                'options': {
+                    'defaultType': 'future',
+                    'defaultMarket': 'linear',
+                    'defaultMarginMode': 'cross'
+                },
+                'enableRateLimit': True
+            })
         
         # Binance-specific symbol mappings
         self.symbol_mappings = {
@@ -881,16 +1011,28 @@ class RealTimeTrader:
         
         # Initialize asset data
         self.asset_data = {symbol: pd.DataFrame() for symbol in self.symbols}
+
+        # Replay state and rolling buffers
+        self.raw_history = {symbol: pd.DataFrame() for symbol in self.symbols}
+        self.replay_df = None
+        self.replay_cursor = None
+        self.max_env_rows = max(self.feature_lookback, int(self.config.get('model', {}).get('window_size', 100)) * 3)
         
         # Initialize model and environment to None, will load later
         self.model = None
         self.env = None
+        self._PPO = None
+        self._VecNormalize = None
+        self._DummyVecEnv = None
         
         # Lock for thread safety
         self.data_lock = threading.Lock()
         
         # Initialize last observation time
-        self.last_observation_time = datetime.now()
+        self.last_observation_time = datetime.min
+        self.last_candle_time = None
+        self.last_frame = None
+        self.last_metrics_time = None
         
         # Run state
         self.shutting_down = False
@@ -905,6 +1047,78 @@ class RealTimeTrader:
         except Exception as e:
             logger.error(f"Error loading config: {str(e)}")
             raise
+
+    def _load_model(self) -> None:
+        """Load the trading model or fall back to a stub policy."""
+        if self.model_mode == 'stub':
+            logger.warning("Using stub policy (random actions).")
+            self.model = StubPolicy(action_dim=len(self.symbols))
+            return
+
+        try:
+            logger.info(f"Loading model from {self.model_path}")
+            PPO, VecNormalize, DummyVecEnv = _import_sb3()
+            self._PPO = PPO
+            self._VecNormalize = VecNormalize
+            self._DummyVecEnv = DummyVecEnv
+            # Prefer policy-only load for stability in this environment
+            self.model = self._load_policy_only()
+            if self.model:
+                logger.info("Policy-only model loaded successfully")
+                return
+
+            # Fallback to full PPO.load (may be less stable on some setups)
+            self.model = PPO.load(self.model_path, device='cpu')
+            logger.info("Model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading SB3 model: {str(e)}")
+            logger.warning("Falling back to stub policy. Set --model-mode stub to suppress this.")
+            self.model = StubPolicy(action_dim=len(self.symbols))
+
+    def _load_policy_only(self):
+        """Load only the policy weights without full PPO reconstruction."""
+        try:
+            from stable_baselines3.common.save_util import load_from_zip_file
+            from stable_baselines3.common.policies import ActorCriticPolicy
+            import __main__
+            import main_opt
+
+            # Ensure features extractor class is resolvable
+            __main__.HybridFeatureExtractor = main_opt.HybridFeatureExtractor
+
+            data, params, _ = load_from_zip_file(self.model_path)
+            policy_kwargs = dict(data['policy_kwargs'])
+            policy_kwargs['features_extractor_class'] = main_opt.HybridFeatureExtractor
+
+            # Use constant LR schedule; not used during inference
+            lr_schedule = lambda _: 0.0
+
+            policy = ActorCriticPolicy(
+                data['observation_space'],
+                data['action_space'],
+                lr_schedule=lr_schedule,
+                use_sde=data.get('use_sde', False),
+                **policy_kwargs
+            )
+            policy.load_state_dict(params['policy'])
+            policy = policy.to('cpu')
+
+            return PolicyOnlyWrapper(policy)
+        except Exception as e:
+            logger.error(f"Policy-only load failed: {e}")
+            return None
+
+    def _load_feature_engine(self):
+        """Load the full feature engine or fall back to a minimal version."""
+        try:
+            Engine = _import_feature_engine()
+            return Engine(
+                volatility_window=self.config.get('feature_engineering', {}).get('volatility_window', 10080),
+                n_components=self.config.get('feature_engineering', {}).get('n_components', 5)
+            )
+        except Exception as e:
+            logger.warning(f"Falling back to SimpleFeatureEngine: {e}")
+            return SimpleFeatureEngine()
     
     def _initialize_positions(self):
         """Initialize position tracking structure."""
@@ -944,8 +1158,12 @@ class RealTimeTrader:
                 self.connected_clients.remove(websocket)
                 logger.info(f"Client disconnected: {websocket.remote_address}")
         
-        self.websocket_server = await websockets.serve(handler, "0.0.0.0", self.websocket_port)
-        logger.info(f"Websocket server started on port {self.websocket_port}")
+        try:
+            self.websocket_server = await websockets.serve(handler, "0.0.0.0", self.websocket_port)
+            logger.info(f"Websocket server started on port {self.websocket_port}")
+        except OSError as e:
+            logger.warning(f"Websocket server disabled: {e}")
+            self.websocket_server = None
     
     async def _broadcast_update(self, data):
         """Broadcast updates to all connected clients."""
@@ -971,14 +1189,8 @@ class RealTimeTrader:
         """Set up the real-time trading system."""
         logger.info("Setting up real-time trading system...")
         
-        # Load the RL model
-        try:
-            logger.info(f"Loading model from {self.model_path}")
-            self.model = PPO.load(self.model_path)
-            logger.info("Model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
-            raise
+        # Load the model (SB3 or stub)
+        self._load_model()
         
         # Initialize risk engine with identical settings to those used in training
         # These settings should match what's in main_opt.py for consistency
@@ -997,12 +1209,15 @@ class RealTimeTrader:
             use_vol_scaling=self.config['risk_management'].get('use_vol_scaling', True)
         )
         
-        # Load historical data or start with empty data
-        if self.historical_data_path and os.path.exists(self.historical_data_path):
-            await self._load_historical_data()
+        # Load historical data or backfill depending on data source
+        if self.data_source == 'replay':
+            await self._load_local_data()
         else:
-            # Backfill some historical data (important to match training data format)
-            await self._backfill_data()
+            if self.historical_data_path and os.path.exists(self.historical_data_path):
+                await self._load_historical_data()
+            else:
+                # Backfill some historical data (important to match training data format)
+                await self._backfill_data()
         
         # Create environment for inference - MUST MATCH TRAINING ENVIRONMENT
         await self._create_environment()
@@ -1070,9 +1285,19 @@ class RealTimeTrader:
             
             logger.info(f"Loaded historical data with shape: {self.historical_df.shape}")
             
-            # Process data through feature engine
-            self.historical_df = self.feature_engine.engineer_features({'binance': {sym: self.historical_df[sym] for sym in self.symbols}})
-            
+            # Build raw data dictionary for feature processing
+            raw_data = {}
+            for symbol in self.symbols:
+                if isinstance(self.historical_df.columns, pd.MultiIndex) and symbol in self.historical_df.columns.get_level_values(0):
+                    base_cols = [c for c in ['open', 'high', 'low', 'close', 'volume', 'funding_rate', 'bid_depth', 'ask_depth'] if (symbol, c) in self.historical_df.columns]
+                    raw_data[symbol] = self.historical_df[symbol][base_cols].copy()
+                else:
+                    raw_data[symbol] = self.historical_df.copy()
+
+            # Process and merge base + engineered features
+            self.historical_df = self._prepare_feature_frame(raw_data)
+            self.raw_history = raw_data
+
             logger.info(f"Processed historical data with shape: {self.historical_df.shape}")
             
         except Exception as e:
@@ -1081,6 +1306,127 @@ class RealTimeTrader:
             # Create empty DataFrames
             self.historical_df = pd.DataFrame()
             await self._backfill_data()
+
+    async def _load_local_data(self):
+        """Load local market data from cache for replay mode."""
+        logger.info("Loading local market data for replay mode...")
+        data_manager = DataManager(self.config.get('data', {}).get('cache_dir', 'data'))
+        raw_data = {}
+
+        for symbol in self.symbols:
+            df = data_manager.load_market_data(
+                exchange='binance',
+                symbol=symbol,
+                timeframe=self.training_timeframe,
+                start_time=None,
+                end_time=None,
+                data_type='perpetual'
+            )
+
+            if df is None or df.empty:
+                logger.warning(f"No local data found for {symbol}")
+                continue
+
+            if self.replay_start:
+                df = df[df.index >= pd.to_datetime(self.replay_start)]
+            if self.replay_end:
+                df = df[df.index <= pd.to_datetime(self.replay_end)]
+
+            if self.backfill_days > 0 and not self.replay_start:
+                cutoff_date = df.index.max() - timedelta(days=self.backfill_days)
+                df = df[df.index >= cutoff_date]
+
+            raw_data[symbol] = df
+
+        if not raw_data:
+            logger.error("Replay mode requires local data, but none was found.")
+            self.historical_df = pd.DataFrame()
+            return
+
+        self.raw_history = raw_data
+        self.historical_df = self._prepare_feature_frame(raw_data)
+        self.historical_df = self.historical_df.sort_index()
+        self.replay_cursor = max(self.config.get('model', {}).get('window_size', 100), 1)
+        logger.info(f"Replay data ready with shape: {self.historical_df.shape}")
+
+    def _load_local_history_for_env(self):
+        """Load local market data to initialize the environment (live fallback)."""
+        logger.info("Loading local cached market data for environment initialization...")
+        data_manager = DataManager(self.config.get('data', {}).get('cache_dir', 'data'))
+        raw_data = {}
+
+        for symbol in self.symbols:
+            df = data_manager.load_market_data(
+                exchange='binance',
+                symbol=symbol,
+                timeframe=self.training_timeframe,
+                start_time=None,
+                end_time=None,
+                data_type='perpetual'
+            )
+
+            if df is None or df.empty:
+                logger.warning(f"No local data found for {symbol}")
+                continue
+
+            if self.backfill_days > 0:
+                cutoff_date = df.index.max() - timedelta(days=self.backfill_days)
+                df = df[df.index >= cutoff_date]
+
+            raw_data[symbol] = df
+
+        if not raw_data:
+            logger.error("No local cached data available for environment initialization.")
+            self.historical_df = pd.DataFrame()
+            return
+
+        self.raw_history = raw_data
+        self.historical_df = self._prepare_feature_frame(raw_data)
+        self.historical_df = self.historical_df.sort_index()
+        logger.info(f"Local history loaded with shape: {self.historical_df.shape}")
+
+    def _prepare_feature_frame(self, raw_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """Create a combined feature DataFrame including base features."""
+        if not raw_data:
+            return pd.DataFrame()
+
+        # Avoid mutating raw_data in feature_engine by passing copies
+        engineer_input = {}
+        for symbol, df in raw_data.items():
+            if df is None or df.empty:
+                continue
+            engineer_input[symbol] = df.copy()
+
+        processed = self.feature_engine.engineer_features({'binance': engineer_input})
+        if processed is None or processed.empty:
+            logger.warning("Feature engineering returned empty results.")
+            return pd.DataFrame()
+
+        if not isinstance(processed.columns, pd.MultiIndex):
+            processed.columns = pd.MultiIndex.from_tuples(processed.columns, names=['asset', 'feature'])
+
+        combined = processed.copy()
+
+        for symbol, df in raw_data.items():
+            if df is None or df.empty:
+                continue
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                series = None
+                if isinstance(df.columns, pd.MultiIndex):
+                    if (symbol, col) in df.columns:
+                        series = df[(symbol, col)].copy()
+                else:
+                    if col in df.columns:
+                        series = df[col].copy()
+
+                if series is None:
+                    continue
+                series = series.reindex(combined.index).ffill().bfill()
+                combined[(symbol, col)] = series
+
+        combined = combined.sort_index(axis=1)
+        combined = combined.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
+        return combined
     
     async def _backfill_data(self):
         """Backfill data by fetching historical data from exchange."""
@@ -1098,7 +1444,7 @@ class RealTimeTrader:
                 
                 all_ohlcv = []
                 while True:
-                    ohlcv = await self.exchange.fetch_ohlcv(exchange_symbol, self.timeframe, since=since, limit=1000)
+                    ohlcv = await self.exchange.fetch_ohlcv(exchange_symbol, self.backfill_timeframe, since=since, limit=1000)
                     if not ohlcv:
                         break
                     all_ohlcv.extend(ohlcv)
@@ -1150,52 +1496,63 @@ class RealTimeTrader:
             # Create MultiIndex DataFrame
             dfs = []
             for symbol, df in backfill_data.items():
-                # Create MultiIndex columns
-                df.columns = pd.MultiIndex.from_product([[symbol], df.columns])
-                dfs.append(df)
+                # Create MultiIndex columns on a copy to avoid mutating raw data
+                temp = df.copy()
+                temp.columns = pd.MultiIndex.from_product([[symbol], temp.columns])
+                dfs.append(temp)
             
             if dfs:
                 self.historical_df = pd.concat(dfs, axis=1)
                 self.historical_df = self.historical_df.sort_index()
-                
-                # Process through feature engine
-                self.historical_df = self.feature_engine.engineer_features({'binance': backfill_data})
-                
+
+                # Process through feature engine and merge base features
+                self.historical_df = self._prepare_feature_frame(backfill_data)
+                self.raw_history = backfill_data
+
                 logger.info(f"Backfilled historical data with shape: {self.historical_df.shape}")
             else:
                 logger.warning("Could not backfill data for any symbol")
                 self.historical_df = pd.DataFrame()
+                self._load_local_history_for_env()
         
         except Exception as e:
             logger.error(f"Error backfilling historical data: {str(e)}")
             logger.error(traceback.format_exc())
             self.historical_df = pd.DataFrame()
+            self._load_local_history_for_env()
     
     async def _create_environment(self):
         """Create trading environment for inference that matches training environment."""
         logger.info("Creating trading environment for inference...")
         
         try:
+            try:
+                EnvClass = _import_env()
+            except Exception as e:
+                logger.error(f"Failed to import trading environment: {e}")
+                self.env = None
+                return
+
             # Load environment with normalization stats if provided
             if self.env_path and os.path.exists(self.env_path):
                 logger.info(f"Loading environment from: {self.env_path}")
                 
                 # First create base environment with identical settings to training
                 # These settings should exactly match those used in InstitutionalPerpetualEnv during training
-                base_env = InstitutionalPerpetualEnv(
+                base_features = self.base_features
+                tech_features = self.tech_features
+
+                base_env = EnvClass(
                     df=self.historical_df,
                     assets=self.symbols,
-                    window_size=100,  # Should match training window size
+                    window_size=int(self.config.get('model', {}).get('window_size', 100)),
                     max_leverage=self.max_leverage,
                     commission=self.commission,
                     risk_engine=self.risk_engine,
                     initial_balance=self.initial_balance,
                     funding_fee_multiplier=self.config.get('trading', {}).get('funding_fee_multiplier', 1.0),
-                    base_features=self.config.get('feature_engineering', {}).get('base_features', ['open', 'high', 'low', 'close', 'volume']),
-                    tech_features=self.config.get('feature_engineering', {}).get('tech_features', [
-                        'rsi', 'macd', 'macd_signal', 'macd_hist', 'bb_upper', 'bb_middle', 'bb_lower',
-                        'atr', 'sma_10', 'ema_10', 'obv'
-                    ]),
+                    base_features=base_features,
+                    tech_features=tech_features,
                     risk_free_rate=self.config.get('trading', {}).get('risk_free_rate', 0.02),
                     max_drawdown=self.config.get('risk_management', {}).get('limits', {}).get('max_drawdown', 0.2),
                     maintenance_margin=self.config.get('trading', {}).get('maintenance_margin', 0.05),
@@ -1203,36 +1560,34 @@ class RealTimeTrader:
                     verbose=False
                 )
                 
-                # Wrap it in a DummyVecEnv
-                vec_env = DummyVecEnv([lambda: base_env])
-                
-                # Load environment with normalization (CRITICAL for proper inference)
-                self.env = VecNormalize.load(self.env_path, vec_env)
-                
-                # Reset training mode and reward normalization for inference
-                self.env.training = False
-                self.env.norm_reward = False
-                
-                logger.info("Environment loaded successfully with normalization stats")
+                if self._DummyVecEnv is None or self._VecNormalize is None:
+                    logger.warning("VecNormalize unavailable; using base environment without normalization.")
+                    self.env = base_env
+                else:
+                    vec_env = self._DummyVecEnv([lambda: base_env])
+                    self.env = self._VecNormalize.load(self.env_path, vec_env)
+                    self.env.training = False
+                    self.env.norm_reward = False
+                    logger.info("Environment loaded successfully with normalization stats")
             else:
                 logger.warning("No environment file provided, creating new environment (NOT RECOMMENDED)")
                 logger.warning("Performance may not match training without proper normalization stats")
                 
                 # Create a fresh environment - try to match training config
-                base_env = InstitutionalPerpetualEnv(
+                base_features = self.base_features
+                tech_features = self.tech_features
+
+                base_env = EnvClass(
                     df=self.historical_df,
                     assets=self.symbols,
-                    window_size=100,  # Should match training window size
+                    window_size=int(self.config.get('model', {}).get('window_size', 100)),
                     max_leverage=self.max_leverage,
                     commission=self.commission,
                     risk_engine=self.risk_engine,
                     initial_balance=self.initial_balance,
                     funding_fee_multiplier=self.config.get('trading', {}).get('funding_fee_multiplier', 1.0),
-                    base_features=self.config.get('feature_engineering', {}).get('base_features', ['open', 'high', 'low', 'close', 'volume']),
-                    tech_features=self.config.get('feature_engineering', {}).get('tech_features', [
-                        'rsi', 'macd', 'macd_signal', 'macd_hist', 'bb_upper', 'bb_middle', 'bb_lower',
-                        'atr', 'sma_10', 'ema_10', 'obv'
-                    ]),
+                    base_features=base_features,
+                    tech_features=tech_features,
                     risk_free_rate=self.config.get('trading', {}).get('risk_free_rate', 0.02),
                     max_drawdown=self.config.get('risk_management', {}).get('limits', {}).get('max_drawdown', 0.2),
                     maintenance_margin=self.config.get('trading', {}).get('maintenance_margin', 0.05),
@@ -1240,14 +1595,14 @@ class RealTimeTrader:
                     verbose=False
                 )
                 
-                # Wrap it in DummyVecEnv and VecNormalize
-                self.env = VecNormalize(DummyVecEnv([lambda: base_env]))
-                
-                # Reset training mode for inference
-                self.env.training = False
-                self.env.norm_reward = False
-                
-                logger.info("New environment created successfully")
+                if self._DummyVecEnv is None or self._VecNormalize is None:
+                    logger.warning("VecNormalize unavailable; using base environment without normalization.")
+                    self.env = base_env
+                else:
+                    self.env = self._VecNormalize(self._DummyVecEnv([lambda: base_env]))
+                    self.env.training = False
+                    self.env.norm_reward = False
+                    logger.info("New environment created successfully")
         
         except Exception as e:
             logger.error(f"Error creating environment: {str(e)}")
@@ -1256,24 +1611,113 @@ class RealTimeTrader:
     
     async def _update_environment_data(self, new_data: pd.DataFrame):
         """Update environment with new data for inference."""
+        if self.env is None:
+            return
         with self.data_lock:
             try:
                 # Get the underlying environment from the vectorized wrapper
-                base_env = self.env.envs[0]
-                
-                # Update the environment's DataFrame
-                base_env.df = pd.concat([base_env.df.iloc[:-1], new_data])
-                
-                # Update current step if needed
+                base_env = self.env.envs[0] if hasattr(self.env, 'envs') else self.env
+
+                # Align columns to environment schema
+                if isinstance(base_env.df, pd.DataFrame) and isinstance(new_data, pd.DataFrame):
+                    new_data = new_data.reindex(columns=base_env.df.columns, fill_value=0.0)
+
+                # Append and keep latest rows
+                combined = pd.concat([base_env.df, new_data])
+                combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+                if len(combined) > self.max_env_rows:
+                    combined = combined.iloc[-self.max_env_rows:]
+
+                base_env.df = combined
                 base_env.current_step = len(base_env.df) - 1
                 
                 logger.debug("Environment data updated successfully")
             except Exception as e:
                 logger.error(f"Error updating environment data: {str(e)}")
                 logger.error(traceback.format_exc())
+
+    def _sync_env_positions(self, base_env):
+        """Sync current paper positions into the environment state."""
+        try:
+            base_env.balance = self.balance
+            for symbol in self.symbols:
+                if symbol not in base_env.positions:
+                    continue
+                pos = self.positions.get(symbol, {})
+                base_env.positions[symbol]['size'] = pos.get('size', 0.0)
+                base_env.positions[symbol]['entry_price'] = pos.get('entry_price', 0.0)
+                base_env.positions[symbol]['leverage'] = pos.get('leverage', 0.0)
+        except Exception as e:
+            logger.warning(f"Failed to sync positions to env: {e}")
+
+    def _get_latest_observation(self) -> np.ndarray:
+        """Get the latest observation from the environment without resetting."""
+        if self.env is None:
+            return self._build_observation_from_frame(self.last_frame)
+
+        base_env = self.env.envs[0] if hasattr(self.env, 'envs') else self.env
+        base_env.current_step = len(base_env.df) - 1
+        self._sync_env_positions(base_env)
+        obs = base_env._get_observation()
+
+        # Normalize observation if VecNormalize is used
+        if hasattr(self.env, 'normalize_obs'):
+            try:
+                obs = self.env.normalize_obs(obs)
+            except Exception:
+                pass
+        return obs
+
+    def _build_observation_from_frame(self, frame: Optional[pd.DataFrame]) -> np.ndarray:
+        """Fallback observation builder when environment is unavailable."""
+        if frame is None or frame.empty:
+            expected = (len(self.symbols) * (len(self.base_features) + len(self.tech_features) + 3)) + 3
+            return np.zeros(expected, dtype=np.float32)
+
+        current_data = frame.iloc[-1]
+        observation = []
+
+        for asset in self.symbols:
+            for feat in self.base_features:
+                observation.append(float(current_data.get((asset, feat), 0.0)))
+            for feat in self.tech_features:
+                observation.append(float(current_data.get((asset, feat), 0.0)))
+
+        total_portfolio_value = self.balance + sum(p.get('unrealized_pnl', 0.0) for p in self.positions.values())
+
+        for asset in self.symbols:
+            position = self.positions.get(asset, {})
+            mark_price = self.market_data.get(asset, {}).get('price', 0.0)
+            position_value = position.get('size', 0.0) * mark_price
+
+            observation.extend([
+                float(position.get('size', 0.0)),
+                float(position_value / (total_portfolio_value + 1e-8)),
+                0.0
+            ])
+
+        recent_trades_pnl = 0.0
+        for trade in self.trades[-100:]:
+            if 'pnl' in trade:
+                recent_trades_pnl += trade['pnl']
+            elif 'realized_pnl' in trade:
+                recent_trades_pnl += trade['realized_pnl']
+
+        active_positions = sum(1 for p in self.positions.values() if abs(p.get('size', 0.0)) > 1e-8)
+
+        observation.extend([
+            float(total_portfolio_value / (self.initial_balance + 1e-8)),
+            float(recent_trades_pnl / (self.initial_balance + 1e-8)),
+            float(active_positions / max(len(self.symbols), 1))
+        ])
+
+        return np.array(observation, dtype=np.float32)
     
     async def _fetch_latest_data(self):
         """Fetch latest market data from exchange."""
+        if self.data_source == 'replay':
+            return self._fetch_latest_data_replay()
+
         logger.info("Fetching latest market data...")
         
         try:
@@ -1282,22 +1726,33 @@ class RealTimeTrader:
             for symbol in self.symbols:
                 exchange_symbol = self.symbol_mappings.get(symbol, symbol)
                 
-                # Fetch latest OHLCV candle using the API timeframe (typically 1m)
+                # Fetch latest OHLCV candles using the API timeframe (typically 1m)
                 ohlcv = await self.exchange.fetch_ohlcv(exchange_symbol, self.api_timeframe, limit=2)
                 if not ohlcv or len(ohlcv) < 2:
                     logger.warning(f"No OHLCV data found for {symbol}")
                     continue
                 
                 # Use the completed candle for decision making
-                completed_candle = ohlcv[0]
+                completed_candle = ohlcv[-2]
                 
                 # Create DataFrame with single candle
                 df = pd.DataFrame([completed_candle], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df.set_index('timestamp', inplace=True)
                 
-                # Get latest price for PnL calculation (current candle)
-                current_price = float(ohlcv[1][4])  # Close price of current candle
+                # Get latest price for PnL calculation (prefer ticker last price)
+                current_price = None
+                try:
+                    ticker = await self.exchange.fetch_ticker(exchange_symbol)
+                    if ticker:
+                        current_price = ticker.get('last') or ticker.get('close') or ticker.get('bid') or ticker.get('ask')
+                except Exception as e:
+                    logger.warning(f"Could not fetch ticker for {symbol}: {str(e)}")
+                
+                if current_price is None:
+                    current_price = float(ohlcv[-1][4])  # Close price of current candle
+                else:
+                    current_price = float(current_price)
                 
                 # Update position's current price
                 self.positions[symbol]['current_price'] = current_price
@@ -1339,98 +1794,51 @@ class RealTimeTrader:
                 dfs.append(df)
             
             if dfs:
-                combined_df = pd.concat(dfs, axis=1)
-                
-                # Check if we need to resample to training timeframe
+                combined_df = pd.concat(dfs, axis=1).sort_index()
+
+                # Update raw history buffers
+                for symbol, df in latest_data.items():
+                    if symbol not in self.raw_history or self.raw_history[symbol].empty:
+                        self.raw_history[symbol] = df.copy()
+                    else:
+                        updated = pd.concat([self.raw_history[symbol], df]).sort_index()
+                        updated = updated[~updated.index.duplicated(keep='last')]
+                        if len(updated) > self.feature_lookback:
+                            updated = updated.iloc[-self.feature_lookback:]
+                        self.raw_history[symbol] = updated
+
+                # Build combined raw data frame from buffer
+                raw_dfs = []
+                for symbol, df in self.raw_history.items():
+                    if df is None or df.empty:
+                        continue
+                    temp = df.copy()
+                    temp.columns = pd.MultiIndex.from_product([[symbol], temp.columns])
+                    raw_dfs.append(temp)
+
+                if not raw_dfs:
+                    logger.warning("Raw history buffer empty after update")
+                    return None
+
+                raw_combined = pd.concat(raw_dfs, axis=1).sort_index()
+
+                # Resample if needed
                 if self.resample_data and self.api_timeframe != self.training_timeframe:
-                    # Fetch additional historical data for proper resampling
-                    need_additional_data = True
-                    # Log the resampling attempt
-                    logger.info(f"Attempting to resample from {self.api_timeframe} to {self.training_timeframe}")
-                    
-                    # If we have historical data, use it for resampling context
-                    if hasattr(self, 'historical_df') and not self.historical_df.empty:
-                        # Get required number of bars for resampling to the training timeframe
-                        if self.api_timeframe == '1m' and self.training_timeframe == '5m':
-                            bars_needed = 5
-                        elif self.api_timeframe == '1m' and self.training_timeframe == '15m':
-                            bars_needed = 15
-                        elif self.api_timeframe == '1m' and self.training_timeframe == '30m':
-                            bars_needed = 30
-                        elif self.api_timeframe == '1m' and self.training_timeframe == '1h':
-                            bars_needed = 60
-                        else:
-                            bars_needed = 10  # Default fallback
-                            
-                        # Try to fetch additional bars for proper resampling
-                        additional_bars = {}
-                        for symbol in self.symbols:
-                            exchange_symbol = self.symbol_mappings.get(symbol, symbol)
-                            
-                            try:
-                                # Fetch additional bars for proper resampling
-                                ohlcv_history = await self.exchange.fetch_ohlcv(
-                                    exchange_symbol, 
-                                    self.api_timeframe, 
-                                    limit=bars_needed
-                                )
-                                
-                                if ohlcv_history and len(ohlcv_history) >= bars_needed:
-                                    df_hist = pd.DataFrame(
-                                        ohlcv_history, 
-                                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-                                    )
-                                    df_hist['timestamp'] = pd.to_datetime(df_hist['timestamp'], unit='ms')
-                                    df_hist.set_index('timestamp', inplace=True)
-                                    
-                                    # Add missing columns that might be needed
-                                    df_hist['funding_rate'] = latest_data[symbol]['funding_rate'].iloc[0] if 'funding_rate' in latest_data[symbol] else 0
-                                    df_hist['bid_depth'] = 0
-                                    df_hist['ask_depth'] = 0
-                                    
-                                    # Store historical bars
-                                    additional_bars[symbol] = df_hist
-                                else:
-                                    logger.warning(f"Could not fetch enough historical bars for {symbol} resampling")
-                            except Exception as e:
-                                logger.error(f"Error fetching historical bars for {symbol}: {str(e)}")
-                        
-                        # If we got additional bars for all symbols, create combined historical data
-                        if len(additional_bars) == len(self.symbols):
-                            # Create MultiIndex DataFrame with historical data
-                            hist_dfs = []
-                            for symbol, df in additional_bars.items():
-                                # Create MultiIndex columns
-                                df.columns = pd.MultiIndex.from_product([[symbol], df.columns])
-                                hist_dfs.append(df)
-                                
-                            if hist_dfs:
-                                historical_combined = pd.concat(hist_dfs, axis=1)
-                                historical_combined = historical_combined.sort_index()
-                                
-                                # Resample to training timeframe
-                                resampled = self._resample_ohlcv(historical_combined, self.training_timeframe)
-                                
-                                if not resampled.empty:
-                                    # Process through feature engine
-                                    processed_df = self.feature_engine.engineer_features(
-                                        {'binance': {sym: additional_bars[sym] for sym in self.symbols}}
-                                    )
-                                    
-                                    logger.info(f"Successfully resampled data to {self.training_timeframe}")
-                                    return processed_df
-                                else:
-                                    logger.warning(f"Resampling produced empty DataFrame")
-                    
-                    # If we're here, either no historical data or resampling failed
-                    logger.warning(f"Could not properly resample data, using raw {self.api_timeframe} data")
-                
-                # Process through feature engine for additional features
-                processed_df = self.feature_engine.engineer_features({'binance': latest_data})
-                
-                logger.info(f"Fetched and processed latest data with timestamp: {processed_df.index[0]}")
-                
-                return processed_df
+                    raw_combined = self._resample_ohlcv(raw_combined, self.training_timeframe)
+
+                # Convert combined frame to dict per symbol
+                raw_for_features = {}
+                for symbol in self.symbols:
+                    if symbol in raw_combined.columns.get_level_values(0):
+                        raw_for_features[symbol] = raw_combined[symbol].copy()
+
+                processed_df = self._prepare_feature_frame(raw_for_features)
+                if processed_df.empty:
+                    logger.warning("Feature preparation returned empty DataFrame")
+                    return None
+
+                logger.info(f"Fetched and processed latest data with timestamp: {processed_df.index[-1]}")
+                return processed_df.tail(1)
             else:
                 logger.warning("Could not fetch latest data for any symbol")
                 return None
@@ -1439,6 +1847,43 @@ class RealTimeTrader:
             logger.error(f"Error fetching latest data: {str(e)}")
             logger.error(traceback.format_exc())
             return None
+
+    def _fetch_latest_data_replay(self):
+        """Fetch next bar from replay dataset."""
+        if self.historical_df is None or self.historical_df.empty:
+            logger.warning("Replay dataset is empty")
+            return None
+
+        if self.replay_cursor is None:
+            self.replay_cursor = max(self.config.get('model', {}).get('window_size', 100), 1)
+
+        if self.replay_cursor >= len(self.historical_df):
+            logger.info("Replay reached end of dataset")
+            return None
+
+        row = self.historical_df.iloc[self.replay_cursor:self.replay_cursor + 1]
+        self.replay_cursor += 1
+
+        # Update market data from base features
+        for symbol in self.symbols:
+            try:
+                close_val = float(row[(symbol, 'close')].iloc[0]) if (symbol, 'close') in row.columns else 0.0
+                self.market_data[symbol] = {
+                    'price': close_val,
+                    'timestamp': row.index[0],
+                    'ohlcv': {
+                        'open': float(row[(symbol, 'open')].iloc[0]) if (symbol, 'open') in row.columns else close_val,
+                        'high': float(row[(symbol, 'high')].iloc[0]) if (symbol, 'high') in row.columns else close_val,
+                        'low': float(row[(symbol, 'low')].iloc[0]) if (symbol, 'low') in row.columns else close_val,
+                        'close': close_val,
+                        'volume': float(row[(symbol, 'volume')].iloc[0]) if (symbol, 'volume') in row.columns else 0.0
+                    },
+                    'funding_rate': float(row[(symbol, 'funding_rate')].iloc[0]) if (symbol, 'funding_rate') in row.columns else 0.0
+                }
+            except Exception as e:
+                logger.warning(f"Replay market data update failed for {symbol}: {e}")
+
+        return row
     
     def _resample_ohlcv(self, df, target_timeframe):
         """
@@ -1545,15 +1990,18 @@ class RealTimeTrader:
         
         try:
             # Update environment with new data
+            self.last_frame = new_data
             await self._update_environment_data(new_data)
-            
-            # Reset the environment to incorporate the new data
-            obs = self.env.reset()
-            
+
+            # Get latest observation without resetting the environment
+            obs = self._get_latest_observation()
+
             # Get model prediction (action)
-            # IMPORTANT: Use deterministic=False during trading to match training behavior
-            # This allows the model to explore and consider uncertainty in its decision
-            action, _ = self.model.predict(obs, deterministic=False)
+            action, _ = self.model.predict(obs, deterministic=self.deterministic_policy)
+
+            # Flatten action if needed
+            if isinstance(action, np.ndarray) and action.ndim > 1:
+                action = action[0]
             
             # Log the raw action vector
             logger.info(f"Raw action vector: {action}")
@@ -1628,7 +2076,8 @@ class RealTimeTrader:
                         execute_trade = True
                         trade_direction = 1
                     elif position['leverage'] != target_leverage:
-                        # Adjust leverage of existing long position
+                        # Adjust leverage of existing long position (close and reopen)
+                        await self._close_position(symbol)
                         execute_trade = True
                         trade_direction = 1
                 elif signal_type == "SHORT":
@@ -1641,7 +2090,8 @@ class RealTimeTrader:
                         execute_trade = True
                         trade_direction = -1
                     elif position['leverage'] != target_leverage:
-                        # Adjust leverage of existing short position
+                        # Adjust leverage of existing short position (close and reopen)
+                        await self._close_position(symbol)
                         execute_trade = True
                         trade_direction = -1
                 
@@ -1695,8 +2145,11 @@ class RealTimeTrader:
                     # Update balance for transaction costs
                     self.balance -= transaction_cost
                     
-                    logger.info(f"Executed {trade['action']} trade for {symbol} at price {current_price}, "
-                               f"size {position_size:.6f}, value ${position_value:.2f}, leverage {target_leverage:.2f}x")
+                    logger.info(
+                        f"TRADE {trade['action']} {symbol} price={current_price:.4f} "
+                        f"size={position_size:.6f} value={position_value:.2f} "
+                        f"lev={target_leverage:.2f}x"
+                    )
                 
                 # Update last trade time
                 self.last_trade_time[symbol] = current_time
@@ -1724,11 +2177,12 @@ class RealTimeTrader:
         entry_price = position['entry_price']
         direction = position['direction']
         
-        # Calculate PnL
+        # Calculate PnL (use absolute size to avoid sign errors)
+        size = abs(position_size)
         if direction > 0:  # Long position
-            pnl = position_size * (current_price - entry_price)
+            pnl = size * (current_price - entry_price)
         else:  # Short position
-            pnl = position_size * (entry_price - current_price)
+            pnl = size * (entry_price - current_price)
         
         # Calculate transaction cost
         position_value = abs(position_size * current_price)
@@ -1764,8 +2218,10 @@ class RealTimeTrader:
         
         self.trades.append(trade)
         
-        logger.info(f"Closed position for {symbol} at price {current_price}, "
-                   f"realized PnL: ${realized_pnl:.2f}")
+        logger.info(
+            f"TRADE CLOSE {symbol} price={current_price:.4f} "
+            f"realized_pnl={realized_pnl:.2f}"
+        )
     
     def _calculate_liquidation_price(self, price: float, direction: int, leverage: float) -> float:
         """
@@ -1803,10 +2259,11 @@ class RealTimeTrader:
             direction = position['direction']
             
             # Calculate unrealized PnL
+            size = abs(position_size)
             if direction > 0:  # Long position
-                unrealized_pnl = position_size * (current_price - entry_price)
+                unrealized_pnl = size * (current_price - entry_price)
             else:  # Short position
-                unrealized_pnl = position_size * (entry_price - current_price)
+                unrealized_pnl = size * (entry_price - current_price)
             
             # Update position
             position['unrealized_pnl'] = unrealized_pnl
@@ -1833,6 +2290,115 @@ class RealTimeTrader:
         logger.debug(f"Updated PnL - Balance: ${self.balance:.2f}, "
                     f"Unrealized PnL: ${total_unrealized_pnl:.2f}, "
                     f"Total Value: ${self.total_value:.2f}")
+
+    def _log_positions_summary(self):
+        """Log a concise positions summary."""
+        total_unrealized = sum(p.get('unrealized_pnl', 0.0) for p in self.positions.values())
+        total_value = self.balance + total_unrealized
+        logger.info(
+            f"PORTFOLIO balance={self.balance:.2f} unreal={total_unrealized:.2f} total={total_value:.2f}"
+        )
+        lines = []
+        for symbol, position in self.positions.items():
+            if abs(position.get('size', 0.0)) <= 1e-8:
+                continue
+            lines.append(
+                f"{symbol} {('LONG' if position.get('direction', 0) > 0 else 'SHORT')}"
+                f" size={position.get('size', 0.0):.6f}"
+                f" entry={position.get('entry_price', 0.0):.4f}"
+                f" current={position.get('current_price', 0.0):.4f}"
+                f" lev={position.get('leverage', 0.0):.2f}x"
+                f" unreal={position.get('unrealized_pnl', 0.0):.2f}"
+            )
+        if not lines:
+            logger.info("POSITIONS none")
+        else:
+            logger.info("POSITIONS " + " | ".join(lines))
+
+    def _log_rolling_metrics(self, now: datetime):
+        """Log rolling performance metrics for the last N minutes."""
+        window_minutes = max(int(self.metrics_interval_minutes), 1)
+        if self.last_metrics_time and (now - self.last_metrics_time).total_seconds() < window_minutes * 60:
+            return
+
+        if len(self.pnl_history) < 2:
+            logger.info(f"METRICS window={window_minutes}m insufficient_data")
+            self.last_metrics_time = now
+            return
+
+        window_start = now - timedelta(minutes=window_minutes)
+        window = []
+        for record in self.pnl_history:
+            try:
+                ts = datetime.fromisoformat(record['timestamp'])
+            except Exception:
+                continue
+            if ts >= window_start:
+                window.append((ts, record))
+
+        if len(window) < 2:
+            logger.info(f"METRICS window={window_minutes}m insufficient_data")
+            self.last_metrics_time = now
+            return
+
+        window.sort(key=lambda x: x[0])
+        times = [t for t, _ in window]
+        values = np.array([r['total_value'] for _, r in window], dtype=np.float64)
+
+        # Rolling returns and drawdown
+        returns = np.diff(values) / np.clip(values[:-1], 1e-8, None)
+        ret_pct = ((values[-1] / max(values[0], 1e-8)) - 1.0) * 100.0
+
+        peaks = np.maximum.accumulate(values)
+        drawdowns = (peaks - values) / np.clip(peaks, 1e-8, None)
+        max_dd = float(drawdowns.max()) if drawdowns.size > 0 else 0.0
+
+        # Sharpe (approx) using average interval
+        if len(times) >= 2:
+            avg_dt = (times[-1] - times[0]).total_seconds() / max(len(times) - 1, 1)
+        else:
+            avg_dt = 60.0
+        periods_per_year = max(365 * 24 * 3600 / max(avg_dt, 1.0), 1.0)
+        rf_annual = float(self.config.get('trading', {}).get('risk_free_rate', 0.02))
+        rf_per_period = rf_annual / periods_per_year
+        excess = returns - rf_per_period
+        sharpe = 0.0
+        vol = 0.0
+        if excess.size > 1:
+            vol = float(excess.std(ddof=1) * np.sqrt(periods_per_year))
+            if excess.std(ddof=1) > 1e-12:
+                sharpe = float(excess.mean() / excess.std(ddof=1) * np.sqrt(periods_per_year))
+
+        # Trade metrics in window
+        trade_window = []
+        for trade in self.trades:
+            try:
+                ts = datetime.fromisoformat(trade['timestamp'])
+            except Exception:
+                continue
+            if ts >= window_start:
+                trade_window.append(trade)
+
+        realized_pnl = sum(t.get('pnl', 0.0) for t in trade_window)
+        win_trades = [t for t in trade_window if t.get('pnl', 0.0) > 0]
+        loss_trades = [t for t in trade_window if t.get('pnl', 0.0) < 0]
+        win_rate = (len(win_trades) / max(len(win_trades) + len(loss_trades), 1)) * 100.0
+
+        logger.info(
+            "METRICS window=%dm return=%.2f%% sharpe=%.2f vol=%.2f%% max_dd=%.2f%% "
+            "trades=%d win_rate=%.1f%% realized=%.2f"
+            % (
+                window_minutes,
+                ret_pct,
+                sharpe,
+                vol * 100.0,
+                max_dd * 100.0,
+                len(trade_window),
+                win_rate,
+                realized_pnl,
+            )
+        )
+        self.last_metrics_time = now
     
     async def run_trading_loop(self):
         """Run the main trading loop."""
@@ -1842,23 +2408,42 @@ class RealTimeTrader:
         try:
             while self.is_running and not self.shutting_down:
                 current_time = datetime.now()
+                poll_interval = max(int(self.poll_interval), 1)
                 
-                # Only fetch new data if it's a new minute
-                if (current_time - self.last_observation_time).total_seconds() >= 60:
+                # Fetch cadence depends on data source
+                should_fetch = True if self.data_source == 'replay' else (
+                    (current_time - self.last_observation_time).total_seconds() >= poll_interval
+                )
+
+                if should_fetch:
                     logger.info(f"Fetching data at {current_time}")
                     
                     # Fetch latest data
                     new_data = await self._fetch_latest_data()
                     
                     if new_data is not None and not new_data.empty:
-                        # Generate signals
-                        signals = await self.generate_signals(new_data)
-                        
-                        # Execute trades based on signals
-                        trades = await self.execute_trades(signals)
-                        
-                        # Save trade data
-                        self._save_trade_data()
+                        candle_time = new_data.index[-1]
+                        trades = []
+
+                        if self.data_source == 'live' and self.last_candle_time is not None and candle_time <= self.last_candle_time:
+                            logger.info("No new completed candle yet; updating PnL only.")
+                            await self._update_pnl()
+                            self._log_positions_summary()
+                            self._log_rolling_metrics(current_time)
+                        else:
+                            # Generate signals
+                            signals = await self.generate_signals(new_data)
+                            
+                            # Execute trades based on signals
+                            trades = await self.execute_trades(signals)
+                            
+                            # Save trade data
+                            self._save_trade_data()
+                            
+                            # Track latest completed candle
+                            self.last_candle_time = candle_time
+                            self._log_positions_summary()
+                            self._log_rolling_metrics(current_time)
                         
                         # Broadcast update to connected clients
                         await self._broadcast_update({
@@ -1887,11 +2472,18 @@ class RealTimeTrader:
                         # Update last observation time
                         self.last_observation_time = current_time
                     else:
+                        if self.data_source == 'replay':
+                            logger.info("Replay data exhausted. Stopping trading loop.")
+                            self.is_running = False
+                            break
                         logger.warning("No data fetched, skipping this iteration")
+                        self.last_observation_time = current_time
                 
-                # Sleep until next minute
-                seconds_to_next_minute = 60 - datetime.now().second
-                await asyncio.sleep(seconds_to_next_minute)
+                # Sleep based on data source
+                if self.data_source == 'replay':
+                    await asyncio.sleep(self.replay_speed)
+                else:
+                    await asyncio.sleep(poll_interval)
         
         except KeyboardInterrupt:
             logger.info("Trading loop interrupted by user")
@@ -1923,36 +2515,35 @@ class RealTimeTrader:
     def _save_trade_data(self):
         """Save trade data to file."""
         try:
+            def _serialize(obj):
+                if isinstance(obj, (datetime, pd.Timestamp)):
+                    return obj.isoformat()
+                if isinstance(obj, dict):
+                    return {k: _serialize(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_serialize(v) for v in obj]
+                return obj
+
             # Save trades
             trades_file = os.path.join(self.save_trades_path, 'trades.json')
             with open(trades_file, 'w') as f:
-                json.dump(self.trades, f, indent=2)
+                json.dump(_serialize(self.trades), f, indent=2)
             
             # Save positions
             positions_file = os.path.join(self.save_trades_path, 'positions.json')
             with open(positions_file, 'w') as f:
-                # Convert any datetime objects to ISO format strings
-                positions_json = {}
-                for symbol, position in self.positions.items():
-                    position_copy = position.copy()
-                    if position_copy.get('timestamp') and isinstance(position_copy['timestamp'], datetime):
-                        position_copy['timestamp'] = position_copy['timestamp'].isoformat()
-                    positions_json[symbol] = position_copy
-                json.dump(positions_json, f, indent=2)
+                json.dump(_serialize(self.positions), f, indent=2)
             
             # Save PnL history
             pnl_file = os.path.join(self.save_trades_path, 'pnl_history.json')
             with open(pnl_file, 'w') as f:
-                json.dump(self.pnl_history, f, indent=2)
+                json.dump(_serialize(self.pnl_history), f, indent=2)
             
             # Save current status
             status_file = os.path.join(self.save_trades_path, 'status.json')
             with open(status_file, 'w') as f:
                 status = self.get_status()
-                # Convert any datetime objects to ISO format strings
-                if status.get('last_trade_time'):
-                    status['last_trade_time'] = {k: v for k, v in status['last_trade_time'].items()}
-                json.dump(status, f, indent=2)
+                json.dump(_serialize(status), f, indent=2)
             
             logger.debug("Trade data saved successfully")
         
@@ -1979,7 +2570,8 @@ class RealTimeTrader:
             await self._generate_daily_report(current_day)
         
         # Close exchange connection
-        await self.exchange.close()
+        if self.exchange:
+            await self.exchange.close()
         
         # Close websocket server if active
         if self.websocket_server:

@@ -3,7 +3,29 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
-import wandb
+try:
+    import wandb as _wandb
+    if not hasattr(_wandb, "init"):
+        raise ImportError("wandb.init not available")
+    wandb = _wandb
+except Exception:
+    class _WandbRunStub:
+        def __init__(self):
+            self.config = {}
+        def log(self, *args, **kwargs):
+            return None
+        def finish(self, *args, **kwargs):
+            return None
+
+    class _WandbStub:
+        def init(self, *args, **kwargs):
+            return _WandbRunStub()
+        def log(self, *args, **kwargs):
+            return None
+        def finish(self, *args, **kwargs):
+            return None
+
+    wandb = _WandbStub()
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 import logging

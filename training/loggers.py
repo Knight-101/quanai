@@ -1,4 +1,33 @@
-import wandb
+try:
+    import wandb as _wandb
+    if not hasattr(_wandb, "init"):
+        raise ImportError("wandb.init not available")
+    wandb = _wandb
+except Exception:
+    class _WandbRunStub:
+        def __init__(self):
+            self.config = {}
+        def log(self, *args, **kwargs):
+            return None
+        def finish(self, *args, **kwargs):
+            return None
+
+    class _WandbStub:
+        def init(self, *args, **kwargs):
+            return _WandbRunStub()
+        def log(self, *args, **kwargs):
+            return None
+        def finish(self, *args, **kwargs):
+            return None
+        class util:
+            @staticmethod
+            def generate_id():
+                return "disabled"
+        class Histogram:
+            def __init__(self, *args, **kwargs):
+                pass
+
+    wandb = _WandbStub()
 from stable_baselines3.common.callbacks import BaseCallback
 import numpy as np
 from typing import Dict, Any

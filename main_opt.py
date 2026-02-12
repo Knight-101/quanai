@@ -12,7 +12,35 @@ from trading_env.institutional_perp_env import InstitutionalPerpetualEnv
 from risk_management.risk_engine import InstitutionalRiskEngine, RiskLimits
 import pandas as pd
 import numpy as np
-import wandb
+try:
+    import wandb as _wandb
+    if not hasattr(_wandb, "init"):
+        raise ImportError("wandb.init not available")
+    wandb = _wandb
+except Exception:
+    class _WandbRunStub:
+        def __init__(self):
+            self.config = {}
+        def log(self, *args, **kwargs):
+            return None
+        def finish(self, *args, **kwargs):
+            return None
+
+    class _WandbStub:
+        def init(self, *args, **kwargs):
+            return _WandbRunStub()
+        def define_metric(self, *args, **kwargs):
+            return None
+        def log(self, *args, **kwargs):
+            return None
+        def finish(self, *args, **kwargs):
+            return None
+        class tensorboard:
+            @staticmethod
+            def patch(*args, **kwargs):
+                return None
+
+    wandb = _WandbStub()
 from pathlib import Path
 import yaml
 import logging
@@ -32,6 +60,15 @@ import traceback
 from stable_baselines3.common.running_mean_std import RunningMeanStd
 import json
 import random
+
+# Optional Optuna support (avoid runtime NameError in type annotations)
+try:
+    import optuna  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    class _OptunaStub:
+        class Trial:  # minimal placeholder for type annotations
+            pass
+    optuna = _OptunaStub()
 
 # Configuration flags
 ENABLE_DETAILED_LEVERAGE_MONITORING = True  # Set to True for more detailed leverage logging
@@ -596,6 +633,12 @@ def parse_args():
                        help='Path to JSON file containing Google Drive file IDs for data files. This enables Google Drive integration.')
     parser.add_argument('--config', type=str, default='config/prod_config.yaml',
                        help='Path to configuration file')
+    parser.add_argument('--no-wandb', action='store_true',
+                       help='Disable Weights & Biases logging')
+    parser.add_argument('--start-date', type=str, default=None,
+                       help='Start date for training data (YYYY-MM-DD)')
+    parser.add_argument('--end-date', type=str, default=None,
+                       help='End date for training data (YYYY-MM-DD)')
     return parser.parse_args()
 
 def load_config(config_path: str = 'config/prod_config.yaml') -> dict:
@@ -718,13 +761,57 @@ class TradingSystem:
         self.model = None
         self.processed_data = None
         # Removed: self.study = None (Optuna optimization not used)
+
+    def _safe_load_ppo(self, model_path: str):
+        """Load a PPO model without using PPO.load to avoid runtime crashes."""
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.save_util import load_from_zip_file
+        import __main__
+        import main_opt
+
+        # Ensure custom extractor class resolves correctly
+        __main__.HybridFeatureExtractor = main_opt.HybridFeatureExtractor
+
+        data, params, _ = load_from_zip_file(model_path)
+
+        policy_kwargs = dict(data.get('policy_kwargs', {}))
+        policy_kwargs['features_extractor_class'] = main_opt.HybridFeatureExtractor
+
+        model = PPO(
+            policy=data.get('policy_class', "MlpPolicy"),
+            env=self.env,
+            learning_rate=data.get('learning_rate', 3e-4),
+            n_steps=data.get('n_steps', 2048),
+            batch_size=data.get('batch_size', 64),
+            n_epochs=data.get('n_epochs', 10),
+            gamma=data.get('gamma', 0.99),
+            gae_lambda=data.get('gae_lambda', 0.95),
+            clip_range=data.get('clip_range', 0.2),
+            clip_range_vf=data.get('clip_range_vf', None),
+            ent_coef=data.get('ent_coef', 0.0),
+            vf_coef=data.get('vf_coef', 0.5),
+            max_grad_norm=data.get('max_grad_norm', 0.5),
+            target_kl=data.get('target_kl', None),
+            use_sde=data.get('use_sde', False),
+            sde_sample_freq=data.get('sde_sample_freq', -1),
+            normalize_advantage=data.get('normalize_advantage', True),
+            tensorboard_log=data.get('tensorboard_log', None),
+            seed=data.get('seed', None),
+            verbose=data.get('verbose', 0),
+            policy_kwargs=policy_kwargs
+        )
+
+        model.set_parameters(params, exact_match=True)
+        if 'num_timesteps' in data:
+            model.num_timesteps = data['num_timesteps']
+        return model
         
     async def initialize(self, args=None):
         """Single entry point for all initialization"""
         logger.info("Starting system initialization...")
         
         # Fetch and process data
-        self.processed_data = await self._fetch_and_process_data()
+        self.processed_data = await self._fetch_and_process_data(args=args)
         
         # Initialize environment with args
         self.env = self._create_environment(self.processed_data, train=True, args=args)
@@ -743,18 +830,37 @@ class TradingSystem:
         
         logger.info("System initialization complete!")
         
-    async def _fetch_and_process_data(self):
+    async def _fetch_and_process_data(self, args=None):
         """Consolidated method for data fetching and processing"""
         logger.info("Fetching and processing data...")
-            
+        
+        # Resolve optional date range
+        start_time = None
+        end_time = None
+        if args and getattr(args, 'start_date', None):
+            start_time = pd.to_datetime(args.start_date)
+        if args and getattr(args, 'end_date', None):
+            end_time = pd.to_datetime(args.end_date)
+        if start_time and end_time and end_time < start_time:
+            raise ValueError("end_date must be on or after start_date")
+        
         # Calculate date range for fallback case only
         lookback_days = self.config['data']['history_days']
+        if start_time:
+            effective_end = end_time or datetime.utcnow()
+            lookback_days = max(1, (effective_end - start_time).days + 1)
         
         # Try to load existing data
-        existing_data = self._load_cached_data()
+        existing_data = self._load_cached_data(start_time=start_time, end_time=end_time)
         if existing_data is not None:
             logger.info("Using existing data from cache.")
             formatted_data = self._format_data_for_training(existing_data)
+            if start_time or end_time:
+                if isinstance(formatted_data.index, pd.DatetimeIndex):
+                    if start_time:
+                        formatted_data = formatted_data[formatted_data.index >= start_time]
+                    if end_time:
+                        formatted_data = formatted_data[formatted_data.index <= end_time]
             logger.info(f"Formatted data shape: {formatted_data.shape}")
             logger.info(f"Columns: {formatted_data.columns}")
             # Save feature data for future use
@@ -778,6 +884,12 @@ class TradingSystem:
         
         # Format data for training
         formatted_data = self._format_data_for_training(all_data)
+        if start_time or end_time:
+            if isinstance(formatted_data.index, pd.DatetimeIndex):
+                if start_time:
+                    formatted_data = formatted_data[formatted_data.index >= start_time]
+                if end_time:
+                    formatted_data = formatted_data[formatted_data.index <= end_time]
         logger.info(f"Formatted data shape: {formatted_data.shape}")
         logger.info(f"Columns: {formatted_data.columns}")
         
@@ -805,8 +917,8 @@ class TradingSystem:
                     exchange=exchange,
                     symbol=symbol,
                     timeframe=self.config['data']['timeframe'],
-                    start_time=None,
-                    end_time=None,
+                    start_time=start_time,
+                    end_time=end_time,
                     data_type='perpetual'
                 )
                 
@@ -2062,10 +2174,6 @@ class TradingSystem:
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found at {model_path}")
-            
-        # Load the saved model
-        logger.info(f"Loading model from {model_path}")
-        model = PPO.load(model_path)
         
         # CRITICAL FIX: More robust environment path finding
         if env_path is None:
@@ -2130,6 +2238,10 @@ class TradingSystem:
             logger.info("No environment file provided or found. Using fresh environment.")
             # Keep the base_env created above
             self.env = base_env
+
+        # Load the saved model safely (avoids PPO.load crash)
+        logger.info(f"Loading model from {model_path} (safe loader)")
+        model = self._safe_load_ppo(model_path)
         
         # Set the model
         self.model = model
@@ -3218,7 +3330,7 @@ async def main():
     try:
         # Parse arguments and load config
         args = parse_args()
-        config = load_config('config/prod_config.yaml')
+        config = load_config(args.config)
 
             # If drive-ids-file is provided, add it to the config
         if args.drive_ids_file:
@@ -3250,8 +3362,11 @@ async def main():
         # Setup directories
         setup_directories(config)
         
-        # Initialize wandb
-        initialize_wandb(config)
+        # Initialize wandb unless disabled
+        if not args.no_wandb:
+            initialize_wandb(config)
+        else:
+            logger.info("WandB disabled via --no-wandb")
         
         # Create trading system
         trading_system = TradingSystem(config)
